@@ -1,0 +1,56 @@
+[
+  {
+    "ts": "2026-06-03T17:25:48.954824+00:00",
+    "mode": "PAPER",
+    "balance": 95.9,
+    "portfolio_value": 98.0,
+    "total_pnl": 0.0,
+    "roi_pct": 0.0,
+    "trades": 25,
+    "open": 1,
+    "wins": 0,
+    "losses": 4,
+    "win_rate": 0.0,
+    "by_strategy": {
+      "test": {
+        "trades": 1,
+        "wins": 0,
+        "pnl": 0.0
+      }
+    },
+    "by_city": {
+      "Test": {
+        "trades": 1,
+        "wins": 0,
+        "pnl": 0.0
+      }
+    }
+  },
+  {
+    "ts": "2026-06-03T17:26:22.453812+00:00",
+    "mode": "PAPER",
+    "balance": 95.9,
+    "portfolio_value": 98.0,
+    "total_pnl": 0.0,
+    "roi_pct": 0.0,
+    "trades": 25,
+    "open": 1,
+    "wins": 0,
+    "losses": 4,
+    "win_rate": 0.0,
+    "by_strategy": {
+      "test": {
+        "trades": 1,
+        "wins": 0,
+        "pnl": 0.0
+      }
+    },
+    "by_city": {
+      "Test": {
+        "trades": 1,
+        "wins": 0,
+        "pnl": 0.0
+      }
+    }
+  }
+]
