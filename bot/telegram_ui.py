@@ -45,25 +45,51 @@ class TelegramBot:
     # SEND MESSAGES
     # ═══════════════════════════════════════════════════════════════
 
-    def send(self, text: str, parse_mode: str = 'HTML') -> bool:
-        """Send a message to the configured chat."""
+    def send(self, text: str, parse_mode: str = 'HTML', reply_markup: dict = None) -> bool:
+        """Send a message to the configured chat (optionally with an inline keyboard)."""
         if not self.enabled:
             return False
         try:
+            payload = {
+                'chat_id': self.chat_id,
+                'text': text,
+                'parse_mode': parse_mode,
+                'disable_web_page_preview': True,
+            }
+            if reply_markup is not None:
+                payload['reply_markup'] = reply_markup
             resp = self._session.post(
-                f"{self.base_url}/sendMessage",
-                json={
-                    'chat_id': self.chat_id,
-                    'text': text,
-                    'parse_mode': parse_mode,
-                    'disable_web_page_preview': True,
-                },
-                timeout=10,
+                f"{self.base_url}/sendMessage", json=payload, timeout=10,
             )
             return resp.status_code == 200
         except Exception as e:
             log.debug(f"Telegram send failed: {e}")
             return False
+
+    def _edit(self, message_id: int, text: str, reply_markup: dict = None) -> bool:
+        """Edit an existing message (used to refresh the settings panel in place)."""
+        if not self.enabled:
+            return False
+        try:
+            payload = {
+                'chat_id': self.chat_id, 'message_id': message_id,
+                'text': text, 'parse_mode': 'HTML', 'disable_web_page_preview': True,
+            }
+            if reply_markup is not None:
+                payload['reply_markup'] = reply_markup
+            r = self._session.post(f"{self.base_url}/editMessageText", json=payload, timeout=10)
+            return r.status_code == 200
+        except Exception as e:
+            log.debug(f"Telegram edit failed: {e}")
+            return False
+
+    def _answer_callback(self, callback_id: str, text: str = ''):
+        try:
+            self._session.post(f"{self.base_url}/answerCallbackQuery",
+                               json={'callback_query_id': callback_id, 'text': text},
+                               timeout=10)
+        except Exception:
+            pass
 
     def notify_trade(self, side: str, bucket_label: str, price: float,
                      size_usd: float, shares: float, strategy: str,
@@ -214,6 +240,18 @@ class TelegramBot:
             data = resp.json()
             for update in data.get('result', []):
                 self._last_update_id = update['update_id']
+
+                # Inline-keyboard button press (settings tick-boxes / +/- )
+                cb = update.get('callback_query')
+                if cb:
+                    cb_chat = str(cb.get('message', {}).get('chat', {}).get('id', ''))
+                    if cb_chat == self.chat_id:
+                        self._handle_callback(
+                            cb.get('data', ''), cb.get('id', ''),
+                            cb.get('message', {}).get('message_id'),
+                        )
+                    continue
+
                 msg = update.get('message', {})
                 text = msg.get('text', '').strip()
                 chat_id = str(msg.get('chat', {}).get('id', ''))
@@ -226,11 +264,109 @@ class TelegramBot:
         except Exception:
             pass
 
+    # ═══════════════════════════════════════════════════════════════
+    # SETTINGS PANEL (live tunables + tick-box toggles)
+    # ═══════════════════════════════════════════════════════════════
+
+    _LABELS = {
+        'TRADING_ENABLED': 'Trading', 'SNIPER_ENABLED': 'Sniper',
+        'SPREAD_ENABLED': 'Spread', 'CONFIDENT_ENABLED': 'Confident',
+        'STABILITY_ENABLED': 'Stability', 'LIQUIDITY_GUARD_ENABLED': 'LiqGuard',
+        'LIQUIDITY_STRICT_BLOCK': 'LiqStrict', 'GRADE_SIZING_ENABLED': 'GradeSize',
+        'SKIP_DECIDED_MARKETS': 'SkipDecided', 'ML_ENABLED': 'ML',
+    }
+
+    def _settings_view(self):
+        """Build (text, inline_keyboard) for the settings panel."""
+        from bot import settings_store
+        bools, nums = settings_store.snapshot()
+
+        text = "⚙️ <b>Bot Settings</b> — tap to change\n"
+        text += f"Trading: {'🟢 ON' if bools.get('TRADING_ENABLED') else '🔴 OFF'}\n\n"
+        text += "<b>Strategies / toggles</b> (tap to flip)\n"
+        text += "<b>Gates</b> (tap ➖/➕)\n"
+        for k, v in nums.items():
+            text += f"  {k} = <b>{v}</b>\n"
+
+        rows = []
+        # Toggle buttons, 2 per row
+        bkeys = settings_store.BOOL_KEYS
+        for i in range(0, len(bkeys), 2):
+            row = []
+            for k in bkeys[i:i + 2]:
+                on = bools.get(k)
+                label = self._LABELS.get(k, k)
+                row.append({'text': f"{'✅' if on else '❌'} {label}",
+                            'callback_data': f"tg:{k}"})
+            rows.append(row)
+        # Numeric gates: [➖] [KEY=val] [➕]
+        for k in settings_store.NUM_KEYS:
+            v = nums.get(k)
+            rows.append([
+                {'text': '➖', 'callback_data': f"dn:{k}"},
+                {'text': f"{k}={v}", 'callback_data': 'noop'},
+                {'text': '➕', 'callback_data': f"up:{k}"},
+            ])
+        return text, {'inline_keyboard': rows}
+
+    def send_settings(self, edit_message_id: int = None):
+        text, kb = self._settings_view()
+        if edit_message_id is not None:
+            self._edit(edit_message_id, text, kb)
+        else:
+            self.send(text, reply_markup=kb)
+
+    def _handle_callback(self, data: str, callback_id: str, message_id):
+        from bot import settings_store
+        if not data or data == 'noop':
+            self._answer_callback(callback_id)
+            return
+        try:
+            action, key = data.split(':', 1)
+        except ValueError:
+            self._answer_callback(callback_id)
+            return
+        ok, msg = False, 'no change'
+        if action == 'tg':
+            ok, msg = settings_store.toggle(key)
+        elif action == 'up':
+            ok, msg = settings_store.bump(key, +1)
+        elif action == 'dn':
+            ok, msg = settings_store.bump(key, -1)
+        self._answer_callback(callback_id, msg)
+        if ok and message_id is not None:
+            self.send_settings(edit_message_id=message_id)
+
     def _handle_command(self, text: str):
         """Handle incoming bot commands."""
         cmd = text.lower().split()[0] if text else ''
+        parts = text.split()
 
-        if cmd == '/status' or cmd == '/stats':
+        if cmd == '/start' or cmd == '/resume':
+            from bot import settings_store
+            settings_store.set_value('TRADING_ENABLED', True)
+            self.send("🟢 <b>Trading ENABLED</b> — the bot will place new trades.")
+        elif cmd == '/stop' or cmd == '/pause':
+            from bot import settings_store
+            settings_store.set_value('TRADING_ENABLED', False)
+            self.send("🔴 <b>Trading DISABLED</b> — monitoring & resolving only, no new buys.")
+        elif cmd == '/settings' or cmd == '/config':
+            self.send_settings()
+        elif cmd == '/set':
+            from bot import settings_store
+            if len(parts) >= 3:
+                ok, msg = settings_store.set_value(parts[1], parts[2])
+                self.send(("✅ " if ok else "⚠️ ") + msg)
+            else:
+                self.send("Usage: <code>/set KEY VALUE</code>  e.g. <code>/set BASKET_MAX_COST 0.80</code>")
+        elif cmd == '/toggle':
+            from bot import settings_store
+            if len(parts) >= 2:
+                ok, msg = settings_store.toggle(parts[1])
+                self.send(("✅ " if ok else "⚠️ ") + msg)
+            else:
+                self.send("Usage: <code>/toggle KEY</code>  e.g. <code>/toggle SNIPER_ENABLED</code>")
+        elif cmd == '/status' or cmd == '/stats':
             self.send_status()
         elif cmd == '/balance' or cmd == '/bal':
             bal = self.pm.get_balance() if self.pm else 0
@@ -249,13 +385,18 @@ class TelegramBot:
         elif cmd == '/help':
             self.send(
                 "🌤️ <b>Weather Sniper Commands</b>\n"
-                "/status — Bot status & positions\n"
-                "/balance — Current balance\n"
-                "/pnl — Total profit/loss\n"
-                "/positions — Open positions\n"
-                "/markets — Active weather markets\n"
-                "/redeem — Redeem winning positions\n"
-                "/help — This message"
+                "<b>/start</b> — enable trading\n"
+                "<b>/stop</b> — disable trading (monitor only)\n"
+                "<b>/settings</b> — toggle strategies & tune gates (buttons)\n"
+                "/set KEY VALUE — set a gate, e.g. /set BASKET_MAX_COST 0.80\n"
+                "/toggle KEY — flip a toggle, e.g. /toggle SNIPER_ENABLED\n"
+                "/status — bot status & positions\n"
+                "/balance — current balance\n"
+                "/pnl — total profit/loss\n"
+                "/positions — open positions\n"
+                "/markets — active weather markets\n"
+                "/redeem — redeem winning positions\n"
+                "/help — this message"
             )
         elif cmd.startswith('/'):
             self.send(f"❓ Unknown command. Try /help")

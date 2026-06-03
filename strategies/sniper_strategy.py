@@ -87,6 +87,11 @@ class SniperStrategy:
             if market_price < 0.005:
                 continue
 
+            # Real-chance filter: don't buy ~1% lottery buckets just because they're
+            # cheap. Require our model to give the bucket a real shot (tunable).
+            if bp.probability < Config.SNIPER_MIN_PROBABILITY:
+                continue
+
             # Calculate edge
             edge = bp.probability - market_price
 

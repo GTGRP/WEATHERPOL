@@ -35,8 +35,10 @@ from strategies.stability_strategy import StabilityStrategy
 from data.stability import StabilityEngine
 from data.liquidity_guard import LiquidityGuard
 from data.clob_client import ClobClient
+from data.market_timing import outcome_decided
 from trading.position_manager import PositionManager
 from bot.telegram_ui import TelegramBot
+from bot import settings_store
 from ml.decision_engine import MLDecisionEngine
 
 
@@ -44,6 +46,7 @@ class WeatherBot:
     """Main weather trading bot with full dashboard."""
 
     def __init__(self):
+        settings_store.load_into_config()   # apply persisted runtime overrides (Telegram /settings)
         self.fetcher = WeatherFetcher()
         self.engine = ProbabilityEngine()
         self.scanner = MarketScanner()
@@ -103,7 +106,9 @@ class WeatherBot:
         # don't bother scanning for buys this cycle — wait for open positions to
         # sell/resolve and free up capital (rechecked next scan; live re-queries CLOB).
         free_balance = self.pm.get_balance()
-        if free_balance < Config.MIN_ORDER_SIZE:
+        if not Config.TRADING_ENABLED:
+            log.info("⏸  Trading DISABLED (/stop) — monitoring & resolving only, no new buys")
+        elif free_balance < Config.MIN_ORDER_SIZE:
             log.info(f"⏸  Balance ${free_balance:.2f} < min order ${Config.MIN_ORDER_SIZE:.2f} — "
                      f"skipping buys, waiting for {len(self.pm.get_open_positions())} positions to resolve")
         else:
@@ -176,6 +181,9 @@ class WeatherBot:
         stability basket, which already scales its legs by the score) while
         still enforcing the grade gate, liquidity guard, and exit rule.
         """
+        # Hard safety: never place when trading is disabled (toggled mid-scan via /stop).
+        if not Config.TRADING_ENABLED:
+            return None
         if grade is None:
             grade = Config.GRADE_NEUTRAL
         if early_exit_price is None:
@@ -272,6 +280,24 @@ class WeatherBot:
 
         lat, lon = coords
 
+        # ── OUTCOME-DECIDED GATE (timezone-aware) ──
+        # Never trade a market whose measurement window has already closed in the
+        # CITY'S LOCAL time — the day's high/low is a recorded fact by then, so any
+        # buy is a known outcome (cheap losing legs). Markets stay OPEN until UMA
+        # resolves, which is NOT a signal that the weather is still undecided.
+        if Config.SKIP_DECIDED_MARKETS:
+            try:
+                decided, why = outcome_decided(
+                    market.market_type, market.measurement_date, lat, lon
+                )
+            except Exception as e:
+                decided, why = False, ''
+                log.debug(f"decided-gate failed {city}: {e}")
+            if decided:
+                log.info(f"   ⛔ DECIDED {city} {market.market_type.split('_')[0]} "
+                         f"{market.measurement_date:%b-%d} — {why} — skip (outcome already set)")
+                return
+
         # Fetch forecasts
         target_time = market.resolution_time
         forecasts = self.fetcher.fetch_all(lat, lon, city, target_time)
@@ -332,7 +358,7 @@ class WeatherBot:
         # buying junk cheap positions in non-winning baskets. Low grade → skip
         # the sniper entirely (the graded adjacent-basket below still runs).
         sniper_signals = []
-        if grade >= Config.SNIPER_MIN_GRADE:
+        if Config.SNIPER_ENABLED and grade >= Config.SNIPER_MIN_GRADE:
             sniper_signals = self.sniper.evaluate(
                 market.title, bucket_probs, market_prices, token_ids, balance
             )
@@ -423,9 +449,11 @@ class WeatherBot:
                         self.trades_placed += 1
 
         # Run Confident Predictor (45% WR, highest PnL — buy most-likely bucket)
-        confident_signals = self.confident.evaluate(
-            market.title, bucket_probs, market_prices, token_ids, balance
-        )
+        confident_signals = []
+        if Config.CONFIDENT_ENABLED:
+            confident_signals = self.confident.evaluate(
+                market.title, bucket_probs, market_prices, token_ids, balance
+            )
 
         for signal in confident_signals[:1]:  # top 1 per market
             self.signals_generated += 1

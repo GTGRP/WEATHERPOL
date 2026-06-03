@@ -37,6 +37,7 @@ class WeatherMarket:
     liquidity: float
     slug: str
     raw: Dict = field(default_factory=dict)
+    measurement_date: Optional[datetime] = None  # the LOCAL calendar day the high/low is measured (from slug)
 
 
 # Cities that have active weather markets on Polymarket
@@ -198,6 +199,7 @@ class MarketScanner:
             liquidity=float(event.get('liquidity', 0) or 0),
             slug=slug,
             raw=event,
+            measurement_date=target_date,  # the LOCAL day the slug names (e.g. june-3)
         )
 
     def _parse_outcome(self, market: Dict, temp_unit: str = 'C') -> Optional[Dict]:

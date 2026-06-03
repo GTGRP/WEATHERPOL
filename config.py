@@ -22,6 +22,9 @@ class Config:
     # ═══════════════════════════════════════════════════════════════════
     TRADING_MODE = os.getenv('TRADING_MODE', 'paper')  # 'paper' or 'live'
     STARTING_BALANCE = float(os.getenv('STARTING_BALANCE', '3.0'))
+    # Master trading switch — toggled live via Telegram /start /stop. When False
+    # the bot keeps scanning/monitoring but places NO new trades.
+    TRADING_ENABLED = os.getenv('TRADING_ENABLED', '1') == '1'
 
     # ═══════════════════════════════════════════════════════════════════
     # POLYMARKET WALLET (reused from polymarket-bot-v2)
@@ -166,6 +169,18 @@ class Config:
     # ═══════════════════════════════════════════════════════════════════
     SNIPER_MIN_GRADE = float(os.getenv('SNIPER_MIN_GRADE', '0.70'))         # stability grade required for a lone sniper buy
     SNIPER_MIN_CONFIDENCE = float(os.getenv('SNIPER_MIN_CONFIDENCE', '0.60'))  # model confidence required for a lone sniper buy
+    # Don't buy ~1% lottery buckets: require our model to give the bucket at least
+    # this real probability. Stops the "buys all cheap, all lose" behavior.
+    SNIPER_MIN_PROBABILITY = float(os.getenv('SNIPER_MIN_PROBABILITY', '0.12'))
+
+    # ═══════════════════════════════════════════════════════════════════
+    # OUTCOME-DECIDED GATE — never trade a market whose measurement window has
+    # already closed in the CITY'S LOCAL time (the day's high/low is a recorded
+    # fact; buying then = buying a known loser). Markets stay open until UMA
+    # resolves — that is NOT a sign the weather is still undecided.
+    # ═══════════════════════════════════════════════════════════════════
+    SKIP_DECIDED_MARKETS = os.getenv('SKIP_DECIDED_MARKETS', '1') == '1'
+    HIGH_TEMP_LOCK_HOUR = int(os.getenv('HIGH_TEMP_LOCK_HOUR', '18'))       # local hour after which the day's HIGH is considered set
 
     # ═══════════════════════════════════════════════════════════════════
     # STABILITY GRADE — stability is a GRADE (not a strategy): it scales

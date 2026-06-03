@@ -873,3 +873,103 @@ performance log over time, DISTINCT from the offline backtest.
   whether to only trade closer to resolution (SCAN_DAYS_AHEAD) where books exist.
 - GitHub push to GTGRP/WEATHERPOL still pending (Bash-classifier outage earlier; verify .env never in
   history before pushing).
+
+
+
+---
+
+## Session 5 CONTINUED (June 3→4, 2026) — CRITICAL FIX: don't trade ALREADY-DECIDED markets
+
+### The bug (real money lost in paper)
+The bot bought cheap bucket baskets on markets whose outcome was ALREADY a recorded fact. A
+"highest/lowest temperature on June 3" market settles on the observed extreme over that city's
+LOCAL calendar day — the daily HIGH happens in the afternoon. But the Polymarket market stays OPEN
+until UMA resolves (hours later / next day), which is NOT a sign the weather is still undecided. The
+scanner reasoned in UTC while the weather day is LOCAL, so e.g. Hong Kong (UTC+8) June-3 markets were
+still being traded at ~02:30 June-4 HKT — high long recorded — and the bot bought losing 1¢ legs
+across many cities. User: "buying knowing losing ... i lost my 10 dollar." Owned it; this was a real
+design hole (open-status ≠ outcome-undecided), not a nitpick.
+
+### The fix — timezone-aware OUTCOME-DECIDED gate
+- NEW `data/market_timing.py`: `get_utc_offset_hours(lat,lon)` (real offset from Open-Meteo
+  `timezone=auto`, cached per city; longitude/15 fallback, never crashes) and
+  `outcome_decided(market_type, measurement_date, lat, lon)`:
+    - highest → decided if local day is PAST, or it's the measurement day AND local hour ≥
+      `HIGH_TEMP_LOCK_HOUR` (default 18 — afternoon peak done).
+    - lowest → decided only once the local day fully ends (daily min can occur late at night).
+- `WeatherMarket.measurement_date` now carries the slug's local day (`data/market_scanner.py`).
+- `dashboard._evaluate_market` runs the gate FIRST (behind `SKIP_DECIDED_MARKETS=1`) and skips decided
+  markets entirely (all strategies): `⛔ DECIDED <city> <type> <date> — <why> — skip`.
+- Config/.env: `SKIP_DECIDED_MARKETS=1`, `HIGH_TEMP_LOCK_HOUR=18`.
+
+### Verified against 67 LIVE markets (no trading, no state change)
+8 correctly DECIDED→skip, 56 tradeable. Caught the exact loss case:
+- Hong Kong highest+lowest Jun-03 → DECIDED (local Jun-04 02:39, past day).
+- Lucknow highest Jun-03 → DECIDED (local Jun-04 00:09).
+- London 19:39 / Moscow 21:39 / Paris 20:39 / Madrid 20:39 / Ankara 21:39 highest Jun-03 → DECIDED
+  (≥18:00 local, high already set). Offsets resolved correctly incl. DST (BST +1, etc.).
+- Also confirmed live: the balance EARLY-OUT fired ("⏸ Balance $1.00 < min order — waiting for 14
+  positions to resolve"), so balance awareness works end-to-end too.
+
+### NOTE for next session
+- The paper state is polluted with ~14 losing positions + ~$1 balance from the BUGGY runs. For an
+  honest re-test, reset paper state (fresh STARTING_BALANCE) — offered to the user.
+- BETTER than skipping decided days: fetch the ACTUAL observed max/min for that local day and buy ONLY
+  the CONFIRMED winning bucket if still < ~$0.95 (Seoul ~4% confirmed-outcome edge) — never cheap
+  speculative baskets. This is the natural next build.
+- Files this fix: data/market_timing.py (new), data/market_scanner.py, dashboard.py, config.py, .env,
+  .env.example. Durable memory: weather-bot-decided-gate.md.
+
+
+
+---
+
+## Session 5 CONTINUED (June 4, 2026) — Telegram /start /stop + live SETTINGS panel + selectivity
+
+User: add Telegram /stop /start (enable/disable trading); a settings menu to toggle strategies (tick
+boxes) and change gate values (like the 0.85) live; and stop the "buys all cheap like lottery, all
+lose" behavior. (The biggest cheap-loss cause — buying AFTER the peak — was fixed by the decided-gate
+in the previous entry.)
+
+### Master trading switch + runtime settings
+- `Config.TRADING_ENABLED` (default 1). When False the bot keeps scanning/monitoring/resolving but
+  places NO new trades. `dashboard.run_once` announces "⏸ Trading DISABLED (/stop)" and skips market
+  eval; `_place` also hard-returns None as a mid-scan safety.
+- NEW `bot/settings_store.py` — live-tunable overrides applied as `Config` attributes and persisted to
+  `data/runtime_settings.json` (gitignored), reloaded at startup via `settings_store.load_into_config()`
+  (called first thing in `WeatherBot.__init__`). BOOL_KEYS = trading + strategy toggles + LiqGuard/
+  LiqStrict/GradeSize/SkipDecided/ML. NUM_KEYS (with ranges/steps) = BASKET_MAX_COST, GRADE_MIN_TO_TRADE,
+  SNIPER_MIN_GRADE/CONFIDENCE/PROBABILITY, BASKET_TIGHT_*, MIN_EDGE_TO_ENTER, LIQUIDITY_THIN_SIZE_MULT,
+  STABILITY_EARLY_EXIT_PRICE, MAX_BET_PCT, HIGH_TEMP_LOCK_HOUR. API: set_value/toggle/bump/snapshot.
+
+### Telegram controls (bot/telegram_ui.py — polling already existed)
+- /start (/resume) → enable trading; /stop (/pause) → disable.
+- /settings (/config) → sends a panel with an INLINE KEYBOARD: tick-box buttons (✅/❌) for every
+  toggle (tap to flip), and ➖/➕ rows to step each numeric gate. Button presses arrive as
+  callback_query (now handled in `_check_updates` → `_handle_callback`), apply via settings_store, and
+  the panel is edited in place (editMessageText).
+- /set KEY VALUE and /toggle KEY for precise/text control. /help updated.
+
+### Selectivity (cheap-hunt) fix
+- `SNIPER_MIN_PROBABILITY` (default 0.12) — sniper now SKIPS buckets our model gives <12% real chance,
+  so it stops buying ~1% cheap lottery tickets that mostly lose. Tunable live.
+- Strategy toggles now actually respected in the dashboard: sniper block gated by `SNIPER_ENABLED`
+  (and grade≥SNIPER_MIN_GRADE), confident block by `CONFIDENT_ENABLED` (spread/stability already were).
+- (Cheap buys with a genuine pre-peak chance are still allowed; the decided-gate blocks post-peak ones.
+  "Hold ~1h through peak then sell" exit refinement noted as a future build.)
+
+### Files changed
+- bot/settings_store.py (NEW); bot/telegram_ui.py (settings panel, callbacks, /start /stop /settings
+  /set /toggle, edit/answer helpers); dashboard.py (load settings, TRADING_ENABLED gates, strategy
+  toggles); strategies/sniper_strategy.py (SNIPER_MIN_PROBABILITY); config.py + .env + .env.example
+  (TRADING_ENABLED, SNIPER_MIN_PROBABILITY); .gitignore (data/runtime_settings.json).
+
+### Verified (exit 0)
+- Imports clean. settings_store: toggle/set/bump/reject-unknown/persist/reload all correct (reloaded 22
+  overrides, TRADING_ENABLED survived a disk round-trip). Telegram panel builds (17 button rows incl.
+  TRADING toggle). WeatherBot() boots with the load hook. `_place` returns None while trading disabled.
+
+### Next
+- Optional: reset polluted paper state (still ~$1 + losing positions from the pre-decided-gate bug) for
+  a clean re-test — offered to user.
+- Confirmed-winner mode for near-decided days (Seoul ~4% edge) and "hold through peak then sell" exit.
