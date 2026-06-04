@@ -119,16 +119,27 @@ class StabilityStrategy:
         target = stability.forecast_max_c
         center_i = min(range(len(indexed)), key=lambda i: abs(indexed[i][0] - target))
 
-        # Conviction → basket WIDTH. High grade + high center-confidence → TIGHT
-        # (center + the neighbor the fractional forecast leans toward, e.g.
-        # predict 24 → 24+25). Otherwise WIDER (center ± 1, e.g. 23+24+25) to
-        # cover forecast error when we're less sure.
+        # Conviction → basket WIDTH, but adjacency is DIRECTIONAL, not blind.
+        # Always buy the forecast-peak (center). Add at most ONE neighbor, on the
+        # side the day is trending toward:
+        #   warming → upper neighbor (+1), cooling → lower neighbor (-1),
+        #   flat → the side the fractional forecast leans toward.
+        # The neighbor is only KEPT if it survives the price floor + MAX_LEG_PRICE
+        # checks below (i.e. it's a real, sellable mispricing — "not all adjacent").
         center_val, center_bp = indexed[center_i]
         center_conf = getattr(center_bp, 'confidence', 0.0)
         lean = 1 if (target - center_val) >= 0 else -1
+        trend = (stability.trend or '').lower()
+        if trend == 'warming':
+            direction = 1
+        elif trend == 'cooling':
+            direction = -1
+        else:
+            direction = lean
         tight = (stability.score >= Config.BASKET_TIGHT_GRADE
                  and center_conf >= Config.BASKET_TIGHT_CONFIDENCE)
-        offsets = [0, lean] if tight else [-1, 0, 1]
+        # Tight (high conviction) → center only. Otherwise → center + trend neighbor.
+        offsets = [0] if tight else [0, direction]
 
         chosen = []
         seen_idx = set()

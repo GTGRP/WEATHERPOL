@@ -28,10 +28,8 @@ from logger import log
 from data.weather_fetcher import WeatherFetcher, get_city_coords, CITY_COORDS
 from data.probability_engine import ProbabilityEngine
 from data.market_scanner import MarketScanner, MARKET_CITIES
-from strategies.sniper_strategy import SniperStrategy
-from strategies.spread_strategy import SpreadStrategy
+from strategies.peak_basket import PeakBasketStrategy
 from strategies.confident_strategy import ConfidentStrategy
-from strategies.stability_strategy import StabilityStrategy
 from data.stability import StabilityEngine
 from data.liquidity_guard import LiquidityGuard
 from data.clob_client import ClobClient
@@ -50,10 +48,8 @@ class WeatherBot:
         self.fetcher = WeatherFetcher()
         self.engine = ProbabilityEngine()
         self.scanner = MarketScanner()
-        self.sniper = SniperStrategy()
-        self.spread = SpreadStrategy()
+        self.peak_basket = PeakBasketStrategy()
         self.confident = ConfidentStrategy()
-        self.stability_strat = StabilityStrategy()
         self.stability_engine = StabilityEngine()
         # Stability GRADE + liquidity guard (applied across ALL strategies)
         self.liquidity = LiquidityGuard()
@@ -194,6 +190,13 @@ class WeatherBot:
             log.info(f"   ⏭️  GRADE SKIP {strategy}:{bucket_label[:18]} — grade {grade:.2f} < {Config.GRADE_MIN_TO_TRADE}")
             return None
 
+        # ── PRICE FLOOR: never buy unsellable junk ──
+        # A leg quoted below MIN_ENTRY_PRICE (~5¢) has no real bid to sell into,
+        # so it can only resolve to $0 (full loss). Reject up front.
+        if entry_price < Config.MIN_ENTRY_PRICE:
+            log.info(f"   ⏭️  PRICE FLOOR {strategy}:{bucket_label[:18]} — ask ${entry_price:.4f} < ${Config.MIN_ENTRY_PRICE:.2f} (unsellable)")
+            return None
+
         # ── Grade sizing ──
         mult = self._grade_multiplier(grade) if apply_grade_size else 1.0
         size_usd = base_size_usd * mult
@@ -234,6 +237,11 @@ class WeatherBot:
                 log.info(f"   💧 LIQ NOBOOK {strategy}:{bucket_label[:18]} — no bid → size x{Config.LIQUIDITY_THIN_SIZE_MULT} + hold")
 
         if fill_price <= 0:
+            return None
+        # Maker re-pricing must also respect the floor: a best_bid below the
+        # floor is the same unsellable-junk trap (we'd own a leg with no exit).
+        if fill_price < Config.MIN_ENTRY_PRICE:
+            log.info(f"   ⏭️  PRICE FLOOR {strategy}:{bucket_label[:18]} — maker fill ${fill_price:.4f} < ${Config.MIN_ENTRY_PRICE:.2f}")
             return None
         shares = size_usd / fill_price
 
@@ -279,6 +287,14 @@ class WeatherBot:
             return
 
         lat, lon = coords
+
+        # ── HIGHEST-TEMP-ONLY GATE ──
+        # We only trade daily-high markets: the high is reached predictably in
+        # the afternoon and the forecast is priced 24–48h out. Lowest-temp /
+        # "or below" markets resolve on late-night minima we don't model well.
+        if Config.HIGHEST_TEMP_ONLY and 'highest' not in (market.market_type or '').lower():
+            log.debug(f"   ⏭️  SKIP {city} {market.market_type} — highest-temp only")
+            return
 
         # ── OUTCOME-DECIDED GATE (timezone-aware) ──
         # Never trade a market whose measurement window has already closed in the
@@ -353,156 +369,20 @@ class WeatherBot:
                 f"{'HOLD' if hold_hint else f'exit@{early_exit_price:.2f}'}"
             )
 
-        # Run Sniper Strategy — but ONLY on high-conviction, stable city-days.
-        # The lone cheap-tail sniper is gated by grade + confidence so it stops
-        # buying junk cheap positions in non-winning baskets. Low grade → skip
-        # the sniper entirely (the graded adjacent-basket below still runs).
-        sniper_signals = []
-        if Config.SNIPER_ENABLED and grade >= Config.SNIPER_MIN_GRADE:
-            sniper_signals = self.sniper.evaluate(
-                market.title, bucket_probs, market_prices, token_ids, balance
-            )
-        elif Config.SNIPER_ENABLED:
-            log.info(f"   ⏭️  SNIPER GATE {city}: grade {grade:.2f} < {Config.SNIPER_MIN_GRADE} — basket only")
-
-        for signal in sniper_signals[:2]:  # top 2 per market
-            # Confidence gate: the forecast must be high-conviction for a lone buy.
-            if signal.confidence < Config.SNIPER_MIN_CONFIDENCE:
-                log.info(f"   ⏭️  SNIPER GATE {city}:{signal.bucket_label[:18]} — conf {signal.confidence:.2f} < {Config.SNIPER_MIN_CONFIDENCE}")
-                continue
-
-            self.signals_generated += 1
-
-            # ML VALIDATION: ask GPT-5.5 if we should take this trade
-            ml_result = self.ml.validate_signal(
-                city=city, bucket_label=signal.bucket_label,
-                entry_price=signal.market_price, our_prob=signal.our_probability,
-                edge=signal.edge, forecast_temp=float(signal.reason.split('Forecast=')[1].split('°')[0]) if 'Forecast=' in signal.reason else 0.0,
-                n_models=3,
-                weekly_context=self.pm.get_weekly_summary(),
-            )
-
-            ml_action = ml_result.get('action', 'BUY')
-            ml_conf = float(ml_result.get('confidence', 0.5))
-            if ml_action == 'SKIP' and ml_conf > 0.7:
-                log.info(f"🧠 ML SKIP: {signal.bucket_label} — {ml_result.get('reason', '')}")
-                continue
-
-            log.info(
-                f"🎯 SNIPER: {city} | {signal.bucket_label[:30]} @ "
-                f"${signal.market_price:.4f} | Edge={signal.edge:.1%} | "
-                f"EV={signal.expected_return:.0f}x | ML={ml_action}({ml_conf:.0%})"
-            )
-
-            # Execute (graded + liquidity-gated, maker-at-bid)
-            pos = self._place(
-                token_id=signal.token_id,
-                condition_id=condition_ids.get(signal.bucket_label, ''),
-                entry_price=signal.market_price,
-                base_size_usd=signal.kelly_size,
-                market_title=market.title,
-                bucket_label=signal.bucket_label,
-                strategy='sniper',
-                city=city,
-                slug=market.slug,
-                resolution_time=market.resolution_time,
-                edge=signal.edge,
-                grade=grade, hold_hint=hold_hint, early_exit_price=early_exit_price,
-            )
-            if pos:
-                self.trades_placed += 1
-                self.telegram.notify_trade(
-                    'BUY', signal.bucket_label, pos.entry_price,
-                    pos.cost_usd, pos.shares, 'sniper',
-                    edge=signal.edge, city=city,
-                )
-
-        # Run Spread Strategy (89% WR — PRIMARY for safety)
-        if Config.SPREAD_ENABLED:
-            spread_signals = self.spread.evaluate(
+        # ───────────────────────────────────────────────────────────────────
+        # PEAK BASKET — unified directional-peak strategy (THE primary strategy).
+        # Buys the ensemble forecast peak + ONE trend-directional neighbor.
+        # Scales capital with stability, models, edge, and basket efficiency.
+        # Replaces the old scattered sniper/spread/stability strategies.
+        # ───────────────────────────────────────────────────────────────────
+        if Config.PEAK_BASKET_ENABLED:
+            peak_signals = self.peak_basket.evaluate(
                 market.title, bucket_probs, market_prices, token_ids, balance,
-                city=city,
+                city=city, stability=stab, grade=grade,
             )
-
-            for signal in spread_signals[:1]:
+            for sig in peak_signals:
                 self.signals_generated += 1
-                log.info(
-                    f"📊 SPREAD: {city} | {signal.primary_bucket[:25]} | "
-                    f"{len(signal.legs)} legs | Cost=${signal.total_cost:.2f}"
-                )
-                for leg in signal.legs:
-                    pos = self._place(
-                        token_id=leg.token_id,
-                        condition_id=condition_ids.get(leg.bucket_label, ''),
-                        entry_price=leg.market_price,
-                        base_size_usd=leg.size_usd,
-                        market_title=market.title,
-                        bucket_label=leg.bucket_label,
-                        strategy='spread',
-                        city=city,
-                        slug=market.slug,
-                        resolution_time=market.resolution_time,
-                        edge=getattr(signal, 'edge_pct', 0.0) / 100.0,
-                        grade=grade, hold_hint=hold_hint, early_exit_price=early_exit_price,
-                    )
-                    if pos:
-                        self.trades_placed += 1
-
-        # Run Confident Predictor (45% WR, highest PnL — buy most-likely bucket)
-        confident_signals = []
-        if Config.CONFIDENT_ENABLED:
-            confident_signals = self.confident.evaluate(
-                market.title, bucket_probs, market_prices, token_ids, balance
-            )
-
-        for signal in confident_signals[:1]:  # top 1 per market
-            self.signals_generated += 1
-            log.info(
-                f"💎 CONFIDENT: {city} | {signal.bucket_label[:25]} @ "
-                f"${signal.market_price:.3f} | P={signal.our_probability:.0%} | "
-                f"Edge={signal.edge:.0%} | EV={signal.expected_return:.0f}x"
-            )
-
-            # Confident = highest-conviction bucket → always hold to resolution.
-            pos = self._place(
-                token_id=signal.token_id,
-                condition_id=condition_ids.get(signal.bucket_label, ''),
-                entry_price=signal.market_price,
-                base_size_usd=signal.size_usd,
-                market_title=market.title,
-                bucket_label=signal.bucket_label,
-                strategy='confident',
-                city=city,
-                slug=market.slug,
-                resolution_time=market.resolution_time,
-                edge=signal.edge,
-                grade=grade, hold_hint=True, early_exit_price=early_exit_price,
-            )
-            if pos:
-                self.trades_placed += 1
-                self.telegram.notify_trade(
-                    'BUY', signal.bucket_label, pos.entry_price,
-                    pos.cost_usd, pos.shares, 'confident',
-                    edge=signal.edge, city=city,
-                )
-
-        # Graded adjacent-bucket basket (24 → 23+24+25) — fires only on
-        # predictable city-days. Reuses the single `stab` grade computed above;
-        # routed through _place for the same grade-sizing + liquidity gate.
-        if Config.STABILITY_ENABLED and stab and stab.predictable:
-            stability_signals = self.stability_strat.evaluate(
-                market.title, bucket_probs, market_prices, token_ids,
-                balance, city=city, stability=stab,
-            )
-            for sig in stability_signals:
-                self.signals_generated += 1
-                log.info(
-                    f"🌡️ STABILITY: {city} | score={sig.stability_score:.2f} "
-                    f"{sig.trend} | center={sig.primary_bucket[:18]} "
-                    f"({sig.forecast_max_c:.1f}°C) | {len(sig.legs)} legs "
-                    f"cost=${sig.total_cost:.2f} Pwin={sig.combined_prob:.0%} | "
-                    f"{sig.exit_hint}"
-                )
+                log.info(f"   🎯 {sig.reason}")
                 for leg in sig.legs:
                     pos = self._place(
                         token_id=leg.token_id,
@@ -511,18 +391,61 @@ class WeatherBot:
                         base_size_usd=leg.size_usd,
                         market_title=market.title,
                         bucket_label=leg.bucket_label,
-                        strategy='stability',
+                        strategy=f'peak_basket_{leg.role}',
                         city=city,
                         slug=market.slug,
                         resolution_time=market.resolution_time,
-                        edge=Config.STABILITY_MIN_EDGE,
+                        edge=sig.combined_prob - sig.total_cost,
                         grade=grade,
-                        hold_hint=sig.hold_to_resolution,
+                        hold_hint=sig.hold_hint,
                         early_exit_price=early_exit_price,
-                        apply_grade_size=False,  # legs already scaled by score
+                        apply_grade_size=False,  # PeakBasket sizes itself
                     )
                     if pos:
                         self.trades_placed += 1
+                        self.telegram.notify_trade(
+                            'BUY', leg.bucket_label, pos.entry_price,
+                            pos.cost_usd, pos.shares, f'peak_{leg.role}',
+                            edge=sig.combined_prob - sig.total_cost, city=city,
+                        )
+
+        # ───────────────────────────────────────────────────────────────────
+        # CONFIDENT — simple peak-only fallback. Only fires when PeakBasket
+        # is disabled OR as a second opinion on high-conviction peak-only bets.
+        # ───────────────────────────────────────────────────────────────────
+        if Config.CONFIDENT_ENABLED:
+            confident_signals = self.confident.evaluate(
+                market.title, bucket_probs, market_prices, token_ids, balance,
+            )
+            for signal in confident_signals[:1]:
+                # Skip if PeakBasket already bought this bucket (dedup).
+                self.signals_generated += 1
+                log.info(
+                    f"   💎 CONFIDENT: {city} | {signal.bucket_label[:25]} @ "
+                    f"${signal.market_price:.3f} | P={signal.our_probability:.0%} | "
+                    f"Edge={signal.edge:.0%}"
+                )
+                pos = self._place(
+                    token_id=signal.token_id,
+                    condition_id=condition_ids.get(signal.bucket_label, ''),
+                    entry_price=signal.market_price,
+                    base_size_usd=signal.size_usd,
+                    market_title=market.title,
+                    bucket_label=signal.bucket_label,
+                    strategy='confident',
+                    city=city,
+                    slug=market.slug,
+                    resolution_time=market.resolution_time,
+                    edge=signal.edge,
+                    grade=grade, hold_hint=True, early_exit_price=early_exit_price,
+                )
+                if pos:
+                    self.trades_placed += 1
+                    self.telegram.notify_trade(
+                        'BUY', signal.bucket_label, pos.entry_price,
+                        pos.cost_usd, pos.shares, 'confident',
+                        edge=signal.edge, city=city,
+                    )
 
     def _check_resolutions(self):
         """Check if any positions resolved, redeem winners."""

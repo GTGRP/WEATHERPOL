@@ -80,6 +80,12 @@ class Config:
     # ═══════════════════════════════════════════════════════════════════
     # Sniper strategy: buy buckets priced below this when forecast is strong
     SNIPER_MAX_ENTRY_PRICE = float(os.getenv('SNIPER_MAX_ENTRY_PRICE', '0.15'))
+    # HARD PRICE FLOOR (all strategies): never buy a YES leg cheaper than this.
+    # Below ~5¢ the book has no real bid — you can buy but not sell, so the leg
+    # can only resolve to $0 (full loss). Kills the 0.1¢ dead-junk baskets.
+    MIN_ENTRY_PRICE = float(os.getenv('MIN_ENTRY_PRICE', '0.05'))
+    # Only trade highest-temperature markets (skip lowest / "or below").
+    HIGHEST_TEMP_ONLY = os.getenv('HIGHEST_TEMP_ONLY', '1') == '1'
     # Minimum edge (our probability - market price) to enter
     MIN_EDGE_TO_ENTER = float(os.getenv('MIN_EDGE_TO_ENTER', '0.10'))
     # Kelly criterion fraction (conservative)
@@ -105,13 +111,13 @@ class Config:
     # ═══════════════════════════════════════════════════════════════════
     # FEATURE TOGGLES (enable/disable without breaking anything)
     # ═══════════════════════════════════════════════════════════════════
-    SNIPER_ENABLED = os.getenv('SNIPER_ENABLED', '1') == '1'
-    SPREAD_ENABLED = os.getenv('SPREAD_STRATEGY_ENABLED', '1') == '1'
-    SELECTIVE_SNIPER_ENABLED = os.getenv('SELECTIVE_SNIPER_ENABLED', '1') == '1'
-    QUICK_FLIP_ENABLED = os.getenv('QUICK_FLIP_ENABLED', '1') == '1'
-    CORRELATION_ARB_ENABLED = os.getenv('CORRELATION_ARB_ENABLED', '1') == '1'
+    SNIPER_ENABLED = os.getenv('SNIPER_ENABLED', '0') == '1'
+    SPREAD_ENABLED = os.getenv('SPREAD_STRATEGY_ENABLED', '0') == '1'
+    SELECTIVE_SNIPER_ENABLED = os.getenv('SELECTIVE_SNIPER_ENABLED', '0') == '1'
+    QUICK_FLIP_ENABLED = os.getenv('QUICK_FLIP_ENABLED', '0') == '1'
+    CORRELATION_ARB_ENABLED = os.getenv('CORRELATION_ARB_ENABLED', '0') == '1'
     CONFIDENT_ENABLED = os.getenv('CONFIDENT_ENABLED', '1') == '1'
-    STABILITY_ENABLED = os.getenv('STABILITY_ENABLED', '1') == '1'
+    STABILITY_ENABLED = os.getenv('STABILITY_ENABLED', '0') == '1'
     LOCKIN_ENABLED = os.getenv('LOCKIN_ENABLED', '1') == '1'
     ML_ENABLED = os.getenv('ML_ENABLED', '1') == '1'
     TELEGRAM_ENABLED = os.getenv('TELEGRAM_ENABLED', '1') == '1'
@@ -151,6 +157,22 @@ class Config:
     STABILITY_MAX_FRACTION = float(os.getenv('STABILITY_MAX_FRACTION', '0.25'))  # max % of balance per basket
     STABILITY_EARLY_EXIT_PRICE = float(os.getenv('STABILITY_EARLY_EXIT_PRICE', '0.85'))
     STABILITY_EXIT_HOURS_BEFORE = float(os.getenv('STABILITY_EXIT_HOURS_BEFORE', '1.0'))
+
+    # ═══════════════════════════════════════════════════════════════════
+    # PEAK BASKET — unified directional-peak strategy (THE ONLY STRATEGY).
+    # Buys the ensemble forecast peak + ONE trend-directional neighbor.
+    # Scales capital with stability score, model agreement, edge, and
+    # basket efficiency. Never buys legs below MIN_ENTRY_PRICE.
+    # ═══════════════════════════════════════════════════════════════════
+    PEAK_BASKET_ENABLED = os.getenv('PEAK_BASKET_ENABLED', '1') == '1'
+    PEAK_MIN_STABILITY = float(os.getenv('PEAK_MIN_STABILITY', '0.45'))        # minimum grade to trade
+    PEAK_MAX_PEAK_PRICE = float(os.getenv('PEAK_MAX_PEAK_PRICE', '0.85'))     # don't buy peak if market already knows
+    PEAK_MAX_NEIGHBOR_PRICE = float(os.getenv('PEAK_MAX_NEIGHBOR_PRICE', '0.60'))  # neighbor cap
+    PEAK_MAX_BASKET_COST = float(os.getenv('PEAK_MAX_BASKET_COST', '0.95'))   # sum(leg prices) < this → ≥5% profit on any win
+    PEAK_MIN_EDGE = float(os.getenv('PEAK_MIN_EDGE', '0.03'))                 # P(win) - basket_cost minimum
+    PEAK_BASE_FRACTION = float(os.getenv('PEAK_BASE_FRACTION', '0.05'))       # base % of balance per basket
+    PEAK_MAX_FRACTION = float(os.getenv('PEAK_MAX_FRACTION', '0.25'))         # max % of balance per basket (when everything aligns)
+    PEAK_MIN_MODELS = int(os.getenv('PEAK_MIN_MODELS', '2'))                  # minimum ensemble models required
 
     # ═══════════════════════════════════════════════════════════════════
     # BASKET QUALITY — predict the max temp, then buy an adjacent basket whose

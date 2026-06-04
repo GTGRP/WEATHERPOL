@@ -972,4 +972,70 @@ in the previous entry.)
 ### Next
 - Optional: reset polluted paper state (still ~$1 + losing positions from the pre-decided-gate bug) for
   a clean re-test — offered to user.
+
+## June 4, 2026 — STRATEGY REWRITE: Peak Basket replaces 4 scattered strategies
+
+### Why (the 0-for-61 lesson)
+Live paper trading returned **0% WR on 61 trades** (`spread:48t 0%WR $-26.69 | stability:22t 0%WR $-42.90`).
+Root cause: the old spread + stability strategies bought cheap-tail buckets ($0.0005-$0.01) blindly across
+both directions ([-2,-1,0,+1,+2] or [-1,0,1]). At 0.1c there is NO BID — you can buy but not sell, so
+every leg resolves to $0 = instant 100% loss. The Becker 14.7M-trade dataset proved every cheap tier has
+negative unconditional edge, yet the strategies kept buying them.
+
+### What changed
+
+**DELETED:** `strategies/spread_strategy.py` — 48 trades, -$26.69, 0% WR. Gone.
+
+**CREATED:** `strategies/peak_basket.py` — Unified directional-peak basket (THE ONE STRATEGY).
+- Finds ensemble forecast peak (7+ models: ECMWF, GFS, ICON, JMA, GEM, OWM, NWS, UKMO)
+- Buys peak + ONE trend-directional neighbor:
+  - warming -> upper neighbor (+1C) as insurance against drift
+  - cooling -> lower neighbor (-1C)
+  - stable/sideways -> peak only (no neighbor needed, models agree)
+- Hard price floor: NEVER buy a leg below MIN_ENTRY_PRICE (5c) — unsellable below this
+- Basket cost < PEAK_MAX_BASKET_COST (95c) — any single winning leg nets >=5% profit
+- Dynamic capital scaling: stability_score x model_agreement x edge x basket_efficiency
+  - When everything aligns (grade >0.80, edge >15%, 5+ models) -> bet up to 25% of balance
+  - When uncertain (grade <0.55) -> bet as little as 1% of balance
+- Directional ONLY: never buys both neighbors blindly — trend determines which side
+- Always holds to resolution (thin books make exits losing)
+
+**UPDATED:** `dashboard.py`
+- Removed sniper/spread/stability imports, init, and invocation blocks
+- Wired PeakBasket as the PRIMARY strategy (behind PEAK_BASKET_ENABLED=1)
+- Kept Confident as optional fallback (behind CONFIDENT_ENABLED=1)
+- Price floor enforced in both `_place()` entry-price and maker-fill checks
+- Highest-temp-only gate: skips all "or below" / lowest_temperature markets
+
+**UPDATED:** `config.py`
+- New knobs: PEAK_BASKET_ENABLED, PEAK_MIN_STABILITY, PEAK_MAX_PEAK_PRICE, PEAK_MAX_NEIGHBOR_PRICE,
+  PEAK_MAX_BASKET_COST, PEAK_MIN_EDGE, PEAK_BASE_FRACTION, PEAK_MAX_FRACTION, PEAK_MIN_MODELS
+- MIN_ENTRY_PRICE=0.05 (hard floor, all strategies)
+- HIGHEST_TEMP_ONLY=1 (skip low-temp / "or below" markets)
+- SNIPER_ENABLED/SPREAD_ENABLED/STABILITY_ENABLED default to '0'
+
+**UPDATED:** `.env` / `.env.example`
+- Disabled old strategies, enabled PeakBasket, added PEAK_* config entries
+
+### Architecture now
+```
+dashboard._evaluate_market()
+  -> stability grade (computed once)
+  -> highest-temp-only gate
+  -> PeakBasket.evaluate()  <— THE strategy
+     -> stability gate (grade >= 0.45)
+     -> find forecast peak (closest to ensemble forecast_max_c)
+     -> trend -> direction (warming/cooling/stable)
+     -> price floor + caps per role
+     -> edge check
+     -> dynamic sizing (5-component multiplier)
+     -> allocate: peak 65%, neighbor 35%
+  -> _place() (grade gate + price floor + liquidity guard + maker re-price)
+  -> optional: Confident fallback (peak-only, high-conviction)
+```
+
+### Next
+- Paper-trade reset recommended (current balance $1 + 61 losing positions from old strategies)
+- Monitor PeakBasket signals for correct trend-directional neighbor selection
+- Tune PEAK_MIN_STABILITY and PEAK_MAX_BASKET_COST based on live paper results
 - Confirmed-winner mode for near-decided days (Seoul ~4% edge) and "hold through peak then sell" exit.
