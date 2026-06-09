@@ -1,0 +1,223 @@
+"""
+Observed-weather engine — "what has actually happened so far today".
+
+This is the data backbone of the overhauled, observation-driven strategy. For a
+given location and local measurement day it returns:
+
+* the **max (or min) temperature already observed** so far today,
+* the **forecast extreme over the remaining hours** of the local day,
+* a **spread** (cross-model std) on that remaining forecast, and
+* how many hours are left and how many models contributed.
+
+Those feed ``data.observed_math`` to produce a locked-in bucket distribution.
+
+Network note
+------------
+The actual HTTP call to Open-Meteo uses ``requests``, imported **lazily inside**
+``_http_get`` so that this module (and its pure helpers below) import cleanly in
+environments where ``requests`` is not installed or the network is disabled.
+The pure helper ``split_observed_remaining`` is fully unit-testable offline.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Sequence, Tuple
+
+try:  # logger pulls Config (and dotenv) in the real app; stay importable offline.
+    from logger import log  # type: ignore
+except Exception:  # pragma: no cover - fallback only used in bare sandboxes
+    import logging
+    log = logging.getLogger("observed_weather")
+
+# Open-Meteo forecast models we average for a remaining-hours spread estimate.
+_DEFAULT_MODELS = ("ecmwf_ifs04", "gfs_seamless", "icon_seamless", "jma_seamless", "gem_seamless")
+_OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+
+
+@dataclass
+class ObservedDayState:
+    """Snapshot of a single local measurement day, mid-day."""
+    observed_extreme_c: float
+    remaining_extreme_c: Optional[float]
+    remaining_spread_c: float
+    hours_remaining: int
+    n_models: int
+    current_temp_c: Optional[float] = None
+    mode: str = "high"
+    as_of_local: Optional[str] = None
+    raw: Dict = field(default_factory=dict)
+
+    @property
+    def is_locked(self) -> bool:
+        """True when no forecast hours remain in the local day."""
+        return self.hours_remaining <= 0 or self.remaining_extreme_c is None
+
+
+def split_observed_remaining(
+    hourly_times: Sequence,
+    hourly_temps: Sequence,
+    now_local: datetime,
+    mode: str = "high",
+) -> Tuple[Optional[float], List[float], int]:
+    """Split one day's hourly series into (observed_extreme, remaining_temps, hours_left).
+
+    ``hourly_times`` may be naive ``datetime`` objects (local) or ISO strings.
+    Hours at or before ``now_local`` count as observed; later hours are the
+    remainder. Pure / offline-testable.
+    """
+    observed: List[float] = []
+    remaining: List[float] = []
+    for t, temp in zip(hourly_times, hourly_temps):
+        if temp is None:
+            continue
+        if isinstance(t, str):
+            try:
+                t = datetime.fromisoformat(t.replace("Z", ""))
+            except Exception:
+                continue
+        if t <= now_local:
+            observed.append(float(temp))
+        else:
+            remaining.append(float(temp))
+
+    if not observed:
+        observed_extreme = None
+    else:
+        observed_extreme = max(observed) if mode == "high" else min(observed)
+    return observed_extreme, remaining, len(remaining)
+
+
+def _stdev(values: Sequence[float]) -> float:
+    vals = [float(v) for v in values if v is not None]
+    if len(vals) < 2:
+        return 0.0
+    mean = sum(vals) / len(vals)
+    var = sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)
+    return math.sqrt(var)
+
+
+class ObservedWeather:
+    """Fetches and assembles an :class:`ObservedDayState` from Open-Meteo."""
+
+    def __init__(self, models: Sequence[str] = _DEFAULT_MODELS, timeout: float = 8.0):
+        self.models = list(models)
+        self.timeout = timeout
+
+    # -- networking (lazy import keeps the module importable offline) --------
+    def _http_get(self, url: str, params: Dict) -> Optional[Dict]:
+        try:
+            import requests  # lazy: only needed when actually fetching
+        except Exception as e:  # pragma: no cover
+            log.warning(f"requests unavailable, cannot fetch observed weather: {e}")
+            return None
+        try:
+            resp = requests.get(url, params=params, timeout=self.timeout)
+            if resp.status_code != 200:
+                return None
+            return resp.json()
+        except Exception as e:
+            log.warning(f"observed-weather fetch failed: {e}")
+            return None
+
+    def get_state(
+        self,
+        lat: float,
+        lon: float,
+        measurement_date: Optional[datetime] = None,
+        mode: str = "high",
+    ) -> Optional[ObservedDayState]:
+        """Assemble the observed/remaining state for the local measurement day.
+
+        Returns ``None`` if no data could be fetched (e.g. offline).
+        """
+        data = self._http_get(
+            _OPEN_METEO_URL,
+            {
+                "latitude": lat,
+                "longitude": lon,
+                "hourly": "temperature_2m",
+                "current": "temperature_2m",
+                "timezone": "auto",
+                "forecast_days": 2,
+                "past_days": 1,
+                "models": ",".join(self.models),
+            },
+        )
+        if not data:
+            return None
+
+        utc_offset = int(data.get("utc_offset_seconds", 0) or 0)
+        now_local = datetime.now(timezone.utc) + timedelta(seconds=utc_offset)
+        now_local = now_local.replace(tzinfo=None)
+
+        target_day = (measurement_date or now_local).date()
+
+        hourly = data.get("hourly", {}) or {}
+        times_raw = hourly.get("time", []) or []
+        times: List[datetime] = []
+        for t in times_raw:
+            try:
+                times.append(datetime.fromisoformat(str(t).replace("Z", "")))
+            except Exception:
+                times.append(None)
+
+        # Collect per-model temperature arrays. With multiple models Open-Meteo
+        # suffixes keys like "temperature_2m_ecmwf_ifs04"; with one it is plain.
+        model_series: List[List[Optional[float]]] = []
+        for key, val in hourly.items():
+            if key.startswith("temperature_2m"):
+                model_series.append(list(val))
+        if not model_series:
+            return None
+
+        # Observed extreme: use the first available model's elapsed hours plus
+        # the live "current" reading (most accurate for what already happened).
+        primary = model_series[0]
+        day_idx = [i for i, t in enumerate(times) if t is not None and t.date() == target_day]
+        day_times = [times[i] for i in day_idx]
+        day_primary = [primary[i] if i < len(primary) else None for i in day_idx]
+
+        observed_extreme, _, _ = split_observed_remaining(day_times, day_primary, now_local, mode)
+        current_temp = None
+        cur = data.get("current", {}) or {}
+        if "temperature_2m" in cur and cur["temperature_2m"] is not None:
+            current_temp = float(cur["temperature_2m"])
+            if observed_extreme is None:
+                observed_extreme = current_temp
+            else:
+                observed_extreme = (max(observed_extreme, current_temp)
+                                    if mode == "high" else min(observed_extreme, current_temp))
+
+        if observed_extreme is None:
+            return None
+
+        # Remaining extreme per model -> mean & cross-model spread.
+        per_model_remaining: List[float] = []
+        hours_remaining = 0
+        for series in model_series:
+            day_vals = [series[i] if i < len(series) else None for i in day_idx]
+            _, remaining, n_left = split_observed_remaining(day_times, day_vals, now_local, mode)
+            hours_remaining = max(hours_remaining, n_left)
+            if remaining:
+                per_model_remaining.append(max(remaining) if mode == "high" else min(remaining))
+
+        if per_model_remaining:
+            remaining_extreme = sum(per_model_remaining) / len(per_model_remaining)
+            remaining_spread = _stdev(per_model_remaining)
+        else:
+            remaining_extreme = None
+            remaining_spread = 0.0
+
+        return ObservedDayState(
+            observed_extreme_c=observed_extreme,
+            remaining_extreme_c=remaining_extreme,
+            remaining_spread_c=remaining_spread,
+            hours_remaining=hours_remaining,
+            n_models=len(model_series),
+            current_temp_c=current_temp,
+            mode=mode,
+            as_of_local=now_local.isoformat(timespec="minutes"),
+        )
