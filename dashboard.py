@@ -5,7 +5,7 @@ Flow:
 1. Scan Polymarket for active weather markets (slug-based, confirmed pattern)
 2. For each market: fetch multi-source forecasts
 3. Run probability engine → find mispriced buckets
-4. Run strategies (Sniper + Spread) → generate signals
+4. Run strategies (LateObserved primary + optional PeakBasket/Confident) → signals
 5. Execute trades (paper or live)
 6. Monitor positions, check resolutions, redeem winners
 7. Send Telegram notifications
@@ -28,8 +28,10 @@ from logger import log
 from data.weather_fetcher import WeatherFetcher, get_city_coords, CITY_COORDS
 from data.probability_engine import ProbabilityEngine
 from data.market_scanner import MarketScanner, MARKET_CITIES
+from data.observed_weather import ObservedWeather
 from strategies.peak_basket import PeakBasketStrategy
 from strategies.confident_strategy import ConfidentStrategy
+from strategies.late_observed_temp import LateObservedTempStrategy
 from data.stability import StabilityEngine
 from data.liquidity_guard import LiquidityGuard
 from data.clob_client import ClobClient
@@ -50,6 +52,9 @@ class WeatherBot:
         self.scanner = MarketScanner()
         self.peak_basket = PeakBasketStrategy()
         self.confident = ConfidentStrategy()
+        # PRIMARY strategy: trade the observed/locked daily extreme (YES + NO).
+        self.late_observed = LateObservedTempStrategy()
+        self.observed = ObservedWeather()
         self.stability_engine = StabilityEngine()
         # Stability GRADE + liquidity guard (applied across ALL strategies)
         self.liquidity = LiquidityGuard()
@@ -128,9 +133,9 @@ class WeatherBot:
             self.telegram.send_daily_summary()
             self._last_daily_summary = today_str
 
-    # ──────────────────────────────────────────────────────────────────
+    # -----------------------------------------------------------------
     # STABILITY GRADE + LIQUIDITY — applied across every strategy
-    # ──────────────────────────────────────────────────────────────────
+    # -----------------------------------------------------------------
     def _grade_multiplier(self, grade: float) -> float:
         """Map a stability grade (0..1) to a size multiplier.
 
@@ -185,23 +190,23 @@ class WeatherBot:
         if early_exit_price is None:
             early_exit_price = Config.STABILITY_EARLY_EXIT_PRICE
 
-        # ── Grade gate: skip trades on unpredictable city-days ──
+        # -- Grade gate: skip trades on unpredictable city-days --
         if Config.GRADE_SIZING_ENABLED and grade < Config.GRADE_MIN_TO_TRADE:
             log.info(f"   ⏭️  GRADE SKIP {strategy}:{bucket_label[:18]} — grade {grade:.2f} < {Config.GRADE_MIN_TO_TRADE}")
             return None
 
-        # ── PRICE FLOOR: never buy unsellable junk ──
-        # A leg quoted below MIN_ENTRY_PRICE (~5¢) has no real bid to sell into,
+        # -- PRICE FLOOR: never buy unsellable junk --
+        # A leg quoted below MIN_ENTRY_PRICE (~5c) has no real bid to sell into,
         # so it can only resolve to $0 (full loss). Reject up front.
         if entry_price < Config.MIN_ENTRY_PRICE:
             log.info(f"   ⏭️  PRICE FLOOR {strategy}:{bucket_label[:18]} — ask ${entry_price:.4f} < ${Config.MIN_ENTRY_PRICE:.2f} (unsellable)")
             return None
 
-        # ── Grade sizing ──
+        # -- Grade sizing --
         mult = self._grade_multiplier(grade) if apply_grade_size else 1.0
         size_usd = base_size_usd * mult
 
-        # ── Liquidity AWARENESS (adapt, don't block) ──
+        # -- Liquidity AWARENESS (adapt, don't block) --
         # Read the book and adjust: enter MAKER at best_bid, trim size on
         # thin/wide books, and force hold-to-resolution when it's too thin to
         # exit. Only skips if LIQUIDITY_STRICT_BLOCK is explicitly enabled.
@@ -288,15 +293,15 @@ class WeatherBot:
 
         lat, lon = coords
 
-        # ── HIGHEST-TEMP-ONLY GATE ──
-        # We only trade daily-high markets: the high is reached predictably in
-        # the afternoon and the forecast is priced 24–48h out. Lowest-temp /
-        # "or below" markets resolve on late-night minima we don't model well.
+        # -- HIGHEST-TEMP-ONLY GATE (optional) --
+        # When enabled, only trade daily-high markets. Disabled by default now
+        # that the observed strategy locks the low overnight and the high in the
+        # afternoon, and trades the NO side either way.
         if Config.HIGHEST_TEMP_ONLY and 'highest' not in (market.market_type or '').lower():
             log.debug(f"   ⏭️  SKIP {city} {market.market_type} — highest-temp only")
             return
 
-        # ── OUTCOME-DECIDED GATE (timezone-aware) ──
+        # -- OUTCOME-DECIDED GATE (timezone-aware) --
         # Never trade a market whose measurement window has already closed in the
         # CITY'S LOCAL time — the day's high/low is a recorded fact by then, so any
         # buy is a known outcome (cheap losing legs). Markets stay OPEN until UMA
@@ -321,16 +326,20 @@ class WeatherBot:
             log.debug(f"No forecasts for {city}")
             return
 
-        # Build bucket list from outcomes
+        # Build bucket list from outcomes (carry BOTH legs: YES + NO).
         buckets = []
         token_ids = {}
+        no_token_ids = {}
         condition_ids = {}
+        no_prices = {}
         for outcome in market.outcomes:
             label = outcome['label']
             lo = outcome.get('bucket_low', float('-inf'))
             hi = outcome.get('bucket_high', float('inf'))
             buckets.append((label, lo, hi))
             token_ids[label] = outcome.get('token_id', '')
+            no_token_ids[label] = outcome.get('token_id_no', '')
+            no_prices[label] = outcome.get('price_no', max(0.0, 1.0 - outcome.get('price', 0.5)))
             condition_ids[label] = outcome.get('condition_id', '')
 
         if not buckets:
@@ -346,7 +355,7 @@ class WeatherBot:
 
         balance = self.pm.get_balance()
 
-        # ── STABILITY GRADE (computed ONCE, applied to every strategy below) ──
+        # -- STABILITY GRADE (computed ONCE, applied to every strategy below) --
         # Stability is a GRADE, not a strategy: it scales position size and
         # decides hold-to-resolution vs early-exit for ALL strategies.
         stab = None
@@ -369,12 +378,70 @@ class WeatherBot:
                 f"{'HOLD' if hold_hint else f'exit@{early_exit_price:.2f}'}"
             )
 
-        # ───────────────────────────────────────────────────────────────────
-        # PEAK BASKET — unified directional-peak strategy (THE primary strategy).
+        # ------------------------------------------------------
+        # LATE OBSERVED-TEMPERATURE — THE PRIMARY strategy.
+        # Once the local day's peak/trough is locked, the observed extreme is a
+        # hard floor/ceiling on settlement. YES the locked bucket and NO the
+        # buckets the observed data has ruled out, with fee-aware gating.
+        # ------------------------------------------------------
+        if Config.LATE_OBSERVED_ENABLED:
+            mode = 'low' if 'low' in (market.market_type or '').lower() else 'high'
+            observed_state = None
+            try:
+                observed_state = self.observed.get_state(
+                    lat, lon, market.measurement_date, mode
+                )
+            except Exception as e:
+                log.debug(f"observed-state fetch failed {city}: {e}")
+            if observed_state is not None:
+                obs_signals = self.late_observed.evaluate(
+                    market.title, buckets, market_prices, token_ids, balance,
+                    city, observed_state,
+                    no_prices=no_prices, no_token_ids=no_token_ids,
+                    grade=grade, market_type=market.market_type,
+                )
+                for sig in obs_signals:
+                    self.signals_generated += 1
+                    log.info(
+                        f"   🌡️  OBSERVED {city} {mode} | lock={sig.lock_confidence:.0%} "
+                        f"obs={sig.observed_extreme_c:.1f}°C | {len(sig.legs)} legs | {sig.reason}"
+                    )
+                    for leg in sig.legs:
+                        side = leg.side.lower()
+                        token = leg.token_id
+                        if not token:
+                            log.debug(f"      skip {side} {leg.bucket_label[:18]}: no token id")
+                            continue
+                        pos = self._place(
+                            token_id=token,
+                            condition_id=condition_ids.get(leg.bucket_label, ''),
+                            entry_price=leg.price,
+                            base_size_usd=leg.size_usd,
+                            market_title=market.title,
+                            bucket_label=f"{leg.side} {leg.bucket_label}",
+                            strategy=f'late_observed_{side}',
+                            city=city,
+                            slug=market.slug,
+                            resolution_time=market.resolution_time,
+                            edge=leg.edge,
+                            grade=grade,
+                            hold_hint=True,  # observed edge realizes at resolution
+                            early_exit_price=early_exit_price,
+                            apply_grade_size=False,  # strategy already Kelly-sizes
+                        )
+                        if pos:
+                            self.trades_placed += 1
+                            self.telegram.notify_trade(
+                                'BUY', f"{leg.side} {leg.bucket_label}", pos.entry_price,
+                                pos.cost_usd, pos.shares, f'late_observed_{side}',
+                                edge=leg.edge, city=city,
+                            )
+
+        # ------------------------------------------------------
+        # PEAK BASKET — forecast-only directional-peak strategy (DEMOTED, opt-in).
         # Buys the ensemble forecast peak + ONE trend-directional neighbor.
-        # Scales capital with stability, models, edge, and basket efficiency.
-        # Replaces the old scattered sniper/spread/stability strategies.
-        # ───────────────────────────────────────────────────────────────────
+        # Off by default now that the observed strategy supersedes it.
+        # ------------------------------------------------------
         if Config.PEAK_BASKET_ENABLED:
             peak_signals = self.peak_basket.evaluate(
                 market.title, bucket_probs, market_prices, token_ids, balance,
@@ -409,10 +476,10 @@ class WeatherBot:
                             edge=sig.combined_prob - sig.total_cost, city=city,
                         )
 
-        # ───────────────────────────────────────────────────────────────────
-        # CONFIDENT — simple peak-only fallback. Only fires when PeakBasket
-        # is disabled OR as a second opinion on high-conviction peak-only bets.
-        # ───────────────────────────────────────────────────────────────────
+        # ------------------------------------------------------
+        # CONFIDENT — simple peak-only fallback (DEMOTED, opt-in). Only fires
+        # when explicitly enabled as a second opinion on peak-only bets.
+        # ------------------------------------------------------
         if Config.CONFIDENT_ENABLED:
             confident_signals = self.confident.evaluate(
                 market.title, bucket_probs, market_prices, token_ids, balance,
@@ -462,7 +529,7 @@ class WeatherBot:
         pending = self.pm.get_pending_orders() if hasattr(self.pm, 'get_pending_orders') else []
 
         log.info(f"\n{'━'*60}")
-        log.info(f"  🌤️  WEATHER SNIPER DASHBOARD")
+        log.info(f"  🌡️  WEATHER SNIPER DASHBOARD")
         log.info(f"{'━'*60}")
         log.info(f"  Mode:        {stats['mode']}")
         log.info(f"  Balance:     ${stats['balance']:.2f}")
@@ -514,11 +581,12 @@ class WeatherBot:
         log.info(f"   Scan interval: {Config.SCAN_INTERVAL_SECONDS}s")
         log.info(f"   Days ahead: {Config.SCAN_DAYS_AHEAD}")
         strats = []
+        if Config.LATE_OBSERVED_ENABLED: strats.append('LateObserved*')
+        if Config.PEAK_BASKET_ENABLED: strats.append('PeakBasket')
+        if Config.CONFIDENT_ENABLED: strats.append('Confident')
         if Config.SNIPER_ENABLED: strats.append('Sniper')
         if Config.SPREAD_ENABLED: strats.append('Spread')
-        if getattr(Config, 'SELECTIVE_SNIPER_ENABLED', 0): strats.append('Selective')
-        if getattr(Config, 'QUICK_FLIP_ENABLED', 0): strats.append('QuickFlip')
-        log.info(f"   Strategies: {', '.join(strats) if strats else 'Sniper'}")
+        log.info(f"   Strategies: {', '.join(strats) if strats else 'none'}")
         log.info(f"   Telegram: {'ON' if self.telegram.enabled else 'OFF'}")
         ml_status = self.ml.get_status()
         log.info(f"   ML: {ml_status.get('model','?')} (local: {ml_status.get('local_model','?')})")

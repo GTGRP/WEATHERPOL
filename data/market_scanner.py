@@ -7,11 +7,15 @@ CONFIRMED SLUG PATTERN (from reference wallet research):
 
 Each event has 11 markets (temperature buckets).
 Cities: Houston, Lucknow, Seoul, Tokyo, London, Taipei, Hong Kong, Beijing, Ankara, etc.
+
+NOTE (overhaul): bucket-bound parsing now delegates to data.bucket_parse, a
+mojibake-hardened parser, and each outcome now carries BOTH sides of the
+binary market (YES + NO token id and price) so observation-driven strategies
+can trade the NO leg of a dead bucket.
 """
 
 import json
 import time
-import re
 import requests
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timezone, timedelta
@@ -19,6 +23,7 @@ from dataclasses import dataclass, field
 
 from config import Config
 from logger import log
+from data.bucket_parse import parse_bucket_bounds
 
 
 @dataclass
@@ -31,7 +36,7 @@ class WeatherMarket:
     country: str
     market_type: str          # 'highest_temperature', 'lowest_temperature'
     resolution_time: Optional[datetime]
-    outcomes: List[Dict]      # [{label, token_id, price, bucket_low, bucket_high}]
+    outcomes: List[Dict]      # [{label, token_id, token_id_no, price, price_no, bucket_low, bucket_high}]
     active: bool
     volume: float
     liquidity: float
@@ -203,7 +208,13 @@ class MarketScanner:
         )
 
     def _parse_outcome(self, market: Dict, temp_unit: str = 'C') -> Optional[Dict]:
-        """Parse a market into an outcome dict with temperature bounds."""
+        """Parse a market into an outcome dict with temperature bounds.
+
+        Carries BOTH legs of the binary market: the YES token/price AND the NO
+        token/price (clobTokenIds[1] / outcomePrices[1]). The NO leg lets the
+        late-observed strategy bet *against* buckets the observed data has ruled
+        out, which is its own tradeable token with its own price.
+        """
         question = market.get('question', '') or market.get('groupItemTitle', '')
 
         raw_ids = market.get('clobTokenIds', '[]')
@@ -229,13 +240,23 @@ class MarketScanner:
             prices = raw_prices if isinstance(raw_prices, list) else [0.5, 0.5]
 
         yes_price = float(prices[0]) if prices else 0.5
-        bucket_lo, bucket_hi = self._parse_bucket_bounds(question, temp_unit)
+        # NO price: prefer the explicit second outcome price, else complement.
+        if len(prices) > 1 and prices[1] is not None:
+            try:
+                no_price = float(prices[1])
+            except (TypeError, ValueError):
+                no_price = max(0.0, 1.0 - yes_price)
+        else:
+            no_price = max(0.0, 1.0 - yes_price)
+
+        bucket_lo, bucket_hi = parse_bucket_bounds(question, temp_unit)
 
         return {
             'label': question,
             'token_id': clob_ids[0],  # YES token
             'token_id_no': clob_ids[1] if len(clob_ids) > 1 else None,
             'price': yes_price,
+            'price_no': no_price,
             'bucket_low': bucket_lo,
             'bucket_high': bucket_hi,
             'market_id': market.get('id', ''),
@@ -243,53 +264,12 @@ class MarketScanner:
         }
 
     def _parse_bucket_bounds(self, text: str, temp_unit: str = 'C') -> Tuple[float, float]:
+        """Backwards-compatible shim around the hardened bucket parser.
+
+        Kept so any external callers / tests that referenced this method keep
+        working; the real logic now lives in data.bucket_parse.
         """
-        Parse temperature bucket bounds from outcome text.
-        
-        Patterns:
-        - "be 24°C on May 29?" → exact bucket (23.5, 24.5)
-        - "be 38°C or higher on..." → (37.5, inf)  
-        - "be 17°C or below on..." → (-inf, 17.5)
-        - "be between 80-81°F on..." → (80, 81) in F, convert to C
-        - "be 71°F or below..." → (-inf, 71.5) in F
-        """
-        text_lower = text.lower()
-
-        # Pattern: "between X-Y°F"
-        range_match = re.search(r'between\s+(\d+)-(\d+)\s*°?([cf])', text_lower)
-        if range_match:
-            lo = float(range_match.group(1))
-            hi = float(range_match.group(2))
-            unit = range_match.group(3)
-            if unit == 'f':
-                lo = (lo - 32) * 5 / 9
-                hi = (hi - 32) * 5 / 9
-            return (lo, hi)
-
-        # Pattern: "be X°C" or "be X°F"  
-        exact_match = re.search(r'be\s+(\d+)\s*°([cf])', text_lower)
-        if exact_match:
-            temp = float(exact_match.group(1))
-            unit = exact_match.group(2)
-            if unit == 'f':
-                temp = (temp - 32) * 5 / 9
-
-            if 'or higher' in text_lower or 'or above' in text_lower:
-                return (temp - 0.5, float('inf'))
-            elif 'or lower' in text_lower or 'or below' in text_lower:
-                return (float('-inf'), temp + 0.5)
-            else:
-                return (temp - 0.5, temp + 0.5)
-
-        # Fallback: try just numbers
-        num_match = re.search(r'(\d+)', text)
-        if num_match:
-            temp = float(num_match.group(1))
-            if temp_unit == 'F':
-                temp = (temp - 32) * 5 / 9
-            return (temp - 0.5, temp + 0.5)
-
-        return (float('-inf'), float('inf'))
+        return parse_bucket_bounds(text, temp_unit)
 
     def get_outcome_prices(self, market: WeatherMarket) -> Dict[str, float]:
         """Fetch live YES prices for all outcomes."""
@@ -308,6 +288,8 @@ class MarketScanner:
                     price = float(resp.json().get('price', 0))
                     prices[outcome['label']] = price
                     outcome['price'] = price
+                    # keep the NO price coherent with the refreshed YES price
+                    outcome['price_no'] = max(0.0, 1.0 - price)
                 else:
                     prices[outcome['label']] = outcome.get('price', 0.5)
             except Exception:
