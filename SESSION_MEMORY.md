@@ -1039,3 +1039,116 @@ dashboard._evaluate_market()
 - Monitor PeakBasket signals for correct trend-directional neighbor selection
 - Tune PEAK_MIN_STABILITY and PEAK_MAX_BASKET_COST based on live paper results
 - Confirmed-winner mode for near-decided days (Seoul ~4% edge) and "hold through peak then sell" exit.
+
+
+
+---
+
+## June 9–10, 2026 (Notion AI / GTGRP session) — FIRST PUSH to GTGRP/WEATHERPOL + LateObserved overhaul + per-market resolution-station verification
+
+New agent (Notion AI) picked up the project in a fresh GitHub remote. Whole session worked through the
+GitHub MCP (no local clone). Repo of record is now `https://github.com/GTGRP/WEATHERPOL` (branch `main`).
+The sandbox here has NO network and NO `requests`/`pytest`, so all live-trading deps were validated only
+by `py_compile` + plain-`python` unit tests; logic that needs the network was exercised with injected fakes.
+
+### June 9, 2026 — FIRST PUSH to the new GTGRP/WEATHERPOL repo (+ Railway)
+- **WHY a new remote:** the old remote `Foruse959/WEATHER-KI-POL` returned **403 WRITE** on BOTH connected
+  GitHub accounts (couldn't push there). The second GitHub MCP connection (`github2`) is also 403. So the
+  canonical remote was switched to `GTGRP/WEATHERPOL` (authed as GTGRP, user id 290462328).
+- **WHAT was pushed:** the full overhauled LateObserved-primary bot to `main` (no new branch, per user).
+  `.env` confirmed in `.gitignore` and never committed (secret-leak check). Repo head after overhaul:
+  `4a4e4d208d0580bb213956abb8583bc6bbbf3a7e`.
+- **Railway:** reviewed deploy logs, cleaned the env into a `railway.env` template (placeholders for secrets),
+  checked `late_observed` firing. STILL PENDING on the user: paste the filled env into Railway, redeploy,
+  and send fresh logs to confirm `late_observed` fires live before going `--live`. (No Railway integration
+  available to this agent — project `374375ea-...`, env `f3f86efb-...`, service `1d92b35c-...`.)
+
+### June 10, 2026 (morning IST) — Q&A: does the bot use ML/LLM to decide?
+- **User asked:** "in this strategy or overall bot, do we use ML or LLM to decide / think / execute?"
+  **Found:** NO. The decide/execute path is fully DETERMINISTIC — forecast ensemble + observed-temp math
+  (`observed_math`, `_MIN_SIGMA=0.35`) + fee-aware gates (`passes_fee_gate`, `kelly_fraction`, `ev_per_contract`,
+  `breakeven_prob`). The GPT-5.5 `ml/decision_engine.py` EXISTS but is DORMANT (0 tokens; not wired into
+  any decision). So there is no ML/LLM in the live trading loop today.
+- **User asked:** "is it good to add or not?" **Answered:** do NOT put an LLM inside the deterministic
+  decide/execute path (adds latency, cost, non-determinism, and no proven edge over the math). Only worth it
+  for: (a) resolution-text parsing helper, (b) shadow-mode logging, (c) city prioritization.
+- **User asked:** "does our bot check the market resolution rules / which station each market settles on?"
+  **Found:** only PARTIALLY — a hardcoded ~40-city airport ICAO table (static); NO per-market rule parsing;
+  unmapped cities fall back to city-center; and it NEVER fetches the actual Wunderground/METAR settlement value.
+
+### June 10, 2026, ~19:00–19:30 IST — NEW FEATURE built + pushed: per-market resolution-station verification
+- **What the user asked (verbatim intent):** "it must do right — find a way to get the exact resolution rules
+  for the scanned market. I heard the Gamma API market metadata returns all the data. Search docs and use ML
+  here to check the place/coordinate in the rule vs the hardcoded coordinate+location: if it's the same, skip;
+  if not, adjust the coordinate so the weather API uses the corrected one. The ML must be fast, simple, and use
+  few tokens — use the OpenAI Responses format." Pasted the Freemodel config (baseUrl `https://api.freemodel.dev/v1`,
+  `api: openai-responses`; models gpt-5.5 / gpt-5.4 / gpt-5.4-mini[non-reasoning] / gpt-5.3-codex).
+
+- **What I researched (docs):**
+  - **Gamma API** (`https://gamma-api.polymarket.com`, no auth): `/events?slug=` → event → `markets[]` carrying
+    `description` / `resolutionSource` / `question` / `conditionId` / `clobTokenIds`. The scanner ALREADY stores
+    the full event dict on `market.raw`, so the rules are available with NO extra API call. Slug pattern
+    `{highest|lowest}-temperature-in-{city}-on-{month}-{day}-{year}`, 11 buckets/event.
+  - **OpenAI Responses API:** `POST {base}/responses`, body `{model, input, max_output_tokens}`; reply via the
+    `output_text` convenience field or `output[].content[].output_text`.
+  - **Model choice:** `gpt-5.4-mini` (non-reasoning, cheap, low-token) for the verify call; the reasoning models
+    are overkill for a yes/no station check.
+
+- **Solution I built (and pushed to `main`):**
+  - **NEW `data/resolution_rules.py` (352 lines)** — pure, network-free helpers: `extract_resolution_text(event)`,
+    `find_icaos(text)` (4-letter ICAO regex minus stopwords), `deterministic_station_match(text, station)`
+    (returns True / False / None), `extract_first_json`, `parse_responses_text` (Responses-API parsing,
+    skips reasoning items), `get_station_by_icao`, the `ResolvedStation` dataclass, and `StationResolver.resolve(...)`.
+  - **NEW `ml/resolution_verifier.py` (134 lines)** — `ResolutionVerifier` over the openai-responses API; reads
+    `ML_RESPONSES_URL` (default `https://api.freemodel.dev/v1`), `ML_API_KEY`, `ML_VERIFY_MODEL` (default
+    `gpt-5.4-mini`); `.enabled = bool(api_key)`; compact JSON-only prompt (CITY / OUR_STATION / RULES[:700]),
+    `max_output_tokens=160`, 8s timeout, per-city cache, token counting, `get_status()`.
+  - **MODIFIED `dashboard.py` (713 lines)** — `_evaluate_market` now resolves the EXACT station coords via the
+    resolver before fetching weather; logs `📍 STATION … → ADJUSTED` / `⚠️ STATION` (suspected mismatch) /
+    `⛔ STATION … skip`; the dashboard footer shows a `Station LLM` token-usage line.
+  - **NEW `tests/test_resolution_rules.py`** — 24 offline unit tests (with injected FakeML/OffML/LowML/RawML),
+    **all 24 passing**; covers deterministic match True/False/None, ICAO lookup, JSON extraction (raw/fenced/embedded),
+    Responses parsing, and the resolve() branches (confirmed-no-LLM, adjusted-via-table-ICAO, adjusted-via-raw-coords,
+    ml-off→hardcoded, skip-on-unverified-mismatch).
+  - **MODIFIED `.env.example`** — documents the new knobs.
+  - Left `ml/decision_engine.py` (the GPT-5.5 engine) UNTOUCHED — this verifier is a separate, dedicated low-cost path.
+
+- **How the verify flow behaves (the core logic):**
+  1. Pull rules text from `market.raw` (event description + each child market description / resolutionSource).
+  2. **Deterministic match first = 0 tokens:** if the rules contain our station's ICAO code, an airport-name token,
+     or its Wunderground URL → CONFIRMED instantly, no LLM call (keep hardcoded coords — the user's "if same, skip").
+  3. **LLM only when ambiguous or a different station is named** → call `gpt-5.4-mini`: a MATCH keeps hardcoded
+     coords; a MISMATCH ADJUSTS the coordinate to the rule's station (prefers our verified table coords when the
+     returned ICAO is known, else the LLM's lat/lon when confidence ≥ `RESOLUTION_VERIFY_MIN_CONF`). The corrected
+     coords then feed the weather/observed engine.
+  4. **Unverifiable different station** → keep hardcoded (logged as RISK), or SKIP the market entirely if
+     `RESOLUTION_SKIP_ON_UNKNOWN=1`.
+
+- **WHEN / WHY I pushed (times):** pushed today **June 10, 2026, ~13:55 UTC (~19:25 IST)**. The 4 code/test files
+  went in ONE `push_files` commit **`1b7ca0b`** to `GTGRP/WEATHERPOL` `main`; the `.env.example` doc update followed
+  as commit **`d1fe189`** (`.env.example` sha is now `e4898fb…`, size 11340). I pushed because the feature was
+  fully written + `py_compile`-clean + 24/24 unit tests passing in the sandbox, and the user's whole workflow is
+  remote-repo-based. Verified `data/resolution_rules.py` landed complete after the push (no truncation).
+
+- **NEW env vars to set in Railway** (reuses the existing `ML_API_KEY`):
+  ```
+  ML_RESPONSES_URL=https://api.freemodel.dev/v1
+  ML_VERIFY_MODEL=gpt-5.4-mini
+  RESOLUTION_VERIFY_ENABLED=1
+  RESOLUTION_VERIFY_MIN_CONF=0.6
+  RESOLUTION_SKIP_ON_UNKNOWN=0
+  ```
+  If `ML_API_KEY` is blank the verifier stays dormant and the bot safely falls back to deterministic matching +
+  hardcoded stations.
+
+- **HONEST limitation (told the user):** this fixes the "wrong PLACE" problem (forecasts the rule's station coords),
+  but the observed engine still reads Open-Meteo at those coords — it does NOT fetch the literal Wunderground/METAR
+  settlement value (exact rounding/units). Matching that exactly is a separate future build.
+
+### Still open / next
+- User to add the 5 env vars + a real `ML_API_KEY` in Railway, redeploy, and send fresh logs (confirm the
+  `📍 STATION` adjust lines + `late_observed` firing) before going `--live`.
+- Optional next build: fetch the ACTUAL observed Wunderground/METAR max/min for the local day and trade only the
+  CONFIRMED winning bucket (ties back to the long-standing Seoul ~4% confirmed-outcome idea).
+- Carry-over backlog from earlier sessions still stands (bucket_center alignment audit; per-city calibrated
+  probability models; de-modeling backtest PnL with real order-book prices).
