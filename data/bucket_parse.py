@@ -1,4 +1,4 @@
-"""
+r"""
 Robust temperature-bucket label parser (dependency-free).
 
 Why this module exists
@@ -38,9 +38,9 @@ POS_INF = float("inf")
 
 # Common mojibake / HTML-entity spellings of the degree sign.
 _DEGREE_VARIANTS = (
-    "ÃÂ°",  # double-encoded
+    "ÃÂ°",  # double-encoded
     "Â°",              # UTF-8 ° misread as Latin-1
-    "â°",        # stray triple-byte artifact
+    "â°",        # stray triple-byte artifact
     "&deg;",
     "&#176;",
     "&#xb0;",
