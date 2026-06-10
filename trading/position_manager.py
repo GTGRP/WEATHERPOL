@@ -9,6 +9,18 @@ Features:
 - Context cleanup: free memory for closed/resolved markets
 - Separate tracking: bought, holding, sold, won, lost, redeemed
 - Market context pool: only active markets consume memory
+
+PAPER-REALISM OVERHAUL (make dry-run behave like real trading):
+- Settlement TRUTH comes from Polymarket's resolved outcome via MarketResolver
+  (works even AFTER a market closes — fixes the "random values after close" bug).
+  The weather observation is only a confirmation metric, never the source.
+- update_prices FREEZES the last good price instead of writing 0/404 garbage.
+- Pre-close win conclusion: flags a near-certain win in the final minutes when
+  the venue price is >= 95/99% (signal/label only; real settlement still books
+  at resolution).
+- Conserved PnL ledger invariant is asserted after every state change.
+- Every BUY/SELL/SETTLE/REDEEM is written to data/paper_trades.jsonl with the
+  signal, strategy, edge, grade and why-bought reason.
 """
 
 import os
@@ -22,6 +34,24 @@ from dataclasses import dataclass, field
 from config import Config
 from logger import log
 
+# Paper-realism helpers (degrade gracefully if unavailable).
+try:
+    from data.market_resolver import MarketResolver
+except Exception:  # pragma: no cover
+    MarketResolver = None
+try:
+    from trading import paper_engine as pe
+except Exception:  # pragma: no cover
+    try:
+        import paper_engine as pe  # type: ignore
+    except Exception:
+        pe = None
+
+
+def _cfg(name: str, default):
+    """Read an optional Config flag with a safe default (decouples this module
+    from the config edit landing)."""
+    return getattr(Config, name, default)
 
 
 @dataclass
@@ -66,6 +96,16 @@ class TrackedPosition:
     exit_price: Optional[float] = None
     exit_time: Optional[datetime] = None
     exit_reason: str = ''             # 'resolution', 'stop_loss', 'take_profit', 'manual'
+    # --- Paper-realism / observability fields ---
+    edge_at_entry: float = 0.0        # edge (our prob - price) when bought
+    grade: float = 0.0                # stability grade at entry
+    lock_confidence: float = 0.0      # observed lock-confidence at entry
+    signal: str = ''                  # which signal/strategy fired the buy
+    reason: str = ''                  # human-readable why-bought
+    last_good_price: float = 0.0      # last non-garbage price (freeze source)
+    current_price_stale: bool = False # True when live price could not be read
+    preclose_locked: bool = False     # flagged near-certain win before close
+    settle_source: str = ''           # 'polymarket' | 'preclose_lock' | 'clob'
 
 
     @property
@@ -89,6 +129,12 @@ class TrackedPosition:
         if self.resolution_time:
             return datetime.now(timezone.utc) > self.resolution_time
         return False
+
+    @property
+    def minutes_to_close(self) -> Optional[float]:
+        if not self.resolution_time:
+            return None
+        return (self.resolution_time - datetime.now(timezone.utc)).total_seconds() / 60.0
 
 
 @dataclass
@@ -138,14 +184,17 @@ class PositionManager:
         self.losses = 0
         self._state_file = 'data/positions.json'
         self._weekly_file = 'data/weekly_memory.json'
+        self._paper_trades_file = _cfg('PAPER_TRADE_LOG', 'data/paper_trades.jsonl')
         self._session = requests.Session()
         self._session.headers['User-Agent'] = f'WeatherSniper/{Config.VERSION}'
+        # Polymarket resolved-outcome reader (settlement source of truth).
+        self._resolver = MarketResolver() if MarketResolver else None
         self._load_state()
         self._load_weekly()
 
-    # ═══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
     # BALANCE
-    # ═══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
 
     def get_balance(self) -> float:
         if Config.is_paper():
@@ -176,15 +225,16 @@ class PositionManager:
             return None
 
 
-    # ═══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
     # POSITION LIFECYCLE
-    # ═══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
 
     def add_position(self, token_id: str, condition_id: str, entry_price: float,
                      shares: float, cost_usd: float, market_title: str,
                      bucket_label: str, strategy: str, city: str = '',
                      slug: str = '', resolution_time: datetime = None,
-                     edge: float = 0.0) -> Optional[TrackedPosition]:
+                     edge: float = 0.0, reason: str = '', grade: float = 0.0,
+                     lock_confidence: float = 0.0, signal: str = '') -> Optional[TrackedPosition]:
         """Add new position — checks balance FIRST, only tracks if order succeeds."""
         # ═══ VALIDATE SHARES (must be positive) ═══
         if shares <= 0 or cost_usd <= 0 or entry_price <= 0:
@@ -231,6 +281,25 @@ class PositionManager:
             tp_price = min(0.60, entry_price * 5)
         else:
             tp_price = min(0.85, entry_price * 2.5)
+
+        # ═══ PAPER REALISTIC FILL ═══
+        # When enabled, walk the live ask ladder so the paper fill price/size and
+        # partial fills mirror what the venue would actually give us. This is the
+        # difference between paper "feeling random" and matching real trading.
+        fill_note = ''
+        if Config.is_paper() and pe is not None and _cfg('PAPER_REALISTIC_FILL', True):
+            asks = self._fetch_ask_ladder(token_id)
+            if asks:
+                fr = pe.simulate_taker_fill(asks, cost_usd, max_price=0.99)
+                if not fr.ok:
+                    log.info(f"⏭️  SKIP {city} {bucket_label[:22]} — no fillable asks (book empty/above cap)")
+                    return None
+                entry_price = round(fr.fill_price, 4)
+                shares = fr.filled_shares
+                cost_usd = round(fr.filled_usd, 4)
+                fill_note = fr.reason + (f" across {fr.levels_used} lvls" if fr.levels_used else '')
+                if fr.partial:
+                    log.info(f"⚖️  PARTIAL FILL {city} {bucket_label[:22]} — {shares:.0f}sh @ ${entry_price:.4f} ({fill_note})")
 
         # ═══ LIVE: Place order FIRST. GTC sits in book until filled. ═══
         # CRITICAL FIX: a GTC order != a filled position. Track as PENDING
@@ -303,7 +372,16 @@ class PositionManager:
             self.total_trades += 1
             self.paper_balance -= cost_usd
             log.info(f"\033[92m📋 PAPER BUY: {city} {bucket_label[:30]} | "
-                     f"{shares:.0f}sh @ ${entry_price:.4f} | cost=${cost_usd:.2f}\033[0m")
+                     f"{shares:.0f}sh @ ${entry_price:.4f} | cost=${cost_usd:.2f}"
+                     + (f" | {fill_note}" if fill_note else "") + "\033[0m")
+
+        # ═══ Observability metadata (common to both modes) ═══
+        pos.edge_at_entry = edge
+        pos.reason = reason
+        pos.grade = grade
+        pos.lock_confidence = lock_confidence
+        pos.signal = signal or strategy
+        pos.last_good_price = pos.current_price
 
         # Register market context
         if slug and slug not in self.market_contexts:
@@ -314,10 +392,40 @@ class PositionManager:
                 edge=edge,
             )
 
+        # Rich per-trade log line (signal / strategy / why / edge) for paper.
+        if Config.is_paper():
+            self._log_paper_trade('BUY', pos, extra={'fill': fill_note})
+
         self._save_state()
+        self._assert_ledger()
         log.info(f"📌 NEW: {city} {bucket_label} | {shares:.0f}sh @ ${entry_price:.4f} "
-                 f"| TP=${tp_price:.2f} | SL={Config.STOP_LOSS_PCT}%")
+                 f"| edge={edge:+.0%} | {pos.signal} | TP=${tp_price:.2f} | SL={Config.STOP_LOSS_PCT}%"
+                 + (f" | why: {reason}" if reason else ""))
         return pos
+
+    def _fetch_ask_ladder(self, token_id: str) -> List[Tuple[float, float]]:
+        """Read the live ask ladder [(price, size_shares), ...] ascending. Used to
+        produce a realistic paper fill. Returns [] if the book can't be read."""
+        try:
+            from data.clob_client import ClobClient
+            if not hasattr(self, '_book_client') or self._book_client is None:
+                self._book_client = ClobClient()
+            book = self._book_client.get_orderbook(token_id)
+            asks = (book or {}).get('asks') or []
+            ladder: List[Tuple[float, float]] = []
+            for lvl in asks:
+                if isinstance(lvl, dict):
+                    price = float(lvl.get('price', 0) or 0)
+                    size = float(lvl.get('size', 0) or 0)
+                else:  # (price, size) tuple/list
+                    price = float(lvl[0]); size = float(lvl[1])
+                if price > 0 and size > 0:
+                    ladder.append((price, size))
+            ladder.sort(key=lambda x: x[0])
+            return ladder
+        except Exception as e:
+            log.debug(f"ask ladder fetch failed {token_id[:12]}...: {e}")
+            return []
 
     def _place_live_order(self, token_id: str, price: float, size_usd: float, shares: float) -> Optional[Dict]:
         """Place a real GTC limit order on Polymarket CLOB V2."""
@@ -512,9 +620,9 @@ class PositionManager:
         return [p for p in self.positions if p.redeemable and p.status in ('open', 'won')]
 
 
-    # ═══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
     # STOP-LOSS & TAKE-PROFIT
-    # ═══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
 
     def check_risk_triggers(self) -> List[TrackedPosition]:
         """Check all open positions for stop-loss / take-profit triggers."""
@@ -556,6 +664,7 @@ class PositionManager:
 
         if triggered:
             self._save_state()
+            self._assert_ledger()
         return triggered
 
     def _close_position(self, pos: TrackedPosition, exit_price: float, reason: str):
@@ -589,37 +698,151 @@ class PositionManager:
         # Free market context if no more open positions for this slug
         self._maybe_free_context(pos.slug)
 
+        # Trade-log the close (paper): SETTLE for win/lose, SELL for exits.
+        if Config.is_paper():
+            action = 'SETTLE' if reason in ('won', 'lost') else 'SELL'
+            self._log_paper_trade(action, pos)
 
-    # ═══════════════════════════════════════════════════════════════
+
+    # ═══════════════════════════════════════════════════════════
     # RESOLUTION & REDEMPTION
-    # ═══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
 
     def check_resolutions(self):
-        """Check if any open positions have resolved."""
+        """Resolve open positions using Polymarket's ACTUAL settled outcome.
+
+        Source of truth (in priority order):
+          1. MarketResolver — Gamma resolved outcomePrices for the slug. Works
+             even after the market closes, so positions never get "stuck".
+          2. Legacy CLOB-price fallback (only when the resolver can't answer).
+        Also runs the pre-close win-conclusion pass first.
+        """
+        # Flag near-certain wins before close (signal/label only).
+        self.check_preclose_locks()
+
         open_pos = self.get_open_positions()
         if not open_pos:
             return
 
         for pos in open_pos:
             try:
-                resp = self._session.get(
-                    f"{Config.CLOB_API_URL}/price",
-                    params={'token_id': pos.token_id, 'side': 'SELL'},
-                    timeout=5,
-                )
-                if resp.status_code == 200:
-                    price = float(resp.json().get('price', 0))
-                    if price >= 0.99:
-                        pos.redeemable = True
-                        self._close_position(pos, 1.0, 'won')
-                    elif price <= 0.01 and pos.is_expired:
-                        self._close_position(pos, 0.0, 'lost')
-                elif resp.status_code == 404 and pos.is_expired:
-                    self._close_position(pos, 0.0, 'lost')
-            except Exception:
-                pass
+                if self._resolve_via_polymarket(pos):
+                    continue
+                # Fallback: legacy CLOB price check.
+                self._legacy_resolution_check(pos)
+            except Exception as e:
+                log.debug(f"resolution check {pos.bucket_label[:20]}: {e}")
 
         self._save_state()
+        self._assert_ledger()
+
+    def _resolve_via_polymarket(self, pos: TrackedPosition) -> bool:
+        """Settle from Polymarket's resolved outcome. Returns True if settled."""
+        if not self._resolver or pe is None or not pos.slug:
+            return False
+        res = self._resolver.get_resolution(pos.slug)
+        if not res or not res.resolved:
+            return False
+
+        bucket = self._match_bucket(res, pos)
+        if bucket is None or bucket.won is None:
+            return False
+
+        # Determine which leg we hold: YES if our token == the bucket's YES token.
+        side = 'yes'
+        if bucket.token_id_yes and pos.token_id and bucket.token_id_yes != pos.token_id:
+            side = 'no'
+
+        decision = pe.decide_settlement(
+            side=side,
+            venue_won=bucket.won,
+            venue_resolved=res.resolved,
+            weather_won=None,  # weather is a confirmation metric, computed elsewhere
+        )
+        if decision.status not in ('won', 'lost'):
+            return False
+
+        pos.settle_source = decision.source
+        if decision.status == 'won':
+            pos.redeemable = True
+            self._close_position(pos, decision.settle_price, 'won')
+            log.info(f"✅ RESOLVED WON: {pos.city} {pos.bucket_label[:30]} "
+                     f"[{side.upper()}] — {decision.reason}")
+        else:
+            self._close_position(pos, decision.settle_price, 'lost')
+            log.info(f"❌ RESOLVED LOST: {pos.city} {pos.bucket_label[:30]} "
+                     f"[{side.upper()}] — {decision.reason}")
+        return True
+
+    @staticmethod
+    def _match_bucket(res, pos: TrackedPosition):
+        """Find the resolution bucket for a position by token id, then by label."""
+        # Prefer exact token match (unambiguous).
+        for b in res.buckets:
+            if b.token_id_yes and pos.token_id and b.token_id_yes == pos.token_id:
+                return b
+        # Fall back to label match (handles NO-side legs whose token differs).
+        lbl = (pos.bucket_label or '').strip().lower()
+        if lbl:
+            for b in res.buckets:
+                bl = (b.label or '').strip().lower()
+                if bl and (bl == lbl or bl in lbl or lbl in bl):
+                    return b
+        return None
+
+    def _legacy_resolution_check(self, pos: TrackedPosition):
+        """Old CLOB-price resolution path — used only when the resolver can't
+        answer (e.g. slug missing). Kept conservative."""
+        try:
+            resp = self._session.get(
+                f"{Config.CLOB_API_URL}/price",
+                params={'token_id': pos.token_id, 'side': 'SELL'},
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                price = float(resp.json().get('price', 0))
+                if price >= 0.99:
+                    pos.redeemable = True
+                    pos.settle_source = 'clob'
+                    self._close_position(pos, 1.0, 'won')
+                elif price <= 0.01 and pos.is_expired:
+                    pos.settle_source = 'clob'
+                    self._close_position(pos, 0.0, 'lost')
+            elif resp.status_code == 404 and pos.is_expired:
+                pos.settle_source = 'clob'
+                self._close_position(pos, 0.0, 'lost')
+        except Exception:
+            pass
+
+    def check_preclose_locks(self):
+        """In the final minutes before close, flag open positions whose venue
+        price says >= threshold as a near-certain WIN. This is a SIGNAL only —
+        balance/PnL are still booked at real settlement in check_resolutions."""
+        if pe is None:
+            return
+        threshold = _cfg('PAPER_PRECLOSE_LOCK_PCT', 0.95)
+        window = _cfg('PAPER_PRECLOSE_WINDOW_MIN', 2.0)
+        changed = False
+        for pos in self.get_open_positions():
+            if pos.preclose_locked or pos.current_price_stale:
+                continue
+            d = pe.preclose_conclusion(
+                venue_price=pos.current_price,
+                minutes_to_close=pos.minutes_to_close,
+                lock_confidence=pos.lock_confidence or None,
+                weather_won=None,
+                price_threshold=threshold,
+                window_minutes=window,
+                lock_threshold=threshold,
+            )
+            if d:
+                pos.preclose_locked = True
+                changed = True
+                log.info(f"🔒 PRECLOSE WIN LIKELY: {pos.city} {pos.bucket_label[:30]} — {d.reason}")
+                if Config.is_paper():
+                    self._log_paper_trade('PRECLOSE_LOCK', pos, extra={'note': d.reason})
+        if changed:
+            self._save_state()
 
     def redeem_position(self, pos: TrackedPosition) -> bool:
         """Redeem a winning position."""
@@ -633,7 +856,9 @@ class PositionManager:
             pos.pnl = payout - pos.cost_usd
             self.total_redeemed += payout
             log.info(f"💰 REDEEM: {pos.bucket_label} → +${payout:.2f}")
+            self._log_paper_trade('REDEEM', pos, extra={'payout': round(payout, 2)})
             self._save_state()
+            self._assert_ledger()
             return True
         else:
             try:
@@ -657,16 +882,23 @@ class PositionManager:
                 count += 1
         return count
 
-    # ═══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
     # PRICE UPDATES
-    # ═══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
 
     def update_prices(self):
-        """Batch update prices for open positions."""
+        """Batch update prices for open positions.
+
+        FREEZE-ON-BAD-DATA: never overwrite a good price with 0 / empty / a
+        failed request. A closed or thin market returns no usable price — we keep
+        the last good value and mark the position stale instead of showing random
+        zeros (this was a major source of the "random values" symptom).
+        """
         open_pos = self.get_open_positions()
         if not open_pos:
             return
 
+        freeze = _cfg('PAPER_FREEZE_ON_BAD_PRICE', True)
         for pos in open_pos:
             try:
                 resp = self._session.get(
@@ -675,20 +907,31 @@ class PositionManager:
                     timeout=3,
                 )
                 if resp.status_code == 200:
-                    price = float(resp.json().get('price', pos.current_price))
-                    pos.current_price = price
-                    pos.current_value = pos.shares * price
-                    if price > pos.peak_price:
-                        pos.peak_price = price
+                    price = float(resp.json().get('price', 0) or 0)
+                    if price > 0:
+                        pos.current_price = price
+                        pos.last_good_price = price
+                        pos.current_value = pos.shares * price
+                        pos.current_price_stale = False
+                        if price > pos.peak_price:
+                            pos.peak_price = price
+                    else:
+                        # No real bid/price — hold last good value, flag stale.
+                        pos.current_price_stale = True
+                        if not freeze:
+                            pos.current_price = 0.0
+                            pos.current_value = 0.0
+                else:
+                    pos.current_price_stale = True
             except Exception:
-                pass
+                pos.current_price_stale = True
 
         self._save_state()
 
 
-    # ═══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
     # CONTEXT MANAGEMENT (free memory for closed markets)
-    # ═══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
 
     def _maybe_free_context(self, slug: str):
         """Free market context if no open positions remain for it."""
@@ -712,9 +955,81 @@ class PositionManager:
         """How many active market contexts we're tracking."""
         return sum(1 for v in self.market_contexts.values() if v.active)
 
-    # ═══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
+    # PAPER TRADE LOG + LEDGER INVARIANT
+    # ═══════════════════════════════════════════════════════════
+
+    def _log_paper_trade(self, action: str, pos: TrackedPosition, extra: Optional[Dict] = None):
+        """Append one structured record per BUY / SELL / SETTLE / REDEEM /
+        PRECLOSE_LOCK to data/paper_trades.jsonl. Captures which signal &
+        strategy fired, why we bought, the edge/grade/lock-confidence, the fill,
+        and realized PnL — so the dry run is fully auditable."""
+        if not Config.is_paper():
+            return
+        try:
+            os.makedirs(os.path.dirname(self._paper_trades_file) or '.', exist_ok=True)
+            rec = {
+                'ts': datetime.now(timezone.utc).isoformat(),
+                'action': action,
+                'city': pos.city,
+                'bucket': pos.bucket_label,
+                'market': pos.market_title[:80],
+                'slug': pos.slug,
+                'strategy': pos.strategy,
+                'signal': pos.signal or pos.strategy,
+                'why': pos.reason,
+                'entry_price': round(pos.entry_price, 4),
+                'current_price': round(pos.current_price, 4),
+                'shares': round(pos.shares, 2),
+                'cost_usd': round(pos.cost_usd, 2),
+                'edge': round(pos.edge_at_entry, 4),
+                'grade': round(pos.grade, 3),
+                'lock_confidence': round(pos.lock_confidence, 3),
+                'status': pos.status,
+                'exit_price': pos.exit_price,
+                'exit_reason': pos.exit_reason,
+                'settle_source': pos.settle_source,
+                'pnl': round(pos.pnl, 4),
+                'roi_pct': round(pos.roi_pct, 1),
+                'preclose_locked': pos.preclose_locked,
+                'stale_price': pos.current_price_stale,
+                'resolution_time': pos.resolution_time.isoformat() if pos.resolution_time else None,
+                'minutes_to_close': (round(pos.minutes_to_close, 1)
+                                     if pos.minutes_to_close is not None else None),
+                'balance_after': round(self.paper_balance, 2),
+            }
+            if extra:
+                rec.update(extra)
+            with open(self._paper_trades_file, 'a') as f:
+                f.write(json.dumps(rec) + '\n')
+        except Exception as e:
+            log.debug(f"paper trade log failed: {e}")
+
+    def _assert_ledger(self):
+        """Verify the conserved PnL invariant after every state change (paper):
+
+            cash balance + locked cost (open/pending/won) == deposited + realized
+
+        'won' positions keep their cost LOCKED until redeemed (cash credited at
+        redemption), so they count with open cost, not realized PnL.
+        """
+        if pe is None or not Config.is_paper():
+            return True
+        locked = sum(p.cost_usd for p in self.positions
+                     if p.status in ('open', 'pending', 'won'))
+        realized = sum(p.pnl for p in self.positions
+                       if p.status in ('sold', 'lost', 'redeemed'))
+        ok, drift = pe.ledger_ok(balance=self.paper_balance, open_cost=locked,
+                                 realized=realized, deposited=self.total_deposited)
+        if not ok:
+            log.warning(f"⚠️ LEDGER DRIFT ${drift:+.4f} — balance=${self.paper_balance:.2f} "
+                        f"locked=${locked:.2f} realized=${realized:.2f} "
+                        f"deposited=${self.total_deposited:.2f}")
+        return ok
+
+    # ═══════════════════════════════════════════════════════════
     # WEEKLY MEMORY
-    # ═══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
 
     def record_weekly_stats(self):
         """Snapshot current week's performance for ML memory."""
@@ -774,9 +1089,9 @@ class PositionManager:
         return " | ".join(lines)
 
 
-    # ═══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
     # STATISTICS (per-position + aggregate)
-    # ═══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
 
     def get_stats(self) -> Dict:
         """Comprehensive stats."""
@@ -853,6 +1168,7 @@ class PositionManager:
         import json
         stats = self.get_stats()
         by_strategy = self.get_per_strategy_stats()
+        ledger_ok_flag = self._assert_ledger()
         snap = {
             'ts': datetime.now(timezone.utc).isoformat(),
             'mode': stats['mode'],
@@ -864,6 +1180,7 @@ class PositionManager:
             'open': stats['open_positions'],
             'wins': stats['wins'], 'losses': stats['losses'],
             'win_rate': round(stats['win_rate'], 1),
+            'ledger_ok': ledger_ok_flag,
             'by_strategy': by_strategy,
             'by_city': self.get_per_city_stats(),
         }
@@ -891,14 +1208,15 @@ class PositionManager:
         summary = (f"📈 PERF [{snap['mode']}] bal=${snap['balance']:.2f} "
                    f"PnL=${snap['total_pnl']:+.2f} ({snap['roi_pct']:+.0f}%) "
                    f"WR={snap['win_rate']:.0f}% {snap['wins']}W/{snap['losses']}L"
+                   + ("" if ledger_ok_flag else " ⚠️LEDGER")
                    + (" | " + " | ".join(parts) if parts else ""))
         log.info(summary)
         return summary
 
 
-    # ═══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
     # PERSISTENCE
-    # ═══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
 
     def _save_state(self):
         """Save positions to disk."""
@@ -937,6 +1255,11 @@ class PositionManager:
             'pp': p.peak_price, 'sl': p.stop_loss_pct, 'tp': p.take_profit_price,
             'xp': p.exit_price, 'xr': p.exit_reason,
             'xt': p.exit_time.isoformat() if p.exit_time else None,
+            # paper-realism fields
+            'edge': p.edge_at_entry, 'grade': p.grade, 'lc': p.lock_confidence,
+            'sig': p.signal, 'why': p.reason, 'lgp': p.last_good_price,
+            'stale': p.current_price_stale, 'plk': p.preclose_locked,
+            'ss': p.settle_source,
         }
 
     def _load_state(self):
@@ -980,6 +1303,15 @@ class PositionManager:
                         exit_price=pd.get('xp'),
                         exit_reason=pd.get('xr', ''),
                         exit_time=datetime.fromisoformat(pd['xt']) if pd.get('xt') else None,
+                        edge_at_entry=pd.get('edge', 0.0),
+                        grade=pd.get('grade', 0.0),
+                        lock_confidence=pd.get('lc', 0.0),
+                        signal=pd.get('sig', ''),
+                        reason=pd.get('why', ''),
+                        last_good_price=pd.get('lgp', 0.0),
+                        current_price_stale=pd.get('stale', False),
+                        preclose_locked=pd.get('plk', False),
+                        settle_source=pd.get('ss', ''),
                     )
                     self.positions.append(pos)
                 except Exception:
