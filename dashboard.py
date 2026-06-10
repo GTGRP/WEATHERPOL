@@ -36,10 +36,15 @@ from data.stability import StabilityEngine
 from data.liquidity_guard import LiquidityGuard
 from data.clob_client import ClobClient
 from data.market_timing import outcome_decided
+from data.resolution_rules import StationResolver
 from trading.position_manager import PositionManager
 from bot.telegram_ui import TelegramBot
 from bot import settings_store
 from ml.decision_engine import MLDecisionEngine
+try:
+    from ml.resolution_verifier import ResolutionVerifier
+except Exception:  # keep the bot runnable even if the verifier import fails
+    ResolutionVerifier = None
 
 
 class WeatherBot:
@@ -62,6 +67,11 @@ class WeatherBot:
         self._book_cache = {}             # token_id -> (timestamp, book) — short TTL
         self.pm = PositionManager()
         self.ml = MLDecisionEngine()
+        # Resolution-station verification: confirm/adjust the EXACT airport each
+        # market settles on. The deterministic check is free; the verifier LLM
+        # is only consulted when a station looks ambiguous or different.
+        self.station_resolver = StationResolver()
+        self.resolution_verifier = ResolutionVerifier() if ResolutionVerifier else None
         self.telegram = TelegramBot(position_manager=self.pm, scanner=self.scanner)
         self.scan_count = 0
         self.signals_generated = 0
@@ -148,6 +158,41 @@ class WeatherBot:
         lo, hi = Config.GRADE_SIZE_MIN_MULT, Config.GRADE_SIZE_MAX_MULT
         return lo + (hi - lo) * g
 
+    def _resolve_station(self, market, city, lat, lon):
+        """Confirm/adjust the EXACT resolution station for a market.
+
+        Returns (lat, lon, ok). ok=False means the caller should SKIP this
+        market (rules name a station we can't verify and skip-on-unknown is on).
+        Logs 📍 confirmed / ⚠️ adjusted / ⛔ skip.
+        """
+        if not Config.RESOLUTION_VERIFY_ENABLED:
+            return lat, lon, True
+        try:
+            rs = self.station_resolver.resolve(
+                city, getattr(market, 'raw', None),
+                ml_engine=self.resolution_verifier,
+                verify_enabled=Config.RESOLUTION_VERIFY_ENABLED,
+                min_conf=Config.RESOLUTION_VERIFY_MIN_CONF,
+                skip_on_unknown=Config.RESOLUTION_SKIP_ON_UNKNOWN,
+            )
+        except Exception as e:
+            log.debug(f"station resolve failed {city}: {e}")
+            return lat, lon, True
+        if rs is None:
+            return lat, lon, True
+        if rs.source == 'skip' or rs.coords is None:
+            log.info(f"   ⛔ STATION {city} — {rs.reason} — skip")
+            return lat, lon, False
+        if rs.source == 'adjusted-ml':
+            log.info(f"   ⚠️  STATION {city} — adjusted to {rs.icao or '?'} "
+                     f"({rs.station_name or '?'}) — {rs.reason}")
+            return rs.coords[0], rs.coords[1], True
+        # confirmed / default: keep the resolver's coords (same as hardcoded).
+        log.debug(f"   📍 STATION {city} — {rs.source} {rs.icao or 'hardcoded'} ({rs.reason})")
+        if rs.coords:
+            return rs.coords[0], rs.coords[1], True
+        return lat, lon, True
+
     def _get_book(self, token_id: str):
         """Fetch the live order book for a token, with a short TTL cache.
 
@@ -171,7 +216,8 @@ class WeatherBot:
     def _place(self, *, token_id, condition_id, entry_price, base_size_usd,
                market_title, bucket_label, strategy, city, slug,
                resolution_time, edge=0.0, grade=None, hold_hint=False,
-               early_exit_price=None, apply_grade_size=True):
+               early_exit_price=None, apply_grade_size=True,
+               reason='', lock_confidence=0.0, signal=''):
         """Single placement path for ALL strategies.
 
         Applies the stability GRADE (gate + size multiplier), the LIQUIDITY
@@ -181,6 +227,9 @@ class WeatherBot:
         `apply_grade_size=False` skips the size multiplier (used by the
         stability basket, which already scales its legs by the score) while
         still enforcing the grade gate, liquidity guard, and exit rule.
+
+        `reason` / `lock_confidence` / `signal` are observability metadata
+        carried into the position so paper logs record WHY each buy fired.
         """
         # Hard safety: never place when trading is disabled (toggled mid-scan via /stop).
         if not Config.TRADING_ENABLED:
@@ -263,6 +312,10 @@ class WeatherBot:
             slug=slug,
             resolution_time=resolution_time,
             edge=edge,
+            reason=reason,
+            grade=grade,
+            lock_confidence=lock_confidence,
+            signal=signal or strategy,
         )
         if pos:
             # Grade-based exit: stable/rain → hold to resolution; else take profit early.
@@ -292,6 +345,13 @@ class WeatherBot:
             return
 
         lat, lon = coords
+
+        # -- RESOLUTION-STATION VERIFICATION --
+        # Forecast/observe the EXACT airport this market settles on. If the rules
+        # name a different station we adjust coordinates (or skip when unknown).
+        lat, lon, station_ok = self._resolve_station(market, city, lat, lon)
+        if not station_ok:
+            return
 
         # -- HIGHEST-TEMP-ONLY GATE (optional) --
         # When enabled, only trade daily-high markets. Disabled by default now
@@ -428,6 +488,9 @@ class WeatherBot:
                             hold_hint=True,  # observed edge realizes at resolution
                             early_exit_price=early_exit_price,
                             apply_grade_size=False,  # strategy already Kelly-sizes
+                            reason=sig.reason,
+                            lock_confidence=sig.lock_confidence,
+                            signal=f'late_observed_{side}',
                         )
                         if pos:
                             self.trades_placed += 1
@@ -467,6 +530,8 @@ class WeatherBot:
                         hold_hint=sig.hold_hint,
                         early_exit_price=early_exit_price,
                         apply_grade_size=False,  # PeakBasket sizes itself
+                        reason=sig.reason,
+                        signal=f'peak_basket_{leg.role}',
                     )
                     if pos:
                         self.trades_placed += 1
@@ -505,6 +570,8 @@ class WeatherBot:
                     resolution_time=market.resolution_time,
                     edge=signal.edge,
                     grade=grade, hold_hint=True, early_exit_price=early_exit_price,
+                    reason=f"P={signal.our_probability:.0%} edge={signal.edge:.0%}",
+                    signal='confident',
                 )
                 if pos:
                     self.trades_placed += 1
@@ -544,6 +611,10 @@ class WeatherBot:
         ml_status = self.ml.get_status()
         if ml_status['enabled']:
             log.info(f"  ML Engine:   {ml_status['model']} ({ml_status['tokens_used']} tokens)")
+        if self.resolution_verifier is not None:
+            vs = self.resolution_verifier.get_status()
+            if vs.get('enabled'):
+                log.info(f"  Station LLM: {vs['model']} ({vs['tokens_used']} tokens, {vs['cache_size']} cached)")
         log.info(f"  Contexts:    {stats.get('active_contexts', 0)} active markets")
         log.info(f"{'─'*60}")
 
@@ -551,10 +622,12 @@ class WeatherBot:
             log.info(f"  FILLED POSITIONS:")
             for p in open_pos[:10]:
                 pnl_e = '+' if p.unrealized_pnl >= 0 else ''
+                lock = ' 🔒' if getattr(p, 'preclose_locked', False) else ''
+                stale = ' ~stale' if getattr(p, 'current_price_stale', False) else ''
                 log.info(
                     f"    {pnl_e} {p.city:12} {p.bucket_label[:30]:30} "
                     f"${p.entry_price:.4f}->${p.current_price:.4f} "
-                    f"({p.roi_pct:+.0f}%)"
+                    f"({p.roi_pct:+.0f}%){lock}{stale}"
                 )
 
         if pending:

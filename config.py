@@ -278,6 +278,31 @@ class Config:
     SCAN_DAYS_AHEAD = int(os.getenv('SCAN_DAYS_AHEAD', '3'))
 
     # ===================================================================
+    # PAPER-REALISM — make the dry run behave like real trading
+    # The paper engine fills against the live ask ladder, settles from
+    # Polymarket's ACTUAL resolved outcome (so it works after a market closes),
+    # freezes stale prices instead of showing 0/random, flags near-certain wins
+    # in the final minutes, and asserts a conserved-PnL ledger after every change.
+    # ===================================================================
+    PAPER_REALISTIC_FILL = os.getenv('PAPER_REALISTIC_FILL', '1') == '1'         # walk the real ask ladder for paper buys
+    PAPER_SETTLE_BY_WEATHER = os.getenv('PAPER_SETTLE_BY_WEATHER', '0') == '1'   # weather is CONFIRMATION-only, never the source of truth
+    PAPER_PRECLOSE_LOCK_PCT = float(os.getenv('PAPER_PRECLOSE_LOCK_PCT', '0.95'))  # venue price >= this in the final minutes => 'win likely'
+    PAPER_PRECLOSE_WINDOW_MIN = float(os.getenv('PAPER_PRECLOSE_WINDOW_MIN', '2'))  # how many minutes before close to flag the lock
+    PAPER_TRADE_LOG = os.getenv('PAPER_TRADE_LOG', 'data/paper_trades.jsonl')    # structured per-trade audit log
+    PAPER_FREEZE_ON_BAD_PRICE = os.getenv('PAPER_FREEZE_ON_BAD_PRICE', '1') == '1'  # keep last good price instead of writing 0
+
+    # ===================================================================
+    # RESOLUTION-STATION VERIFICATION — forecast/observe the EXACT airport the
+    # market settles on. Deterministic match first (0 tokens); only calls the
+    # cheap verifier LLM when the station is ambiguous or looks different.
+    # ===================================================================
+    RESOLUTION_VERIFY_ENABLED = os.getenv('RESOLUTION_VERIFY_ENABLED', '1') == '1'
+    RESOLUTION_VERIFY_MIN_CONF = float(os.getenv('RESOLUTION_VERIFY_MIN_CONF', '0.6'))
+    RESOLUTION_SKIP_ON_UNKNOWN = os.getenv('RESOLUTION_SKIP_ON_UNKNOWN', '0') == '1'
+    ML_RESPONSES_URL = os.getenv('ML_RESPONSES_URL', 'https://api.freemodel.dev/v1')
+    ML_VERIFY_MODEL = os.getenv('ML_VERIFY_MODEL', 'gpt-5.4-mini')
+
+    # ===================================================================
     # TELEGRAM (optional notifications)
     # ===================================================================
     TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
@@ -367,5 +392,7 @@ class Config:
         print(f"Min Edge:    {cls.MIN_EDGE_TO_ENTER*100:.0f}% | fee-aware taker={cls.ASSUME_TAKER_FILLS}")
         print(f"Kelly:       {cls.KELLY_FRACTION}")
         print(f"Liquidity:   {'STRICT' if cls.LIQUIDITY_STRICT_BLOCK else 'adaptive'}")
+        print(f"Paper:       realistic-fill={cls.PAPER_REALISTIC_FILL} preclose>={cls.PAPER_PRECLOSE_LOCK_PCT:.0%} freeze={cls.PAPER_FREEZE_ON_BAD_PRICE}")
+        print(f"Resolve:     station-verify={'ON' if cls.RESOLUTION_VERIFY_ENABLED else 'OFF'} (min_conf={cls.RESOLUTION_VERIFY_MIN_CONF})")
         print(f"Scan:        every {cls.SCAN_INTERVAL_SECONDS}s")
         print(f"{'='*60}\n")
