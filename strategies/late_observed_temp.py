@@ -212,6 +212,15 @@ class LateObservedTempStrategy:
             mode=mode,
         )
         if lock < self.min_lock_conf:
+            # DIAGNOSTIC: the day isn't locked enough yet for the primary edge.
+            # This is the #2 reason the primary stays silent — surface the exact
+            # numbers (lock vs threshold + the observed state) so it's debuggable.
+            log.info(
+                f"   🌡️  PRIMARY skip {city} {mode} — lock {lock:.0%} < {self.min_lock_conf:.0%} "
+                f"(obs {observed_state.observed_extreme_c:.1f}°C, "
+                f"{observed_state.hours_remaining}h left, "
+                f"±{observed_state.remaining_spread_c:.1f}°C across {observed_state.n_models} models)"
+            )
             return []
 
         probs = om.observed_bucket_probabilities(
@@ -238,6 +247,16 @@ class LateObservedTempStrategy:
             params=params,
         )
         if not legs:
+            # DIAGNOSTIC: day IS locked, but no bucket cleared the fee gate at
+            # current book prices — the #3 reason for silence. Show the gate so
+            # we know whether to relax min_edge / entry band or it's just rich.
+            log.info(
+                f"   🌡️  PRIMARY no-edge {city} {mode} — lock {lock:.0%}, "
+                f"obs {observed_state.observed_extreme_c:.1f}°C but no bucket cleared the "
+                f"fee gate (need edge ≥ {params.min_edge:.0%}, "
+                f"YES {params.min_entry_price:.0%}-{params.max_entry_price:.0%} / "
+                f"NO {params.no_min_price:.0%}-{params.no_max_price:.0%})"
+            )
             return []
 
         return [LateObservedSignal(
