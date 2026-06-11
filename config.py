@@ -6,8 +6,9 @@ Supports paper (dry-run) and live trading modes.
 
 OVERHAUL NOTE: defaults now favor the observation-driven edge — the
 Late Observed-Temperature strategy is the PRIMARY strategy, fee-aware EV gating
-is on, liquidity blocking is strict, and the old forecast-only strategies
-(PeakBasket / Confident) are demoted to opt-in.
+is on, liquidity awareness adapts to thin books (no hard blocking by default),
+and the old forecast-only strategies (PeakBasket / Confident) are demoted to
+opt-in.
 """
 
 import os
@@ -83,16 +84,33 @@ class Config:
     OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY', '')
     # Open-Meteo: no key needed (free, 10k calls/day)
     # weather.gov: no key needed (US gov free)
+    # Open-Meteo endpoints to round-robin across. The free tier allows ~10k
+    # calls/day; alternating across mirrors (or a self-hosted instance) spreads
+    # the budget and reduces the chance of a single-IP rate limit. Comma-sep.
+    # Add a second URL here and the fetcher alternates automatically.
+    OPEN_METEO_ENDPOINTS = [e.strip() for e in os.getenv(
+        'OPEN_METEO_ENDPOINTS',
+        'https://api.open-meteo.com/v1/forecast'
+    ).split(',') if e.strip()]
+    # How long a forecast fetch is cached (seconds). Lower = fresher data + more
+    # API calls; keep within the daily budget.
+    WEATHER_FORECAST_CACHE_SECONDS = int(os.getenv('WEATHER_FORECAST_CACHE_SECONDS', '300'))
 
     # ===================================================================
     # TRADING PARAMETERS
     # ===================================================================
     # Sniper strategy: buy buckets priced below this when forecast is strong
     SNIPER_MAX_ENTRY_PRICE = float(os.getenv('SNIPER_MAX_ENTRY_PRICE', '0.15'))
-    # HARD PRICE FLOOR (all strategies): never buy a YES leg cheaper than this.
-    # Below ~5 cents the book has no real bid — you can buy but not sell, so the
-    # leg can only resolve to $0 (full loss). Kills the 0.1 cent dead-junk baskets.
+    # SELLABILITY FLOOR (early-exit strategies): a leg that plans to SELL before
+    # resolution needs a real bid to exit into. Below ~5c the book often has no
+    # bid, so we only require this floor for strategies that intend to flip.
+    # Hold-to-resolution legs (e.g. late-observed) bypass it — their EV is
+    # already fee-cleared and they never need to sell.
     MIN_ENTRY_PRICE = float(os.getenv('MIN_ENTRY_PRICE', '0.05'))
+    # HARD DUST FLOOR (all strategies): below this a leg can't even rest on the
+    # 1c-tick venue. This is the only absolute price block now — cheap EV+ tails
+    # above it are allowed when held to resolution (the 90%-WR wallet's edge).
+    ABS_PRICE_FLOOR = float(os.getenv('ABS_PRICE_FLOOR', '0.01'))
     # Trade BOTH daily-high and daily-low markets. The observation-driven
     # strategy locks the high in the afternoon and the low overnight, and trades
     # the NO side of dead buckets either way. Set to 1 to restrict to highs only.
@@ -125,7 +143,10 @@ class Config:
     SNIPER_ENABLED = os.getenv('SNIPER_ENABLED', '0') == '1'
     SPREAD_ENABLED = os.getenv('SPREAD_STRATEGY_ENABLED', '0') == '1'
     SELECTIVE_SNIPER_ENABLED = os.getenv('SELECTIVE_SNIPER_ENABLED', '0') == '1'
-    QUICK_FLIP_ENABLED = os.getenv('QUICK_FLIP_ENABLED', '0') == '1'
+    # Early-mispricing / forecast-change sniper: buy a freshly mispriced bucket
+    # before the book adjusts and flip on the correction (or hold if structural).
+    # Enabled by default now that it is wired into the scan loop.
+    QUICK_FLIP_ENABLED = os.getenv('QUICK_FLIP_ENABLED', '1') == '1'
     CORRELATION_ARB_ENABLED = os.getenv('CORRELATION_ARB_ENABLED', '0') == '1'
     # Demoted: forecast-only single-bucket bet. Off by default — the observed
     # strategy supersedes it. Flip to 1 to run it as a second opinion.
@@ -152,6 +173,10 @@ class Config:
     LATE_OBSERVED_MIN_LOCK = float(os.getenv('LATE_OBSERVED_MIN_LOCK', '0.70'))  # min lock-confidence to trade
     LATE_OBSERVED_MIN_EDGE = float(os.getenv('LATE_OBSERVED_MIN_EDGE', '0.10'))  # post-fee probability cushion
     LATE_OBSERVED_MAX_YES_PRICE = float(os.getenv('LATE_OBSERVED_MAX_YES_PRICE', '0.95'))
+    # Cheap-tail allowance for the HOLD-to-resolution primary strategy. Lower
+    # than the global sellability floor because these legs never need to sell —
+    # this is exactly the sub-5c tail the reference 90%-WR wallet lives in.
+    LATE_OBSERVED_MIN_ENTRY_PRICE = float(os.getenv('LATE_OBSERVED_MIN_ENTRY_PRICE', '0.02'))
     LATE_OBSERVED_NO_MIN_PRICE = float(os.getenv('LATE_OBSERVED_NO_MIN_PRICE', '0.04'))
     LATE_OBSERVED_NO_MAX_PRICE = float(os.getenv('LATE_OBSERVED_NO_MAX_PRICE', '0.97'))
     LATE_OBSERVED_BASE_FRACTION = float(os.getenv('LATE_OBSERVED_BASE_FRACTION', '0.06'))
@@ -222,10 +247,11 @@ class Config:
     SNIPER_MIN_PROBABILITY = float(os.getenv('SNIPER_MIN_PROBABILITY', '0.12'))
 
     # ===================================================================
-    # OUTCOME-DECIDED GATE — never trade a market whose measurement window has
-    # already closed in the CITY'S LOCAL time. NOTE: the late-observed strategy
-    # deliberately trades the *almost*-decided window (after the lock hour but
-    # before UMA resolution), which is the source of its edge.
+    # OUTCOME-DECIDED GATE — only HARD-skip a market once its measurement day is
+    # FULLY OVER in the city's local time (value recorded, just awaiting UMA).
+    # The intraday lock-hour window (same local day, after the peak) is exactly
+    # where the late-observed strategy has its edge, so it is NOT skipped — the
+    # bot trades the locked-but-unresolved extreme.
     # ===================================================================
     SKIP_DECIDED_MARKETS = os.getenv('SKIP_DECIDED_MARKETS', '1') == '1'
     HIGH_TEMP_LOCK_HOUR = int(os.getenv('HIGH_TEMP_LOCK_HOUR', '18'))       # local hour after which the day's HIGH is considered set
@@ -241,14 +267,16 @@ class Config:
     GRADE_SIZE_MAX_MULT = float(os.getenv('GRADE_SIZE_MAX_MULT', '1.25'))  # size multiplier at grade 1
 
     # ===================================================================
-    # LIQUIDITY AWARENESS — weather books are thin & asymmetric. The bot READS
-    # the order book and ADAPTS: maker entry at best_bid, trims size on
-    # thin/wide books, holds to resolution when too thin to exit. Now STRICT by
-    # default: trades that fail the guard are skipped (no buying into walls).
+    # LIQUIDITY AWARENESS — weather books are thin & asymmetric BY DESIGN. The
+    # bot READS the order book and ADAPTS: maker entry at best_bid, trims size
+    # on thin/wide books, holds to resolution when too thin to exit. ADAPTIVE by
+    # default (STRICT_BLOCK off): we utilise wide-spread weather books instead of
+    # skipping them, and only the truly untradeable (no bid / no book) get
+    # down-sized + held. Set LIQUIDITY_STRICT_BLOCK=1 to hard-skip instead.
     # ===================================================================
     LIQUIDITY_GUARD_ENABLED = os.getenv('LIQUIDITY_GUARD_ENABLED', '1') == '1'   # read & adapt to the book
-    LIQUIDITY_STRICT_BLOCK = os.getenv('LIQUIDITY_STRICT_BLOCK', '1') == '1'     # 1 = skip trades that fail the guard (default ON)
-    LIQUIDITY_THIN_SIZE_MULT = float(os.getenv('LIQUIDITY_THIN_SIZE_MULT', '0.5'))  # size multiplier on thin/wide books
+    LIQUIDITY_STRICT_BLOCK = os.getenv('LIQUIDITY_STRICT_BLOCK', '0') == '1'     # 0 = adapt (default), 1 = hard-skip failing books
+    LIQUIDITY_THIN_SIZE_MULT = float(os.getenv('LIQUIDITY_THIN_SIZE_MULT', '0.7'))  # keep ~70% size on thin/wide books (trim ~30%)
     LIQUIDITY_BOOK_CACHE_SECONDS = int(os.getenv('LIQUIDITY_BOOK_CACHE_SECONDS', '30'))
 
     # ===================================================================
@@ -389,9 +417,10 @@ class Config:
         print(f"Balance:     ${cls.STARTING_BALANCE:.2f} pUSD")
         print(f"Primary:     LateObserved {'ON' if cls.LATE_OBSERVED_ENABLED else 'OFF'} "
               f"(NO-side {'ON' if cls.LATE_OBSERVED_NO_SIDE else 'OFF'})")
+        print(f"QuickFlip:   {'ON' if cls.QUICK_FLIP_ENABLED else 'OFF'}")
         print(f"Min Edge:    {cls.MIN_EDGE_TO_ENTER*100:.0f}% | fee-aware taker={cls.ASSUME_TAKER_FILLS}")
         print(f"Kelly:       {cls.KELLY_FRACTION}")
-        print(f"Liquidity:   {'STRICT' if cls.LIQUIDITY_STRICT_BLOCK else 'adaptive'}")
+        print(f"Liquidity:   {'STRICT' if cls.LIQUIDITY_STRICT_BLOCK else 'adaptive'} (thin x{cls.LIQUIDITY_THIN_SIZE_MULT})")
         print(f"Paper:       realistic-fill={cls.PAPER_REALISTIC_FILL} preclose>={cls.PAPER_PRECLOSE_LOCK_PCT:.0%} freeze={cls.PAPER_FREEZE_ON_BAD_PRICE}")
         print(f"Resolve:     station-verify={'ON' if cls.RESOLUTION_VERIFY_ENABLED else 'OFF'} (min_conf={cls.RESOLUTION_VERIFY_MIN_CONF})")
         print(f"Scan:        every {cls.SCAN_INTERVAL_SECONDS}s")
