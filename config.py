@@ -255,6 +255,16 @@ class Config:
     # ===================================================================
     SKIP_DECIDED_MARKETS = os.getenv('SKIP_DECIDED_MARKETS', '1') == '1'
     HIGH_TEMP_LOCK_HOUR = int(os.getenv('HIGH_TEMP_LOCK_HOUR', '18'))       # local hour after which the day's HIGH is considered set
+    # PER-STRATEGY lock-window opt-in. When a market is decided/locked but the
+    # local day is NOT yet fully over, these decide which strategies still run.
+    # Observation strategies (LateObserved, QuickFlip) HAVE their edge in this
+    # window, so they default ON (1). Forecast-only strategies (PeakBasket,
+    # Confident) have no edge once the extreme is locked, so they default OFF (0).
+    # This replaces the old blanket skip that was blocking EVERY strategy.
+    LATE_OBSERVED_TRADE_DECIDED = os.getenv('LATE_OBSERVED_TRADE_DECIDED', '1') == '1'
+    QUICK_FLIP_TRADE_DECIDED = os.getenv('QUICK_FLIP_TRADE_DECIDED', '1') == '1'
+    PEAK_BASKET_TRADE_DECIDED = os.getenv('PEAK_BASKET_TRADE_DECIDED', '0') == '1'
+    CONFIDENT_TRADE_DECIDED = os.getenv('CONFIDENT_TRADE_DECIDED', '0') == '1'
 
     # ===================================================================
     # STABILITY GRADE — stability is a GRADE (not a strategy): it scales
@@ -418,6 +428,10 @@ class Config:
         print(f"Primary:     LateObserved {'ON' if cls.LATE_OBSERVED_ENABLED else 'OFF'} "
               f"(NO-side {'ON' if cls.LATE_OBSERVED_NO_SIDE else 'OFF'})")
         print(f"QuickFlip:   {'ON' if cls.QUICK_FLIP_ENABLED else 'OFF'}")
+        print(f"Lock-window: LateObs={'Y' if cls.LATE_OBSERVED_TRADE_DECIDED else 'N'} "
+              f"Flip={'Y' if cls.QUICK_FLIP_TRADE_DECIDED else 'N'} "
+              f"Peak={'Y' if cls.PEAK_BASKET_TRADE_DECIDED else 'N'} "
+              f"Confident={'Y' if cls.CONFIDENT_TRADE_DECIDED else 'N'}")
         print(f"Min Edge:    {cls.MIN_EDGE_TO_ENTER*100:.0f}% | fee-aware taker={cls.ASSUME_TAKER_FILLS}")
         print(f"Kelly:       {cls.KELLY_FRACTION}")
         print(f"Liquidity:   {'STRICT' if cls.LIQUIDITY_STRICT_BLOCK else 'adaptive'} (thin x{cls.LIQUIDITY_THIN_SIZE_MULT})")

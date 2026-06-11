@@ -5,7 +5,7 @@ Flow:
 1. Scan Polymarket for active weather markets (slug-based, confirmed pattern)
 2. For each market: fetch multi-source forecasts
 3. Run probability engine → find mispriced buckets
-4. Run strategies (LateObserved primary + optional PeakBasket/Confident) → signals
+4. Run strategies (LateObserved primary + QuickFlip + optional PeakBasket/Confident) → signals
 5. Execute trades (paper or live)
 6. Monitor positions, check resolutions, redeem winners
 7. Send Telegram notifications
@@ -32,10 +32,11 @@ from data.observed_weather import ObservedWeather
 from strategies.peak_basket import PeakBasketStrategy
 from strategies.confident_strategy import ConfidentStrategy
 from strategies.late_observed_temp import LateObservedTempStrategy
+from strategies.quick_flip import QuickFlipStrategy
 from data.stability import StabilityEngine
 from data.liquidity_guard import LiquidityGuard
 from data.clob_client import ClobClient
-from data.market_timing import outcome_decided
+from data.market_timing import outcome_decided, city_local_now
 from data.resolution_rules import StationResolver
 from trading.position_manager import PositionManager
 from bot.telegram_ui import TelegramBot
@@ -59,6 +60,9 @@ class WeatherBot:
         self.confident = ConfidentStrategy()
         # PRIMARY strategy: trade the observed/locked daily extreme (YES + NO).
         self.late_observed = LateObservedTempStrategy()
+        # Forecast-change arbitrage: enter a freshly mispriced bucket before the
+        # book digests new model data; flips quick or holds if structural.
+        self.quick_flip = QuickFlipStrategy()
         self.observed = ObservedWeather()
         self.stability_engine = StabilityEngine()
         # Stability GRADE + liquidity guard (applied across ALL strategies)
@@ -244,11 +248,19 @@ class WeatherBot:
             log.info(f"   ⏭️  GRADE SKIP {strategy}:{bucket_label[:18]} — grade {grade:.2f} < {Config.GRADE_MIN_TO_TRADE}")
             return None
 
-        # -- PRICE FLOOR: never buy unsellable junk --
-        # A leg quoted below MIN_ENTRY_PRICE (~5c) has no real bid to sell into,
-        # so it can only resolve to $0 (full loss). Reject up front.
-        if entry_price < Config.MIN_ENTRY_PRICE:
-            log.info(f"   ⏭️  PRICE FLOOR {strategy}:{bucket_label[:18]} — ask ${entry_price:.4f} < ${Config.MIN_ENTRY_PRICE:.2f} (unsellable)")
+        # -- PRICE FLOORS --
+        # (1) HARD DUST FLOOR (all strategies): below ABS_PRICE_FLOOR a leg can't
+        #     even rest on the 1c-tick venue — true junk, always reject.
+        abs_floor = getattr(Config, 'ABS_PRICE_FLOOR', 0.01)
+        if entry_price < abs_floor:
+            log.info(f"   ⏭️  DUST {strategy}:{bucket_label[:18]} — ask ${entry_price:.4f} < ${abs_floor:.2f}")
+            return None
+        # (2) SELLABILITY FLOOR (early-exit strategies only): a leg that plans to
+        #     SELL before resolution needs a real bid (~5c) to exit into. HOLD-to-
+        #     resolution legs bypass this — an EV+ 2-4c locked tail never needs a
+        #     bid and is exactly the reference 90%-WR wallet's cheap-tail edge.
+        if (not hold_hint) and entry_price < Config.MIN_ENTRY_PRICE:
+            log.info(f"   ⏭️  PRICE FLOOR {strategy}:{bucket_label[:18]} — ask ${entry_price:.4f} < ${Config.MIN_ENTRY_PRICE:.2f} (no exit bid)")
             return None
 
         # -- Grade sizing --
@@ -292,10 +304,14 @@ class WeatherBot:
 
         if fill_price <= 0:
             return None
-        # Maker re-pricing must also respect the floor: a best_bid below the
-        # floor is the same unsellable-junk trap (we'd own a leg with no exit).
-        if fill_price < Config.MIN_ENTRY_PRICE:
-            log.info(f"   ⏭️  PRICE FLOOR {strategy}:{bucket_label[:18]} — maker fill ${fill_price:.4f} < ${Config.MIN_ENTRY_PRICE:.2f}")
+        # Maker re-pricing must respect the same floors. Dust is always rejected;
+        # the sellability floor again applies only to early-exit legs (hold legs,
+        # including anything forced to hold by a thin book above, may rest cheap).
+        if fill_price < abs_floor:
+            log.info(f"   ⏭️  DUST {strategy}:{bucket_label[:18]} — maker fill ${fill_price:.4f} < ${abs_floor:.2f}")
+            return None
+        if (not hold_hint) and fill_price < Config.MIN_ENTRY_PRICE:
+            log.info(f"   ⏭️  PRICE FLOOR {strategy}:{bucket_label[:18]} — maker fill ${fill_price:.4f} < ${Config.MIN_ENTRY_PRICE:.2f} (no exit bid)")
             return None
         shares = size_usd / fill_price
 
@@ -361,11 +377,17 @@ class WeatherBot:
             log.debug(f"   ⏭️  SKIP {city} {market.market_type} — highest-temp only")
             return
 
-        # -- OUTCOME-DECIDED GATE (timezone-aware) --
-        # Never trade a market whose measurement window has already closed in the
-        # CITY'S LOCAL time — the day's high/low is a recorded fact by then, so any
-        # buy is a known outcome (cheap losing legs). Markets stay OPEN until UMA
-        # resolves, which is NOT a signal that the weather is still undecided.
+        # -- OUTCOME-DECIDED GATE (timezone-aware, PER-STRATEGY) --
+        # A "decided/locked" day KILLS the edge for forecast-guessing strategies
+        # but IS the edge for observation strategies (the recorded extreme is a
+        # hard floor/ceiling while the book still prices stale forecast doubt).
+        # So this is NO LONGER a blanket skip. We only HARD-skip when the city's
+        # local day is FULLY OVER (value recorded, just awaiting UMA payout —
+        # nothing left for anyone). Otherwise we flag a LOCK WINDOW and let each
+        # strategy opt in below via its own *_TRADE_DECIDED config flag.
+        # (This was the bug behind "signals but zero trades": the old gate
+        # returned here and LateObserved never even ran.)
+        in_lock_window = False
         if Config.SKIP_DECIDED_MARKETS:
             try:
                 decided, why = outcome_decided(
@@ -375,9 +397,20 @@ class WeatherBot:
                 decided, why = False, ''
                 log.debug(f"decided-gate failed {city}: {e}")
             if decided:
-                log.info(f"   ⛔ DECIDED {city} {market.market_type.split('_')[0]} "
-                         f"{market.measurement_date:%b-%d} — {why} — skip (outcome already set)")
-                return
+                fully_over = False
+                try:
+                    if market.measurement_date is not None:
+                        fully_over = (city_local_now(lat, lon).date()
+                                      > market.measurement_date.date())
+                except Exception as e:
+                    log.debug(f"day-over check failed {city}: {e}")
+                if fully_over:
+                    log.info(f"   ⛔ OVER {city} {market.market_type.split('_')[0]} "
+                             f"{market.measurement_date:%b-%d} — {why} — skip (day fully over, awaiting UMA)")
+                    return
+                in_lock_window = True
+                log.info(f"   🔓 LOCK WINDOW {city} {market.market_type.split('_')[0]} "
+                         f"{market.measurement_date:%b-%d} — {why} — observation strategies only")
 
         # Fetch forecasts
         target_time = market.resolution_time
@@ -443,8 +476,11 @@ class WeatherBot:
         # Once the local day's peak/trough is locked, the observed extreme is a
         # hard floor/ceiling on settlement. YES the locked bucket and NO the
         # buckets the observed data has ruled out, with fee-aware gating.
+        # Trades in the LOCK WINDOW by default (that's its whole edge).
         # ------------------------------------------------------
-        if Config.LATE_OBSERVED_ENABLED:
+        if Config.LATE_OBSERVED_ENABLED and (
+            not in_lock_window or getattr(Config, 'LATE_OBSERVED_TRADE_DECIDED', True)
+        ):
             mode = 'low' if 'low' in (market.market_type or '').lower() else 'high'
             observed_state = None
             try:
@@ -501,11 +537,67 @@ class WeatherBot:
                             )
 
         # ------------------------------------------------------
+        # QUICK FLIP — forecast-change arbitrage. When fresh model data shifts a
+        # bucket's probability, enter BEFORE the book adjusts and flip on the
+        # correction (or hold if the move is structural). High win-rate, fast
+        # exit. Also runs in the lock window (the forecast-change edge holds).
+        # ------------------------------------------------------
+        if getattr(Config, 'QUICK_FLIP_ENABLED', False) and (
+            not in_lock_window or getattr(Config, 'QUICK_FLIP_TRADE_DECIDED', True)
+        ):
+            qf_mode = 'low' if 'low' in (market.market_type or '').lower() else 'highest'
+            try:
+                flip_signals = self.quick_flip.evaluate(
+                    market.title, bucket_probs, market_prices, market_prices,
+                    token_ids, balance, city=city, market_type=qf_mode,
+                )
+            except Exception as e:
+                flip_signals = []
+                log.debug(f"quick_flip eval failed {city}: {e}")
+            for fsig in flip_signals:
+                self.signals_generated += 1
+                log.info(
+                    f"   ⚡ FLIP {city} | {fsig.bucket_label[:25]} @ ${fsig.entry_price:.3f} "
+                    f"→ ${fsig.target_price:.3f} ({fsig.expected_roi_pct:.0f}% ROI, "
+                    f"{fsig.expected_hold_minutes}m) | {fsig.entry_reason}"
+                )
+                pos = self._place(
+                    token_id=fsig.token_id,
+                    condition_id=condition_ids.get(fsig.bucket_label, ''),
+                    entry_price=fsig.entry_price,
+                    base_size_usd=fsig.size_usd,
+                    market_title=market.title,
+                    bucket_label=fsig.bucket_label,
+                    strategy='quick_flip',
+                    city=city,
+                    slug=market.slug,
+                    resolution_time=market.resolution_time,
+                    edge=fsig.expected_roi_pct / 100.0,
+                    grade=grade,
+                    hold_hint=False,            # quick-flip EXITS into the correction
+                    early_exit_price=fsig.target_price,
+                    apply_grade_size=False,     # quick-flip sizes itself
+                    reason=fsig.entry_reason,
+                    lock_confidence=fsig.confidence,
+                    signal='quick_flip',
+                )
+                if pos:
+                    self.trades_placed += 1
+                    self.telegram.notify_trade(
+                        'BUY', fsig.bucket_label, pos.entry_price,
+                        pos.cost_usd, pos.shares, 'quick_flip',
+                        edge=fsig.expected_roi_pct / 100.0, city=city,
+                    )
+
+        # ------------------------------------------------------
         # PEAK BASKET — forecast-only directional-peak strategy (DEMOTED, opt-in).
         # Buys the ensemble forecast peak + ONE trend-directional neighbor.
-        # Off by default now that the observed strategy supersedes it.
+        # Off by default now that the observed strategy supersedes it. Skipped in
+        # the lock window (no forecast edge once the extreme is recorded).
         # ------------------------------------------------------
-        if Config.PEAK_BASKET_ENABLED:
+        if Config.PEAK_BASKET_ENABLED and (
+            not in_lock_window or getattr(Config, 'PEAK_BASKET_TRADE_DECIDED', False)
+        ):
             peak_signals = self.peak_basket.evaluate(
                 market.title, bucket_probs, market_prices, token_ids, balance,
                 city=city, stability=stab, grade=grade,
@@ -543,9 +635,12 @@ class WeatherBot:
 
         # ------------------------------------------------------
         # CONFIDENT — simple peak-only fallback (DEMOTED, opt-in). Only fires
-        # when explicitly enabled as a second opinion on peak-only bets.
+        # when explicitly enabled as a second opinion on peak-only bets. Skipped
+        # in the lock window (no forecast edge once the extreme is recorded).
         # ------------------------------------------------------
-        if Config.CONFIDENT_ENABLED:
+        if Config.CONFIDENT_ENABLED and (
+            not in_lock_window or getattr(Config, 'CONFIDENT_TRADE_DECIDED', False)
+        ):
             confident_signals = self.confident.evaluate(
                 market.title, bucket_probs, market_prices, token_ids, balance,
             )
@@ -655,6 +750,7 @@ class WeatherBot:
         log.info(f"   Days ahead: {Config.SCAN_DAYS_AHEAD}")
         strats = []
         if Config.LATE_OBSERVED_ENABLED: strats.append('LateObserved*')
+        if getattr(Config, 'QUICK_FLIP_ENABLED', False): strats.append('QuickFlip')
         if Config.PEAK_BASKET_ENABLED: strats.append('PeakBasket')
         if Config.CONFIDENT_ENABLED: strats.append('Confident')
         if Config.SNIPER_ENABLED: strats.append('Sniper')
