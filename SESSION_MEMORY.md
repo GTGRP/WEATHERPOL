@@ -365,3 +365,58 @@ New log lines to watch for: `🔓 LOCK WINDOW`, `⛔ OVER`, `⚡ FLIP` (in addit
   into a testable `decide_placement()`; add CI (pytest + ruff) + pin a lockfile; document/remove the dormant
   GPT-5.5 + XGBoost path (not in the trade decision path); cap `data/paper_trades.jsonl` growth; extend the
   Open-Meteo round-robin to `data/observed_weather.py`; fix the `weather.gov` points_url stray `{` bug.
+
+---
+
+## June 11, 2026 (Notion AI / GTGRP, late evening ~23:00 IST) — DIAGNOSTIC LOGGING (per-cycle SCAN FUNNEL + primary-silence visibility)
+
+Same agent (Notion AI) / same remote `https://github.com/GTGRP/WEATHERPOL` branch `main`, via GitHub MCP
+(sandbox offline, `py_compile`-only validation). Continues the June 11 afternoon work above.
+
+### OVERALL FOUND ON LOGS (two Railway paper logs the user sent)
+- **logs1.json** (13:25): 21 BUY, 28 ⚡FLIP, 10 🔓LOCK WINDOW, balance $100→$25.39. PRIMARY (🌡️ OBSERVED) fired
+  **0 times**.
+- **logs2.json** (15:48): **0 BUY**, 169 ⚡FLIP, 80 🔓LOCK WINDOW, 17 ⛔OVER, balance frozen $12.34, 28 open
+  positions, −11%. PRIMARY fired **0 times** again. quick_flip = 32 trades, **0% win rate**, −$10.64.
+- **Why zero buys in run 2 (categorised all 169 flip signals):** **74 💧LIQ THIN + 55 ⏭️PRICE FLOOR + 40 silent
+  add_position rejects** (duplicate-guard / min-notional). Balance was NEVER the blocker (0 `⏸` balance-pause
+  lines in either log; $12.34 > min order).
+- **Why the PRIMARY never fired:** the 🔓 LOCK WINDOW gate OPENED (so the strategy DID run), but
+  `LateObservedTempStrategy.evaluate` returned `[]` SILENTLY — either `observed_state is None` (no station data
+  yet / fetch failed / dark) or `lock_confidence < 0.70`, or the legs failed the fee gate. All three exits were
+  silent/debug-level, so the log gave NO clue why the primary stayed quiet. THAT is what these diagnostics fix.
+- Most flips were on "lowest temperature" markets at night (lows correctly NOT locked overnight); highs were in
+  the lock window but the primary still emitted nothing → confidence/data, now made visible.
+
+### WHAT DIAGNOSTIC LOGS WERE ADDED (commits `6075b424` + this one, GTGRP/WEATHERPOL main)
+1. **`strategies/late_observed_temp.py`** — the PRIMARY no longer fails silently. Two new `log.info` lines:
+   - `🌡️ PRIMARY skip {city} {mode} — lock {lock:.0%} < {min:.0%} (obs {°C}, {h}h left, ±{spread}°C across
+     {n} models)` when the day isn't locked enough.
+   - `🌡️ PRIMARY no-edge {city} {mode} — lock {lock:.0%}, obs {°C} but no bucket cleared the fee gate
+     (need edge ≥ {min_edge}, YES {band} / NO {band})` when it's locked but nothing clears fees.
+2. **`dashboard.py`** — observability across the whole scan:
+   - `🌙 PRIMARY no-data {city} {mode}` when `observed_state is None` (the #1 silence reason: no station reading
+     yet / fetch failed / offline).
+   - **`🔎 SCAN FUNNEL (this cycle)`** — the single most useful debug block, printed every cycle in the
+     dashboard. A per-cycle `Counter` (`self._funnel`, reset each `run_once`) tallies EVERY outcome:
+     `placed`, `add_reject` (dup/min/bal), `price_floor`, `dust`, `grade_skip`, `liq_skip`, `liq_thin` (hold),
+     `liq_nobook` (hold), `lock_window`, `over`, `primary_signal`, `primary_no_data`, `no_forecast`, `no_coords`.
+     If trades==0 this shows EXACTLY which gate ate them — we never again have to guess "why didn't it trade".
+   - `💰 deployed $X across N pos | free $Y` capital-deployment line under the funnel.
+   - Data-health counters `no_forecast` / `no_coords` are incremented where the market was previously dropped at
+     a silent `log.debug` (so dead cities/forecasts now show up in the funnel).
+3. Both files `py_compile`-clean. The new emojis to watch for: `🔎 SCAN FUNNEL`, `🌙 PRIMARY no-data`,
+   `🌡️ PRIMARY skip`, `🌡️ PRIMARY no-edge`, `💰 deployed`.
+
+### WHEN / WHY pushed
+June 11, 2026 late evening IST. Pushed in two commits (the first `6075b424` carried `late_observed_temp.py`
+alone; this commit carries `dashboard.py` + this SESSION_MEMORY append) — net repo state has all diagnostics
+together. WHY: the user asked for the crucial "show all important logs so we can debug without guessing" line,
+plus any other useful diagnostics, plus this memory note. HEAD advances past `5dce428`.
+
+### STILL PENDING (user / next agent)
+- **User → Railway:** REDEPLOY, then send tomorrow's full-trade log (~4–6 PM IST for Asian-city highs, optionally
+  9–11 PM IST for European highs) so we can read the new `🔎 SCAN FUNNEL` + `🌡️ PRIMARY …` lines and confirm
+  whether the primary finally fires (and if not, EXACTLY which gate stops it).
+- **Open decision (deferred):** whether to relax/reprice the quick_flip 5c sellability floor so sub-5c flips fill,
+  and/or add a duplicate-guard cooldown (quick_flip re-signals the same held buckets each cycle).

@@ -21,6 +21,7 @@ import sys
 import os
 import time
 import argparse
+from collections import Counter
 from datetime import datetime, timezone
 
 from config import Config
@@ -80,6 +81,7 @@ class WeatherBot:
         self.scan_count = 0
         self.signals_generated = 0
         self.trades_placed = 0
+        self._funnel = Counter()          # per-scan placement funnel (diagnostics)
         self._last_resolution_check = 0
         self._last_daily_summary = ''
         self._last_weekly_record = ''
@@ -87,6 +89,7 @@ class WeatherBot:
     def run_once(self):
         """Run a single scan cycle."""
         self.scan_count += 1
+        self._funnel = Counter()  # reset per-cycle diagnostics funnel
         now = datetime.now(timezone.utc)
         log.info(f"\n{'═'*60}")
         log.info(f"🔍 SCAN #{self.scan_count} — {now.strftime('%Y-%m-%d %H:%M:%S UTC')}")
@@ -245,6 +248,7 @@ class WeatherBot:
 
         # -- Grade gate: skip trades on unpredictable city-days --
         if Config.GRADE_SIZING_ENABLED and grade < Config.GRADE_MIN_TO_TRADE:
+            self._funnel['grade_skip'] += 1
             log.info(f"   ⏭️  GRADE SKIP {strategy}:{bucket_label[:18]} — grade {grade:.2f} < {Config.GRADE_MIN_TO_TRADE}")
             return None
 
@@ -253,6 +257,7 @@ class WeatherBot:
         #     even rest on the 1c-tick venue — true junk, always reject.
         abs_floor = getattr(Config, 'ABS_PRICE_FLOOR', 0.01)
         if entry_price < abs_floor:
+            self._funnel['dust'] += 1
             log.info(f"   ⏭️  DUST {strategy}:{bucket_label[:18]} — ask ${entry_price:.4f} < ${abs_floor:.2f}")
             return None
         # (2) SELLABILITY FLOOR (early-exit strategies only): a leg that plans to
@@ -260,6 +265,7 @@ class WeatherBot:
         #     resolution legs bypass this — an EV+ 2-4c locked tail never needs a
         #     bid and is exactly the reference 90%-WR wallet's cheap-tail edge.
         if (not hold_hint) and entry_price < Config.MIN_ENTRY_PRICE:
+            self._funnel['price_floor'] += 1
             log.info(f"   ⏭️  PRICE FLOOR {strategy}:{bucket_label[:18]} — ask ${entry_price:.4f} < ${Config.MIN_ENTRY_PRICE:.2f} (no exit bid)")
             return None
 
@@ -286,20 +292,24 @@ class WeatherBot:
                 fill_price = book['best_bid']
                 if not chk.passed:
                     if Config.LIQUIDITY_STRICT_BLOCK:
+                        self._funnel['liq_skip'] += 1
                         log.info(f"   ⏭️  LIQ SKIP {strategy}:{bucket_label[:18]} — {chk.reason}")
                         return None
                     # Aware mode: trade smaller + hold to resolution (can't rely on an exit).
                     size_usd *= Config.LIQUIDITY_THIN_SIZE_MULT
                     hold_hint = True
+                    self._funnel['liq_thin'] += 1
                     log.info(f"   💧 LIQ THIN {strategy}:{bucket_label[:18]} — {chk.reason} "
                              f"→ size x{Config.LIQUIDITY_THIN_SIZE_MULT} + hold, maker@{fill_price:.3f}")
             else:
                 # No book / no bid: stay at scan price, trim size, and hold.
                 if Config.LIQUIDITY_STRICT_BLOCK:
+                    self._funnel['liq_skip'] += 1
                     log.info(f"   ⏭️  LIQ SKIP {strategy}:{bucket_label[:18]} — no order book")
                     return None
                 size_usd *= Config.LIQUIDITY_THIN_SIZE_MULT
                 hold_hint = True
+                self._funnel['liq_nobook'] += 1
                 log.info(f"   💧 LIQ NOBOOK {strategy}:{bucket_label[:18]} — no bid → size x{Config.LIQUIDITY_THIN_SIZE_MULT} + hold")
 
         if fill_price <= 0:
@@ -308,9 +318,11 @@ class WeatherBot:
         # the sellability floor again applies only to early-exit legs (hold legs,
         # including anything forced to hold by a thin book above, may rest cheap).
         if fill_price < abs_floor:
+            self._funnel['dust'] += 1
             log.info(f"   ⏭️  DUST {strategy}:{bucket_label[:18]} — maker fill ${fill_price:.4f} < ${abs_floor:.2f}")
             return None
         if (not hold_hint) and fill_price < Config.MIN_ENTRY_PRICE:
+            self._funnel['price_floor'] += 1
             log.info(f"   ⏭️  PRICE FLOOR {strategy}:{bucket_label[:18]} — maker fill ${fill_price:.4f} < ${Config.MIN_ENTRY_PRICE:.2f} (no exit bid)")
             return None
         shares = size_usd / fill_price
@@ -334,6 +346,7 @@ class WeatherBot:
             signal=signal or strategy,
         )
         if pos:
+            self._funnel['placed'] += 1
             # Grade-based exit: stable/rain → hold to resolution; else take profit early.
             if hold_hint:
                 pos.take_profit_price = 0.99
@@ -341,6 +354,11 @@ class WeatherBot:
             else:
                 pos.take_profit_price = early_exit_price
                 pos.exit_reason = 'grade_early_exit'
+        else:
+            # Passed every _place gate but PositionManager still declined: almost
+            # always the DUPLICATE GUARD (already holding this token+strategy),
+            # or a min-notional / insufficient-balance / unfilled maker check.
+            self._funnel['add_reject'] += 1
         return pos
 
     def _evaluate_market(self, market):
@@ -357,6 +375,7 @@ class WeatherBot:
                     coords = val
                     break
         if not coords:
+            self._funnel['no_coords'] += 1
             log.debug(f"No coordinates for: {city}")
             return
 
@@ -405,10 +424,12 @@ class WeatherBot:
                 except Exception as e:
                     log.debug(f"day-over check failed {city}: {e}")
                 if fully_over:
+                    self._funnel['over'] += 1
                     log.info(f"   ⛔ OVER {city} {market.market_type.split('_')[0]} "
                              f"{market.measurement_date:%b-%d} — {why} — skip (day fully over, awaiting UMA)")
                     return
                 in_lock_window = True
+                self._funnel['lock_window'] += 1
                 log.info(f"   🔓 LOCK WINDOW {city} {market.market_type.split('_')[0]} "
                          f"{market.measurement_date:%b-%d} — {why} — observation strategies only")
 
@@ -416,6 +437,7 @@ class WeatherBot:
         target_time = market.resolution_time
         forecasts = self.fetcher.fetch_all(lat, lon, city, target_time)
         if not forecasts:
+            self._funnel['no_forecast'] += 1
             log.debug(f"No forecasts for {city}")
             return
 
@@ -489,6 +511,14 @@ class WeatherBot:
                 )
             except Exception as e:
                 log.debug(f"observed-state fetch failed {city}: {e}")
+            if observed_state is None:
+                # The PRIMARY edge needs observed station data. Make the silence
+                # visible: no data = no observed extreme yet (early in the local
+                # day / fetch failed / offline). This is the #1 reason the
+                # primary stays quiet, so log it instead of skipping silently.
+                self._funnel['primary_no_data'] += 1
+                log.info(f"   🌙 PRIMARY no-data {city} {mode} — no observed station reading yet "
+                         f"(early in local day / fetch failed / offline)")
             if observed_state is not None:
                 obs_signals = self.late_observed.evaluate(
                     market.title, buckets, market_prices, token_ids, balance,
@@ -496,6 +526,8 @@ class WeatherBot:
                     no_prices=no_prices, no_token_ids=no_token_ids,
                     grade=grade, market_type=market.market_type,
                 )
+                if obs_signals:
+                    self._funnel['primary_signal'] += 1
                 for sig in obs_signals:
                     self.signals_generated += 1
                     log.info(
@@ -711,6 +743,26 @@ class WeatherBot:
             if vs.get('enabled'):
                 log.info(f"  Station LLM: {vs['model']} ({vs['tokens_used']} tokens, {vs['cache_size']} cached)")
         log.info(f"  Contexts:    {stats.get('active_contexts', 0)} active markets")
+        log.info(f"{'─'*60}")
+
+        # -- SCAN FUNNEL (this cycle) --------------------------------------
+        # The single most useful debug line: every signal either becomes a
+        # placed trade or dies at a known gate. If trades==0 this shows EXACTLY
+        # which gate ate them (price floor / liquidity / duplicate / no-data),
+        # so we never again have to guess "why didn't it trade".
+        f = self._funnel
+        if f:
+            placed = f.get('placed', 0)
+            log.info(f"  🔎 SCAN FUNNEL (this cycle):")
+            log.info(f"     ✅ placed={placed}   ⛔ add-skip dup/min/bal={f.get('add_reject', 0)}")
+            log.info(f"     ⏭️  price_floor={f.get('price_floor', 0)}  dust={f.get('dust', 0)}  "
+                     f"grade_skip={f.get('grade_skip', 0)}  liq_skip={f.get('liq_skip', 0)}")
+            log.info(f"     💧 liq_thin_hold={f.get('liq_thin', 0)}  liq_nobook_hold={f.get('liq_nobook', 0)}")
+            log.info(f"     🔓 lock_window={f.get('lock_window', 0)}  ⛔ over={f.get('over', 0)}  "
+                     f"🌡️  primary_signal={f.get('primary_signal', 0)}  🌙 primary_no_data={f.get('primary_no_data', 0)}")
+            log.info(f"     ⚠️  no_forecast={f.get('no_forecast', 0)}  no_coords={f.get('no_coords', 0)}")
+        deployed = stats['portfolio_value'] - stats['balance']
+        log.info(f"  💰 deployed ${deployed:.2f} across {len(open_pos)} pos | free ${stats['balance']:.2f}")
         log.info(f"{'─'*60}")
 
         if open_pos:
