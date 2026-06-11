@@ -448,28 +448,74 @@ identical: `placed=0`, `add-skip dup/min/bal=14–16`, `price_floor=6–7`, `liq
 1. **`_http_get` is now LOUD on failure** — on non-200 it logs `⚠️ observed-weather HTTP {status} @ {lat},{lon}
    models=… — {body[:200]}` (Open-Meteo returns `{"error":true,"reason":…}` on 400, so we finally SEE the
    reason); exceptions log `⚠️ observed-weather fetch failed`.
-2. **Single-source fallback (THE actual fix)** — `get_state` tries the multi-model request first; if it returns
-   no data it RETRIES once with the plain single-source forecast (no `models=` param), the most reliable
-   Open-Meteo shape. Logs `ℹ️ observed weather using single-source fallback`. We lose the cross-model spread but
-   still get a real observed extreme (what actually drives the PRIMARY edge). Directly defeats a multi-model 400.
-3. **Every `None`-return path now logs WHY** — `🌙 observed fetch returned no data (multi-model AND fallback
-   both failed)`; `🌙 observed: response had no temperature_2m hourly series (keys=…)`; `🌙 observed: no elapsed
-   hours yet for {day} (local now …, N day-rows) — too early in local day`.
-4. **current-temp suffix bug fixed** — with multiple models Open-Meteo suffixes the `current` key
-   (`temperature_2m_ecmwf_ifs04`), so the old exact-key `"temperature_2m" in cur` check ALWAYS missed it and
-   `current_temp` stayed None; now matched by prefix.
-File `py_compile`-clean. New emojis to watch: `⚠️ observed-weather HTTP`, `ℹ️ … single-source fallback`,
-`🌙 observed: …`.
+2. **Single-source fallback** — `get_state` tries the multi-model request first; if it returns
+   no data it RETRIES once with the plain single-source forecast (no `models=` param). Logs `ℹ️ observed weather
+   using single-source fallback`.
+3. **Every `None`-return path now logs WHY** — `🌙 observed fetch returned no data`; `🌙 observed: response had
+   no temperature_2m hourly series`; `🌙 observed: no elapsed hours yet for {day} … too early in local day`.
+4. **current-temp suffix bug fixed** — multi-model responses suffix the `current` key
+   (`temperature_2m_ecmwf_ifs04`); now matched by prefix instead of exact key.
+File `py_compile`-clean. New emojis: `⚠️ observed-weather HTTP`, `ℹ️ … single-source fallback`, `🌙 observed: …`.
 
 ### WHEN / WHY pushed
-June 11, 2026 ~23:40 IST, SINGLE commit (`data/observed_weather.py` + this SESSION_MEMORY append). HEAD advances
-past `b69fdc07`.
+June 11, 2026 ~23:40 IST, SINGLE commit `334922fe` (`data/observed_weather.py` + this SESSION_MEMORY append).
+
+---
+
+## June 12, 2026 (Notion AI / GTGRP, ~00:20 IST) — OBSERVED-EXTREME TWO-SOURCE FIX (forecast models return null for already-elapsed hours)
+
+Same agent (Notion AI) / same remote `https://github.com/GTGRP/WEATHERPOL` branch `main`, via GitHub MCP
+(sandbox offline; this time validated by `py_compile` AND an offline unit test with injected fake responses).
+Continues the ~23:40 fetch-fix entry above. Commit `b990c63097feed14f49f2cf7a81c7137fce1f2a5`
+(`data/observed_weather.py`); this SESSION_MEMORY append follows as a separate diary commit.
+
+### OVERALL FOUND ON LOGS (next Railway log, `logs.1781203214147.json`, scans #1–#3, 18:37–18:39 UTC)
+The ~23:40 fetch fix WORKED and exposed a deeper bug:
+- **The fetch is now HEALTHY** — ZERO `⚠️ observed-weather HTTP` errors, ZERO `single-source fallback` lines,
+  ZERO `both failed`. The Open-Meteo request succeeds cleanly for every city. The whole silent-failure class the
+  ~23:40 commit targeted is gone.
+- **Trading is HEALTHY again** — SCAN #1 `placed=13` with realistic partial fills ("filled across N lvls"),
+  `💰 deployed $64.91 across 13 pos | free $29.81`. SCAN #2/#3 `placed=0, add-skip dup/min/bal=13` = it already
+  holds those 13 (duplicate-guard, expected, NOT a bug).
+- **BUT the PRIMARY is STILL `primary_no_data=63` every cycle** — and the NEW diagnostic pinned WHY precisely:
+  every city logs `🌙 observed: no elapsed hours yet for 2026-06-11 @ … (local now 19:37, 24 day-rows) — too
+  early in local day`. Note it is **19:37 local in London with 24 day-rows present, yet 0 elapsed hours found**.
+  That is NOT "too early".
+
+### ROOT CAUSE (the real one)
+**Forecast-only models (`ecmwf_ifs04`, `gfs_seamless`, …) return `null` for hours that have ALREADY ELAPSED
+today — they only forecast forward.** So the multi-model request can never produce an observed extreme for the
+elapsed part of the day: every past hour is null and gets skipped → `observed_extreme = None` → PRIMARY returns
+nothing. The `current` reading wasn't backfilling it either (multi-model response carried no usable `current`).
+
+### THE FIX (two-source design in `get_state`)
+1. **History-aware source (observed)** — query the PLAIN Open-Meteo forecast (NO `models=` param) + the live
+   `current` reading. Its `temperature_2m` backfills the ACTUAL elapsed hours, which is exactly what "observed so
+   far today" needs. The observed extreme + current now come from THIS source.
+2. **Spread source (remaining)** — keep the multi-model request, used ONLY for the remaining-hours cross-model
+   spread (what forecast models are good at).
+3. **Graceful degrade** — if the history source fails, fall back to the multi-model response for observed too
+   (logs `ℹ️ observed: history source failed … using multi-model`); if both fail, `🌙 observed fetch returned no
+   data (history source AND multi-model source both failed)`. Refactored parsing into `_parse_day()` +
+   `_current_temp()` helpers (the latter still prefix-matches the suffixed current key).
+   Improved the too-early line to `🌙 observed: no actual readings yet … (… day-rows, no current) — too early`.
+
+### VALIDATION (this time actually tested, offline)
+`py_compile` clean. Wrote an offline test (`/data/dash/t_obs.py`) that monkeypatches `_http_get` to return a fake
+history response (real past hours filled, `current`=23.5) and a fake multi-model response (past hours ALL null,
+future filled per 3 models). Result: `observed_extreme_c = 24.0` (from the history source, EVEN THOUGH the model
+source's past hours were all null), `remaining_extreme_c = 19.0`, `remaining_spread_c = 1.0`, `n_models = 3`,
+`current_temp_c = 23.5`. Exactly the intended behaviour — the observed extreme survives forecast-model null pasts.
+
+### WHEN / WHY pushed
+June 12, 2026 ~00:20 IST. Code commit `b990c630` (`data/observed_weather.py`), this diary append as a follow-up
+commit. User said "yes ship it" after I explained the two-source split in plain terms.
 
 ### STILL PENDING (user / next agent)
-- **User → Railway:** REDEPLOY, then send the next log. If the primary now has data we should FINALLY see
-  `🌡️ OBSERVED` lines (and `primary_no_data` drop in the funnel). If it's STILL no-data, the new
-  `⚠️ observed-weather HTTP {status} — {reason}` / `🌙 observed: …` lines will say EXACTLY why (bad param, rate
-  limit, too-early, or empty series) — read those FIRST.
+- **User → Railway:** REDEPLOY, then send the next log taken when cities are MID/LATE in their local day (Asian
+  highs ~4–6 PM IST, European highs ~9–11 PM IST). We should now FINALLY see `🌡️ OBSERVED` lines and
+  `primary_no_data` drop in the funnel. If a city is genuinely early in its local day, `🌙 observed: no actual
+  readings yet … too early` is CORRECT (not a bug) — just wait for that city's afternoon.
 - **Deferred (unchanged):** quick_flip duplicate-guard cooldown (re-signals held buckets each cycle → add-skip
-  14–16/cycle); relax/reprice the quick_flip 5c floor; extend the Open-Meteo round-robin endpoints to
-  `data/observed_weather.py` too.
+  ~13/cycle); relax/reprice the quick_flip 5c floor; extend the Open-Meteo round-robin endpoints into
+  `data/observed_weather.py` too; investigate the 3 `no_coords` cities.
