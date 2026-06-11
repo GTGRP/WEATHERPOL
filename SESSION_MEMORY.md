@@ -420,3 +420,56 @@ plus any other useful diagnostics, plus this memory note. HEAD advances past `5d
   whether the primary finally fires (and if not, EXACTLY which gate stops it).
 - **Open decision (deferred):** whether to relax/reprice the quick_flip 5c sellability floor so sub-5c flips fill,
   and/or add a duplicate-guard cooldown (quick_flip re-signals the same held buckets each cycle).
+
+---
+
+## June 11, 2026 (Notion AI / GTGRP, ~23:40 IST) — OBSERVED-WEATHER FETCH FIX (the PRIMARY's real blocker) + loud diagnostics
+
+Same agent (Notion AI) / same remote `https://github.com/GTGRP/WEATHERPOL` branch `main`, via GitHub MCP
+(sandbox offline, `py_compile`-only validation). Continues the late-evening diagnostic-logging entry above.
+User picked "Debug & fix the observed-weather fetch" from the survey after the new funnel exposed the blocker.
+
+### OVERALL FOUND ON LOGS (first post-diagnostics Railway log, ~10-min run, scans #6–#9, 17:55–17:58 UTC)
+The new diagnostics WORKED and immediately exposed the real root cause. Every cycle's `🔎 SCAN FUNNEL` was
+identical: `placed=0`, `add-skip dup/min/bal=14–16`, `price_floor=6–7`, `liq_thin_hold=5–8`, `lock_window=6`,
+`over=2`, `primary_signal=0`, **`primary_no_data=64`**, `no_coords=3`, `no_forecast=0`; `💰 deployed $70 across
+16 pos, free $26.75`.
+- **THE PRIMARY BLOCKER = `observed_state is None` for ALL 64 high/low markets, EVERY cycle** (`🌙 PRIMARY
+  no-data` ×64). Crucially there were ZERO `observed-state fetch failed` exceptions → `get_state` was returning
+  `None` SILENTLY from inside. Even same-day lock-window cities (London 18:55 local, which HAS elapsed hours)
+  returned None → the HTTP request itself was failing wholesale, almost certainly an Open-Meteo non-200 on the
+  multi-model + `current` param combo, which `data/observed_weather.py::_http_get` swallowed with a bare
+  `return None` and NO log line.
+- `placed=0` was NOT new rejections: `add-skip dup/min/bal=14–16` = quick_flip RE-signalling buckets it already
+  holds (bot already holds 16 pos / $70 deployed). `price_floor`/`liq_thin` were minor secondary gates.
+  `over=2` = Hong Kong (local day already over). `no_coords=3` = 3 markets dropped for missing coords (minor).
+
+### WHAT DIAGNOSTIC LOGS / FIX WERE ADDED (`data/observed_weather.py`, one commit)
+1. **`_http_get` is now LOUD on failure** — on non-200 it logs `⚠️ observed-weather HTTP {status} @ {lat},{lon}
+   models=… — {body[:200]}` (Open-Meteo returns `{"error":true,"reason":…}` on 400, so we finally SEE the
+   reason); exceptions log `⚠️ observed-weather fetch failed`.
+2. **Single-source fallback (THE actual fix)** — `get_state` tries the multi-model request first; if it returns
+   no data it RETRIES once with the plain single-source forecast (no `models=` param), the most reliable
+   Open-Meteo shape. Logs `ℹ️ observed weather using single-source fallback`. We lose the cross-model spread but
+   still get a real observed extreme (what actually drives the PRIMARY edge). Directly defeats a multi-model 400.
+3. **Every `None`-return path now logs WHY** — `🌙 observed fetch returned no data (multi-model AND fallback
+   both failed)`; `🌙 observed: response had no temperature_2m hourly series (keys=…)`; `🌙 observed: no elapsed
+   hours yet for {day} (local now …, N day-rows) — too early in local day`.
+4. **current-temp suffix bug fixed** — with multiple models Open-Meteo suffixes the `current` key
+   (`temperature_2m_ecmwf_ifs04`), so the old exact-key `"temperature_2m" in cur` check ALWAYS missed it and
+   `current_temp` stayed None; now matched by prefix.
+File `py_compile`-clean. New emojis to watch: `⚠️ observed-weather HTTP`, `ℹ️ … single-source fallback`,
+`🌙 observed: …`.
+
+### WHEN / WHY pushed
+June 11, 2026 ~23:40 IST, SINGLE commit (`data/observed_weather.py` + this SESSION_MEMORY append). HEAD advances
+past `b69fdc07`.
+
+### STILL PENDING (user / next agent)
+- **User → Railway:** REDEPLOY, then send the next log. If the primary now has data we should FINALLY see
+  `🌡️ OBSERVED` lines (and `primary_no_data` drop in the funnel). If it's STILL no-data, the new
+  `⚠️ observed-weather HTTP {status} — {reason}` / `🌙 observed: …` lines will say EXACTLY why (bad param, rate
+  limit, too-early, or empty series) — read those FIRST.
+- **Deferred (unchanged):** quick_flip duplicate-guard cooldown (re-signals held buckets each cycle → add-skip
+  14–16/cycle); relax/reprice the quick_flip 5c floor; extend the Open-Meteo round-robin endpoints to
+  `data/observed_weather.py` too.

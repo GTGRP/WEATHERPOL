@@ -17,6 +17,13 @@ The actual HTTP call to Open-Meteo uses ``requests``, imported **lazily inside**
 ``_http_get`` so that this module (and its pure helpers below) import cleanly in
 environments where ``requests`` is not installed or the network is disabled.
 The pure helper ``split_observed_remaining`` is fully unit-testable offline.
+
+Diagnostics
+-----------
+Every path that yields ``None`` now emits a log line (the HTTP status + error
+body on non-200, the single-source fallback notice, and which post-parse guard
+tripped). Before this, a non-200 response returned ``None`` silently, which made
+the PRIMARY strategy look broken with no explanation in the logs.
 """
 
 from __future__ import annotations
@@ -116,10 +123,24 @@ class ObservedWeather:
         try:
             resp = requests.get(url, params=params, timeout=self.timeout)
             if resp.status_code != 200:
+                # CRITICAL DIAGNOSTIC: previously this returned None silently,
+                # which is exactly why the PRIMARY strategy looked dead with no
+                # explanation. Open-Meteo returns a JSON body like
+                # {"error": true, "reason": "..."} on 400 — surface it.
+                body = ""
+                try:
+                    body = resp.text[:200].replace("\n", " ")
+                except Exception:
+                    pass
+                log.warning(
+                    f"\u26a0\ufe0f  observed-weather HTTP {resp.status_code} "
+                    f"@ {params.get('latitude')},{params.get('longitude')} "
+                    f"models={params.get('models', '-')} \u2014 {body}"
+                )
                 return None
             return resp.json()
         except Exception as e:
-            log.warning(f"observed-weather fetch failed: {e}")
+            log.warning(f"\u26a0\ufe0f  observed-weather fetch failed: {e}")
             return None
 
     def get_state(
@@ -131,23 +152,41 @@ class ObservedWeather:
     ) -> Optional[ObservedDayState]:
         """Assemble the observed/remaining state for the local measurement day.
 
-        Returns ``None`` if no data could be fetched (e.g. offline).
+        Returns ``None`` if no data could be fetched (e.g. offline) — and now
+        always logs *why* so the silence is debuggable.
         """
-        data = self._http_get(
-            _OPEN_METEO_URL,
-            {
-                "latitude": lat,
-                "longitude": lon,
-                "hourly": "temperature_2m",
-                "current": "temperature_2m",
-                "timezone": "auto",
-                "forecast_days": 2,
-                "past_days": 1,
-                "models": ",".join(self.models),
-            },
-        )
+        base_params: Dict = {
+            "latitude": lat,
+            "longitude": lon,
+            "hourly": "temperature_2m",
+            "current": "temperature_2m",
+            "timezone": "auto",
+            "forecast_days": 2,
+            "past_days": 1,
+        }
+
+        # Try the multi-model request first — it gives us a real cross-model
+        # spread for the remaining hours.
+        data = self._http_get(_OPEN_METEO_URL, {**base_params, "models": ",".join(self.models)})
+        used_fallback = False
         if not data:
+            # Multi-model requests can be rejected (e.g. HTTP 400 on some
+            # param combinations / model availability). Fall back to the
+            # default single-source forecast, which is the most reliable
+            # Open-Meteo shape. We lose the cross-model spread (it is filled in
+            # later from observed_math defaults) but still get a real observed
+            # extreme, which is what actually drives the PRIMARY edge.
+            used_fallback = True
+            data = self._http_get(_OPEN_METEO_URL, base_params)
+
+        if not data:
+            log.warning(
+                f"   \U0001f319 observed fetch returned no data @ {lat:.2f},{lon:.2f} "
+                f"(multi-model AND single-source fallback both failed)"
+            )
             return None
+        if used_fallback:
+            log.info(f"   \u2139\ufe0f  observed weather using single-source fallback @ {lat:.2f},{lon:.2f}")
 
         utc_offset = int(data.get("utc_offset_seconds", 0) or 0)
         now_local = datetime.now(timezone.utc) + timedelta(seconds=utc_offset)
@@ -157,7 +196,7 @@ class ObservedWeather:
 
         hourly = data.get("hourly", {}) or {}
         times_raw = hourly.get("time", []) or []
-        times: List[datetime] = []
+        times: List[Optional[datetime]] = []
         for t in times_raw:
             try:
                 times.append(datetime.fromisoformat(str(t).replace("Z", "")))
@@ -171,6 +210,10 @@ class ObservedWeather:
             if key.startswith("temperature_2m"):
                 model_series.append(list(val))
         if not model_series:
+            log.warning(
+                f"   \U0001f319 observed: response had no temperature_2m hourly series "
+                f"@ {lat:.2f},{lon:.2f} (keys={list(hourly.keys())[:6]})"
+            )
             return None
 
         # Observed extreme: use the first available model's elapsed hours plus
@@ -181,10 +224,19 @@ class ObservedWeather:
         day_primary = [primary[i] if i < len(primary) else None for i in day_idx]
 
         observed_extreme, _, _ = split_observed_remaining(day_times, day_primary, now_local, mode)
+
+        # Live "current" reading. With multiple models this key is suffixed
+        # (e.g. "temperature_2m_ecmwf_ifs04"), so match by prefix rather than an
+        # exact key — the old exact-key check missed it on multi-model requests.
         current_temp = None
         cur = data.get("current", {}) or {}
-        if "temperature_2m" in cur and cur["temperature_2m"] is not None:
-            current_temp = float(cur["temperature_2m"])
+        cur_val = None
+        for k, v in cur.items():
+            if k.startswith("temperature_2m") and v is not None:
+                cur_val = v
+                break
+        if cur_val is not None:
+            current_temp = float(cur_val)
             if observed_extreme is None:
                 observed_extreme = current_temp
             else:
@@ -192,6 +244,11 @@ class ObservedWeather:
                                     if mode == "high" else min(observed_extreme, current_temp))
 
         if observed_extreme is None:
+            log.info(
+                f"   \U0001f319 observed: no elapsed hours yet for {target_day} "
+                f"@ {lat:.2f},{lon:.2f} (local now {now_local:%Y-%m-%d %H:%M}, "
+                f"{len(day_idx)} day-rows) — too early in local day"
+            )
             return None
 
         # Remaining extreme per model -> mean & cross-model spread.
