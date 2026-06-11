@@ -265,3 +265,103 @@ correctly even after the market closed. That is what removes the post-close "con
   `preclose_locked` flag + status fields already cover the practical need); fetch the literal Wunderground/METAR
   settlement value for exact-rounding confirmation; bucket_center alignment audit; per-city calibrated probability
   models; de-model the backtest PnL with real order-book prices.
+
+---
+
+## June 11, 2026 (Notion AI / GTGRP) — "SIGNALS BUT ZERO TRADES" ROOT-CAUSE FIX + PER-STRATEGY DECIDED GATE + cheap-tail unblock + more Asian markets + Open-Meteo round-robin + QuickFlip wiring + full repo AUDIT
+
+Same agent (Notion AI) / same remote `https://github.com/GTGRP/WEATHERPOL` branch `main`, all via GitHub MCP
+(no local clone; sandbox offline, no `requests`/`pytest`). Continues the June 9–10 work above. Times in IST.
+The full audit deliverable for this session is in a NEW dated file: `AUDIT_REPORT_2026-06-11.md`.
+
+### WHAT THE USER REPORTED (verbatim intent)
+"The bot does not even trade a single market, don't know why. It SIGNALS, but skips markets due to multiple
+restrictions, and now the log shows skipped because already-high DETERMINED. Before that the bot didn't try to
+buy any position — why? In the first report the 90%-win-rate wallet uses ASIAN countries too — we need to add
+more of those countries." The user ALSO pasted a full principal-engineer 4-phase repo-audit prompt (Phase 1
+Discovery/Repo-Map, Phase 2 evidence-based Audit with file:line + severity, Phase 3 Improvement Strategy, Phase 4
+Task Plan with milestones + quick wins; deliver an Exec Summary graded A–F + Open Questions). HARD CONSTRAINT on
+that first request: ANALYSIS ONLY — do not modify code.
+
+### WHAT I DELIVERED FIRST (analysis only — no code changed)
+The complete 4-phase audit (overall health grade C), led by the zero-trades diagnosis. Saved verbatim to
+`AUDIT_REPORT_2026-06-11.md`. Then I asked a 3-question survey to confirm scope BEFORE touching any code.
+
+### WHAT THE USER TOLD ME (survey answers = explicit authorization to change code)
+1. Fix ALL root causes that stop the bot from trading. The "outcome decided = true" gate that stops our
+   strategies must be fixed. Make the liquidity guard adaptive/dynamic — it should adapt, decide, and only skip
+   very-high-risk / no-liquidity markets, not cut the whole strategy. Trimming ~30% on risky books is good, do
+   NOT block. Add NEW stable, good-winning ASIAN markets. Open-Meteo is free 10k calls/day — request within that
+   budget, and if the IP allows, alternate/switch between endpoints in parallel.
+2. Sub-5c entries are good AS LONG AS they are profitable AFTER fees; at ~95% confidence the fee is low, so
+   anything net-positive after fees is best.
+3. Liquidity must be adaptive and aware — weather books have WIDE spreads, but we should UTILISE them, not skip.
+   Only block very-high-risk markets with no liquidity to buy. Goal = TRADE and WIN, not block/skip.
+   NEW STRATEGY REQUEST: a fast scanner (every sec/ms) that catches a NEW market the instant it appears (price
+   may be mispriced), buys the mispriced basket early, takes profit when the price corrects; if the entry is
+   judged good, hold to resolution, else book profit. On a new market, immediately query the weather API for the
+   date's forecast estimate, average via multiple formulas, and enter early at a low price. Note the adjacent /
+   peak market may also be mispriced — enter there too and exit when it corrects. Research whether to hold or sell.
+Follow-up question from the user: does the `_evaluate_market` change affect ALL strategies — should it be made
+dynamic per-strategy (1 if a strategy needs decided markets, 0 if it doesn't, e.g. late-observed)?
+
+### WHAT I SUGGESTED
+- The #1 cause of zero trades is a BLANKET "decided" gate that `return`s at the top of `_evaluate_market` BEFORE
+  any strategy runs. Recommended making it PER-STRATEGY rather than a single global skip.
+- For sub-5c: keep a hard 1c DUST floor (a leg below ~1c can't even rest on the 1c-tick venue), but only enforce
+  the 5c SELLABILITY floor for strategies that must SELL before resolution; HOLD-to-resolution legs
+  (Late-Observed) can hold EV+ 2–4c tails — that's exactly the reference 90%-WR wallet's edge.
+- The "new fast scanner" the user described ALREADY EXISTS as `strategies/quick_flip.py` (forecast-change
+  arbitrage) but was never wired into the loop — so WIRE it, don't rewrite.
+- Confirmed the user's per-strategy idea is the correct design and implemented it as `*_TRADE_DECIDED` flags:
+  observation strategies (LateObserved, QuickFlip) trade the lock window (1); forecast-only strategies
+  (PeakBasket, Confident) do not (0).
+
+### WHAT I DID + WHY (commits, GTGRP/WEATHERPOL main)
+1. `187b919` **config.py** — `LIQUIDITY_STRICT_BLOCK` 1→0 (adapt, don't block), `LIQUIDITY_THIN_SIZE_MULT`
+   0.5→0.7 (trim ~30%), added `ABS_PRICE_FLOOR=0.01` + `LATE_OBSERVED_MIN_ENTRY_PRICE=0.02`, `QUICK_FLIP_ENABLED`
+   0→1, `OPEN_METEO_ENDPOINTS` (comma-split env) + `WEATHER_FORECAST_CACHE_SECONDS=300`. WHY: make liquidity
+   adaptive, allow cheap hold-to-resolution tails, enable QuickFlip, spread the Open-Meteo daily budget.
+2. `cf4a933` **four files** — "Allow EV+ sub-5c hold tails + add stable Asian markets + Open-Meteo round-robin":
+   - `strategies/late_observed_temp.py` — `DecideParams.min_entry_price` default 0.02; reads
+     `LATE_OBSERVED_MIN_ENTRY_PRICE`. WHY: allow EV+ sub-5c hold-to-resolution tails.
+   - `data/market_scanner.py` — `MARKET_CITIES` += delhi, bangkok, shanghai, osaka, jakarta, manila,
+     kuala-lumpur. WHY: more stable Asian markets like the 90%-WR wallet uses.
+   - `data/weather_stations.py` — `STATIONS` += osaka RJOO, jakarta WIII, manila RPLL, kuala-lumpur WMKK
+     (delhi VIDP / bangkok VTBS / shanghai ZSPD already present). WHY: forecast the EXACT resolution airport.
+   - `data/weather_fetcher.py` — Open-Meteo endpoint ROUND-ROBIN (`_next_open_meteo_url`) + configurable forecast
+     cache TTL; added the new cities to `CITY_COORDS`. WHY: stay within the free 10k/day budget + reduce
+     single-IP rate limiting.
+3. `5dce428` **dashboard.py + config.py** — THE ZERO-TRADES FIX (the root cause):
+   - dashboard `_evaluate_market` decided-gate is NO LONGER a blanket `return`. It computes `decided` + whether
+     the city's LOCAL day is FULLY OVER (`city_local_now`). It HARD-skips + logs `⛔ OVER` ONLY when the day is
+     fully over (value recorded, just awaiting UMA payout). Otherwise it flags a LOCK WINDOW (logs
+     `🔓 LOCK WINDOW`) and lets each strategy opt in via `*_TRADE_DECIDED`. WHY: the OLD gate returned here
+     BEFORE Late-Observed (the PRIMARY edge strategy) ever ran — that single `return` was the actual cause of
+     "signals but zero trades / skipped because already-high determined".
+   - dashboard `_place` price floors: a hard DUST floor (`ABS_PRICE_FLOOR`, all strategies) always rejects; the
+     5c SELLABILITY floor now applies ONLY to non-hold (early-exit) legs — hold legs may rest cheap. WHY: the 5c
+     floor was silently killing the new sub-5c Late-Observed tails enabled in `cf4a933`.
+   - QuickFlip WIRED into the scan loop (import + `self.quick_flip` + an `evaluate` block after Late-Observed +
+     a `run_loop` strats line). Logs `⚡ FLIP`. WHY: the user's "fast scanner / catch fresh mispricing / flip on
+     correction" strategy already existed but was dormant.
+   - config.py: added `LATE_OBSERVED_TRADE_DECIDED=1`, `QUICK_FLIP_TRADE_DECIDED=1`, `PEAK_BASKET_TRADE_DECIDED=0`,
+     `CONFIDENT_TRADE_DECIDED=0`; `print_status` now shows the lock-window flags + QuickFlip. WHY: the user's exact
+     request to make the gate PER-STRATEGY toggleable (1 if the strategy needs decided markets, 0 if not).
+
+### WHEN
+All three pushes on June 11, 2026 (afternoon IST, ~16:00–17:25). Reasoning/`py_compile`-level review only
+(sandbox offline; dashboard/config not import-testable offline). HEAD after this session = `5dce428…`.
+New log lines to watch for: `🔓 LOCK WINDOW`, `⛔ OVER`, `⚡ FLIP` (in addition to the existing
+`🌡️ OBSERVED`, `📐 GRADE`, `💧 LIQ THIN/NOBOOK`).
+
+### STILL PENDING (user / next agent)
+- **User → Railway:** REDEPLOY. No new env required — the new defaults are baked in (`LIQUIDITY_STRICT_BLOCK=0`,
+  `LIQUIDITY_THIN_SIZE_MULT=0.7`, `QUICK_FLIP_ENABLED=1`, the `*_TRADE_DECIDED` defaults). Keep PAPER mode for
+  1–2 cycles — trading frequency will rise sharply now that the gate + 5c floor are relaxed. Send fresh logs to
+  confirm `🔓 LOCK WINDOW` / `🌡️ OBSERVED` / `⚡ FLIP` lines now lead to REAL `BUY` fills instead of the old
+  `⛔ DECIDED` wall.
+- **Optional / de-prioritized (from the audit):** per-cycle rejection-summary log line; extract `_place` gating
+  into a testable `decide_placement()`; add CI (pytest + ruff) + pin a lockfile; document/remove the dormant
+  GPT-5.5 + XGBoost path (not in the trade decision path); cap `data/paper_trades.jsonl` growth; extend the
+  Open-Meteo round-robin to `data/observed_weather.py`; fix the `weather.gov` points_url stray `{` bug.
