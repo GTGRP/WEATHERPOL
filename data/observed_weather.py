@@ -11,19 +11,34 @@ given location and local measurement day it returns:
 
 Those feed ``data.observed_math`` to produce a locked-in bucket distribution.
 
+Two-source design (THE fix for "observed_state is None for every city")
+----------------------------------------------------------------------
+Forecast-only models (ecmwf_ifs04, gfs_seamless, …) return ``null`` for hours
+that have **already elapsed today** — they only look forward. Asking them "what
+was the high so far?" yields nothing, so the observed extreme was always None.
+
+So we now query TWO things:
+
+1. **History-aware source** — the plain Open-Meteo forecast (NO ``models=``
+   param) plus the live ``current`` reading. Its ``temperature_2m`` backfills
+   recent ACTUAL hours, which is exactly what "observed so far today" needs.
+2. **Spread source** — the multi-model request, used ONLY for the cross-model
+   spread over the REMAINING hours (what the forecast models are good at).
+
+Either source can fail independently; we degrade gracefully and log which one
+succeeded.
+
 Network note
 ------------
 The actual HTTP call to Open-Meteo uses ``requests``, imported **lazily inside**
-``_http_get`` so that this module (and its pure helpers below) import cleanly in
-environments where ``requests`` is not installed or the network is disabled.
-The pure helper ``split_observed_remaining`` is fully unit-testable offline.
+``_http_get`` so this module (and the pure helpers below) import cleanly where
+``requests`` is missing or the network is disabled. ``split_observed_remaining``
+is fully unit-testable offline.
 
 Diagnostics
 -----------
-Every path that yields ``None`` now emits a log line (the HTTP status + error
-body on non-200, the single-source fallback notice, and which post-parse guard
-tripped). Before this, a non-200 response returned ``None`` silently, which made
-the PRIMARY strategy look broken with no explanation in the logs.
+Every path that yields ``None`` emits a log line (HTTP status + error body on
+non-200, which source(s) failed, and which post-parse guard tripped).
 """
 
 from __future__ import annotations
@@ -123,10 +138,8 @@ class ObservedWeather:
         try:
             resp = requests.get(url, params=params, timeout=self.timeout)
             if resp.status_code != 200:
-                # CRITICAL DIAGNOSTIC: previously this returned None silently,
-                # which is exactly why the PRIMARY strategy looked dead with no
-                # explanation. Open-Meteo returns a JSON body like
-                # {"error": true, "reason": "..."} on 400 — surface it.
+                # Open-Meteo returns a JSON body like {"error": true,
+                # "reason": "..."} on 400 — surface it instead of silent None.
                 body = ""
                 try:
                     body = resp.text[:200].replace("\n", " ")
@@ -143,6 +156,43 @@ class ObservedWeather:
             log.warning(f"\u26a0\ufe0f  observed-weather fetch failed: {e}")
             return None
 
+    @staticmethod
+    def _parse_day(
+        data: Dict, target_day
+    ) -> Tuple[List[Optional[datetime]], List[List[Optional[float]]], List[int]]:
+        """Return (day_times, model_series, day_idx) for ``target_day`` in ``data``.
+
+        ``model_series`` is every ``temperature_2m*`` hourly array (one per model,
+        or a single plain array on a no-``models`` request). ``day_idx`` indexes
+        the hourly rows whose local date equals ``target_day``.
+        """
+        hourly = data.get("hourly", {}) or {}
+        times: List[Optional[datetime]] = []
+        for t in hourly.get("time", []) or []:
+            try:
+                times.append(datetime.fromisoformat(str(t).replace("Z", "")))
+            except Exception:
+                times.append(None)
+        model_series: List[List[Optional[float]]] = [
+            list(val) for key, val in hourly.items() if key.startswith("temperature_2m")
+        ]
+        day_idx = [i for i, t in enumerate(times) if t is not None and t.date() == target_day]
+        day_times = [times[i] for i in day_idx]
+        return day_times, model_series, day_idx
+
+    @staticmethod
+    def _current_temp(data: Dict) -> Optional[float]:
+        """Live ``current`` temperature. Matches by prefix because multi-model
+        responses suffix the key (e.g. ``temperature_2m_ecmwf_ifs04``)."""
+        cur = data.get("current", {}) or {}
+        for k, v in cur.items():
+            if k.startswith("temperature_2m") and v is not None:
+                try:
+                    return float(v)
+                except Exception:
+                    return None
+        return None
+
     def get_state(
         self,
         lat: float,
@@ -152,8 +202,8 @@ class ObservedWeather:
     ) -> Optional[ObservedDayState]:
         """Assemble the observed/remaining state for the local measurement day.
 
-        Returns ``None`` if no data could be fetched (e.g. offline) — and now
-        always logs *why* so the silence is debuggable.
+        Returns ``None`` if no usable data could be fetched — and always logs
+        *why* so the silence is debuggable.
         """
         base_params: Dict = {
             "latitude": lat,
@@ -165,78 +215,52 @@ class ObservedWeather:
             "past_days": 1,
         }
 
-        # Try the multi-model request first — it gives us a real cross-model
-        # spread for the remaining hours.
-        data = self._http_get(_OPEN_METEO_URL, {**base_params, "models": ",".join(self.models)})
-        used_fallback = False
-        if not data:
-            # Multi-model requests can be rejected (e.g. HTTP 400 on some
-            # param combinations / model availability). Fall back to the
-            # default single-source forecast, which is the most reliable
-            # Open-Meteo shape. We lose the cross-model spread (it is filled in
-            # later from observed_math defaults) but still get a real observed
-            # extreme, which is what actually drives the PRIMARY edge.
-            used_fallback = True
-            data = self._http_get(_OPEN_METEO_URL, base_params)
+        # 1) HISTORY-AWARE source: plain forecast (no models=). Its hourly
+        #    temperature_2m backfills the ACTUAL elapsed hours of today, and it
+        #    carries a usable live `current` reading. This is what the observed
+        #    extreme must come from — forecast-only models return null for the
+        #    past, which is why the observed extreme used to always be None.
+        obs_data = self._http_get(_OPEN_METEO_URL, base_params)
 
-        if not data:
+        # 2) SPREAD source: multi-model, used ONLY for the remaining-hours
+        #    cross-model spread (what the forecast models are good at).
+        model_data = self._http_get(_OPEN_METEO_URL, {**base_params, "models": ",".join(self.models)})
+
+        if not obs_data and not model_data:
             log.warning(
                 f"   \U0001f319 observed fetch returned no data @ {lat:.2f},{lon:.2f} "
-                f"(multi-model AND single-source fallback both failed)"
+                f"(history source AND multi-model source both failed)"
             )
             return None
-        if used_fallback:
-            log.info(f"   \u2139\ufe0f  observed weather using single-source fallback @ {lat:.2f},{lon:.2f}")
+        if not obs_data:
+            log.info(
+                f"   \u2139\ufe0f  observed: history source failed @ {lat:.2f},{lon:.2f}, "
+                f"using multi-model for observed too (past hours may be sparse)"
+            )
 
-        utc_offset = int(data.get("utc_offset_seconds", 0) or 0)
+        # Local clock / target day come from whichever response we have.
+        primary_data = obs_data or model_data
+        utc_offset = int(primary_data.get("utc_offset_seconds", 0) or 0)
         now_local = datetime.now(timezone.utc) + timedelta(seconds=utc_offset)
         now_local = now_local.replace(tzinfo=None)
-
         target_day = (measurement_date or now_local).date()
 
-        hourly = data.get("hourly", {}) or {}
-        times_raw = hourly.get("time", []) or []
-        times: List[Optional[datetime]] = []
-        for t in times_raw:
-            try:
-                times.append(datetime.fromisoformat(str(t).replace("Z", "")))
-            except Exception:
-                times.append(None)
-
-        # Collect per-model temperature arrays. With multiple models Open-Meteo
-        # suffixes keys like "temperature_2m_ecmwf_ifs04"; with one it is plain.
-        model_series: List[List[Optional[float]]] = []
-        for key, val in hourly.items():
-            if key.startswith("temperature_2m"):
-                model_series.append(list(val))
-        if not model_series:
+        # --- OBSERVED extreme (+ current) from the history-aware source -----
+        obs_source = obs_data or model_data
+        day_times, obs_series, day_idx = self._parse_day(obs_source, target_day)
+        if not obs_series:
             log.warning(
                 f"   \U0001f319 observed: response had no temperature_2m hourly series "
-                f"@ {lat:.2f},{lon:.2f} (keys={list(hourly.keys())[:6]})"
+                f"@ {lat:.2f},{lon:.2f}"
             )
             return None
 
-        # Observed extreme: use the first available model's elapsed hours plus
-        # the live "current" reading (most accurate for what already happened).
-        primary = model_series[0]
-        day_idx = [i for i, t in enumerate(times) if t is not None and t.date() == target_day]
-        day_times = [times[i] for i in day_idx]
-        day_primary = [primary[i] if i < len(primary) else None for i in day_idx]
+        s0 = obs_series[0]
+        day_vals0 = [s0[i] if i < len(s0) else None for i in day_idx]
+        observed_extreme, _, _ = split_observed_remaining(day_times, day_vals0, now_local, mode)
 
-        observed_extreme, _, _ = split_observed_remaining(day_times, day_primary, now_local, mode)
-
-        # Live "current" reading. With multiple models this key is suffixed
-        # (e.g. "temperature_2m_ecmwf_ifs04"), so match by prefix rather than an
-        # exact key — the old exact-key check missed it on multi-model requests.
-        current_temp = None
-        cur = data.get("current", {}) or {}
-        cur_val = None
-        for k, v in cur.items():
-            if k.startswith("temperature_2m") and v is not None:
-                cur_val = v
-                break
-        if cur_val is not None:
-            current_temp = float(cur_val)
+        current_temp = self._current_temp(obs_source)
+        if current_temp is not None:
             if observed_extreme is None:
                 observed_extreme = current_temp
             else:
@@ -245,18 +269,20 @@ class ObservedWeather:
 
         if observed_extreme is None:
             log.info(
-                f"   \U0001f319 observed: no elapsed hours yet for {target_day} "
+                f"   \U0001f319 observed: no actual readings yet for {target_day} "
                 f"@ {lat:.2f},{lon:.2f} (local now {now_local:%Y-%m-%d %H:%M}, "
-                f"{len(day_idx)} day-rows) — too early in local day"
+                f"{len(day_idx)} day-rows, no current) — too early in local day"
             )
             return None
 
-        # Remaining extreme per model -> mean & cross-model spread.
+        # --- REMAINING extreme + cross-model spread from the SPREAD source --
+        spread_source = model_data or obs_data
+        s_day_times, s_series, s_day_idx = self._parse_day(spread_source, target_day)
         per_model_remaining: List[float] = []
         hours_remaining = 0
-        for series in model_series:
-            day_vals = [series[i] if i < len(series) else None for i in day_idx]
-            _, remaining, n_left = split_observed_remaining(day_times, day_vals, now_local, mode)
+        for series in s_series:
+            day_vals = [series[i] if i < len(series) else None for i in s_day_idx]
+            _, remaining, n_left = split_observed_remaining(s_day_times, day_vals, now_local, mode)
             hours_remaining = max(hours_remaining, n_left)
             if remaining:
                 per_model_remaining.append(max(remaining) if mode == "high" else min(remaining))
@@ -273,7 +299,7 @@ class ObservedWeather:
             remaining_extreme_c=remaining_extreme,
             remaining_spread_c=remaining_spread,
             hours_remaining=hours_remaining,
-            n_models=len(model_series),
+            n_models=len(s_series),
             current_temp_c=current_temp,
             mode=mode,
             as_of_local=now_local.isoformat(timespec="minutes"),
