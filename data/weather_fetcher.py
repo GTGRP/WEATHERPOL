@@ -8,6 +8,11 @@ Sources:
 
 Each source returns standardized forecast data that feeds into
 the probability engine.
+
+Open-Meteo's free tier allows ~10k calls/day. To spread that budget and reduce
+single-IP rate-limit risk, the fetcher round-robins across the endpoints in
+Config.OPEN_METEO_ENDPOINTS (default = the single public endpoint). Add a second
+mirror / self-hosted instance there and calls alternate automatically.
 """
 
 import time
@@ -45,7 +50,21 @@ class WeatherFetcher:
         self.session = requests.Session()
         self.session.headers.update({'User-Agent': f'WeatherSniper/{Config.VERSION}'})
         self._cache: Dict[str, Tuple[float, List[ForecastPoint]]] = {}
-        self._cache_ttl = 300  # 5 minutes
+        self._cache_ttl = int(getattr(Config, 'WEATHER_FORECAST_CACHE_SECONDS', 300))  # 5 min default
+        self._om_idx = 0  # round-robin index across Open-Meteo endpoints
+
+    def _open_meteo_endpoints(self) -> List[str]:
+        eps = getattr(Config, 'OPEN_METEO_ENDPOINTS', None)
+        if eps:
+            return list(eps)
+        return ["https://api.open-meteo.com/v1/forecast"]
+
+    def _next_open_meteo_url(self) -> str:
+        """Pick the next Open-Meteo endpoint (round-robin across configured ones)."""
+        eps = self._open_meteo_endpoints()
+        url = eps[self._om_idx % len(eps)]
+        self._om_idx += 1
+        return url
 
     def fetch_all(self, lat: float, lon: float, city: str = '',
                   target_time: datetime = None) -> List[ForecastPoint]:
@@ -94,6 +113,7 @@ class WeatherFetcher:
         """
         Open-Meteo: SINGLE batch request with all models for speed.
         Previously made 5 sequential requests — now 1 batch call.
+        Endpoint is chosen round-robin across Config.OPEN_METEO_ENDPOINTS.
         """
         results = []
         models = ['ecmwf_ifs04', 'gfs_seamless', 'icon_seamless',
@@ -103,7 +123,7 @@ class WeatherFetcher:
             'icon_seamless': 0.82, 'jma_seamless': 0.78, 'gem_seamless': 0.75,
         }
 
-        url = "https://api.open-meteo.com/v1/forecast"
+        url = self._next_open_meteo_url()
         params = {
             'latitude': lat,
             'longitude': lon,
@@ -288,6 +308,9 @@ CITY_COORDS = {
     'shanghai': (31.2304, 121.4737),
     'beijing': (39.9042, 116.4074),
     'osaka': (34.6937, 135.5023),
+    'jakarta': (-6.2088, 106.8456),
+    'kuala lumpur': (3.1390, 101.6869),
+    'kualalumpur': (3.1390, 101.6869),
     # US
     'new york': (40.7128, -74.0060),
     'nyc': (40.7128, -74.0060),

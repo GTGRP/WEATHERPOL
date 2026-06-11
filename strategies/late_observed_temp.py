@@ -73,7 +73,8 @@ class LateObservedSignal:
 class DecideParams:
     """Plain thresholds for the pure decision core (no Config dependency)."""
     min_edge: float = 0.10           # post-fee probability cushion required
-    min_entry_price: float = 0.05    # ignore dust-priced YES legs
+    min_entry_price: float = 0.02    # cheap-tail floor: this is a HOLD-to-resolution
+                                     # strategy, so EV+ sub-5c tails are allowed
     max_entry_price: float = 0.95    # don't pay through the roof for YES
     no_min_price: float = 0.04       # only NO a dead bucket if book still prices it richly
     no_max_price: float = 0.97       # NO token price ceiling (avoid ~$1 no-edge fills)
@@ -170,7 +171,7 @@ class LateObservedTempStrategy:
         self.min_lock_conf = float(g("LATE_OBSERVED_MIN_LOCK", 0.70))
         self.params = DecideParams(
             min_edge=float(g("LATE_OBSERVED_MIN_EDGE", 0.10)),
-            min_entry_price=float(g("MIN_ENTRY_PRICE", 0.05)),
+            min_entry_price=float(g("LATE_OBSERVED_MIN_ENTRY_PRICE", 0.02)),
             max_entry_price=float(g("LATE_OBSERVED_MAX_YES_PRICE", 0.95)),
             no_min_price=float(g("LATE_OBSERVED_NO_MIN_PRICE", 0.04)),
             no_max_price=float(g("LATE_OBSERVED_NO_MAX_PRICE", 0.97)),

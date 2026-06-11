@@ -45,7 +45,9 @@ class WeatherMarket:
     measurement_date: Optional[datetime] = None  # the LOCAL calendar day the high/low is measured (from slug)
 
 
-# Cities that have active weather markets on Polymarket
+# Cities that have active weather markets on Polymarket.
+# Asian cities are heavily traded by the reference 90%-win wallets, so we cover
+# the stable, airport-station-backed ones (see data/weather_stations.py).
 MARKET_CITIES = {
     'houston': ('Houston', 'USA', 'F'),
     'new-york-city': ('New York City', 'USA', 'F'),
@@ -73,6 +75,14 @@ MARKET_CITIES = {
     'austin': ('Austin', 'USA', 'F'),
     'moscow': ('Moscow', 'Russia', 'C'),
     'new-york': ('New York City', 'USA', 'F'),
+    # ═══ Asian markets (stable, airport-station-backed) ═══
+    'delhi': ('Delhi', 'India', 'C'),
+    'bangkok': ('Bangkok', 'Thailand', 'C'),
+    'shanghai': ('Shanghai', 'China', 'C'),
+    'osaka': ('Osaka', 'Japan', 'C'),
+    'jakarta': ('Jakarta', 'Indonesia', 'C'),
+    'manila': ('Manila', 'Philippines', 'C'),
+    'kuala-lumpur': ('Kuala Lumpur', 'Malaysia', 'C'),
 }
 
 

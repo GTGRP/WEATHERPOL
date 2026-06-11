@@ -224,6 +224,26 @@ STATIONS: dict[str, WeatherStation] = {
         icao="VTBS", lat=13.6900, lon=100.7501,
         wunderground_url="https://www.wunderground.com/history/daily/th/bangkok/VTBS",
     ),
+    "osaka": WeatherStation(
+        city="Osaka", station_name="Osaka Itami Airport",
+        icao="RJOO", lat=34.7855, lon=135.4382,
+        wunderground_url="https://www.wunderground.com/history/daily/jp/osaka/RJOO",
+    ),
+    "jakarta": WeatherStation(
+        city="Jakarta", station_name="Soekarno-Hatta Intl Airport",
+        icao="WIII", lat=-6.1256, lon=106.6558,
+        wunderground_url="https://www.wunderground.com/history/daily/id/jakarta/WIII",
+    ),
+    "manila": WeatherStation(
+        city="Manila", station_name="Ninoy Aquino Intl Airport",
+        icao="RPLL", lat=14.5086, lon=121.0197,
+        wunderground_url="https://www.wunderground.com/history/daily/ph/manila/RPLL",
+    ),
+    "kuala-lumpur": WeatherStation(
+        city="Kuala Lumpur", station_name="Kuala Lumpur Intl Airport",
+        icao="WMKK", lat=2.7456, lon=101.7099,
+        wunderground_url="https://www.wunderground.com/history/daily/my/kuala-lumpur/WMKK",
+    ),
     "warsaw": WeatherStation(
         city="Warsaw", station_name="Warsaw Chopin Airport",
         icao="EPWA", lat=52.1657, lon=20.9671,
