@@ -572,3 +572,91 @@ follow-up diary commit.
   blocks sub-5c flips, early_exit fires into the correction); (b) research why no SELL actions fire
   (observed/confident legs set hold_hint=True → take_profit≈0.99 → effectively hold-to-resolution; stop_loss
   skipped for entry<3c) and a hold-vs-sell take at 62% WR.
+
+---
+
+## June 12, 2026 (Notion AI / GTGRP, ~16:00 IST) — QUICK_FLIP v2 (run-boundary + book-or-cut) + NEW PEAK_CLUSTER basket + STRICT thesis/flip EXITS
+
+Same agent (Notion AI) / same remote `https://github.com/GTGRP/WEATHERPOL` branch `main`, via GitHub MCP
+(sandbox offline; every file `py_compile`-clean; dashboard variable-scope grep-verified). This entry continues
+the ~15:30 Telegram entry above and IMPLEMENTS the analysis I delivered there (which the user approved verbatim).
+
+### WHY (user's instructions, verbatim intent — REQUEST 14)
+"great findings, I agree all change orders, but in point two — you said entry only when forecast moves the
+market, doesn't condition it — it is good, but also it misses some opportunities on forecast. KEEP BOTH, give
+slight points / a boost on the second point; the others are good. The thesis-invalidation is a good one — maybe
+make it MORE STRICT: only sell if the signal or market has gone to VERY BAD conditions, so many positions hold
+to resolution and only the very bad ones exit early. Yes the quick flips require exit=true. The basket thing you
+mentioned (total basket < 0.85) I'd like to run as a NEW strategy that scans in PARALLEL without disturbing the
+others, finding the market where the peak is estimated — it may reach a maximum of 30; if buying 30, 31, 32, 29,
+28 all combined, if any ONE wins we profit after fees. We already tried this but never implemented it properly.
+If buying 4 or 5 or 3 baskets, profit. Also after all this update, update the session as before (second-to-last)
+and push all."
+
+### WHAT I CHANGED (4 files, one atomic commit `fbb63ddb`)
+1. **REWROTE `strategies/quick_flip.py`** — fixes the 0%-WR death (old version stored a per-CYCLE snapshot, so
+   "change" was scan jitter, fired on a single model, and never truly exited):
+   - **Run-boundary baseline**: `_current_run()` keys the baseline to the most recent model RUN (ECMWF 00/12Z,
+     GFS 6-hourly, HRRR hourly, ICON 3-hourly, JMA, GEM). `detect_changes()` only compares ACROSS run boundaries
+     (baseline keyed `f"{city}_{market_type}"`, stores `run_id`), so a signal means a NEW run actually moved the
+     ensemble mean ≥ `QUICK_FLIP_MIN_DELTA_C` — not cycle noise.
+   - **KEEP BOTH entry paths, stale = BOOST (per user's point 2)**: still enters on a genuine forecast move even
+     if the market already drifted; when the market price is STALE (`|price-prev| < STALE_EPS`) it ADDS
+     `QUICK_FLIP_STALE_BOOST` to confidence (not a hard gate). Also a publish-window boost
+     (`QUICK_FLIP_WINDOW_BOOST`) inside `QUICK_FLIP_WINDOW_MIN` after a publish. Confidence starts from the
+     bucket's multi-model agreement and must clear `QUICK_FLIP_MIN_CONFIDENCE` after boosts.
+   - **Dedup cooldown** (`_recent_signals`, `QUICK_FLIP_SIGNAL_COOLDOWN_MIN`) stops re-signalling held buckets;
+     **smaller size** (`QUICK_FLIP_SIZE_PCT` / `MAX_SIZE_USD`); carries `expected_hold_minutes` so the loop can
+     book-or-cut. `find_spread_arbitrage()` retained for compatibility.
+2. **NEW `strategies/peak_cluster.py`** — the user's parallel any-one-wins basket. Estimates the peak bucket
+   (argmax model probability), takes a window of ± `PEAK_CLUSTER_SPAN` adjacent buckets, greedily adds the
+   highest-probability legs while combined per-share cost stays < `PEAK_CLUSTER_MAX_COST` (defaults to
+   `BASKET_MAX_COST` 0.85). Buys EQUAL SHARES across 3–5 legs (`budget/cost`), so since buckets are mutually
+   exclusive and combined cost < $1, ANY single winning leg pays $1 > cost = net profit after fees
+   (`roi = (1-cost)/cost`). Hold-to-resolution (`hold_hint=True`). Runs ALONGSIDE the others, untouched.
+3. **NEW `trading/exit_policies.py`** — the two exits, WITHOUT touching `position_manager.py`:
+   - `check_flip_exits(pm)`: quick_flip BOOK-OR-CUT. Past its `flip_max_hold_minutes` (or `QUICK_FLIP_MAX_HOLD_MIN`)
+     it EXITS at market — booking the gain if up, cutting if down (skips stale prices). Flips finally truly exit.
+   - `check_thesis_exits(pm)`: STRICT thesis-invalidation (user's "only VERY BAD exit early"). Only a non-tail
+     (`entry ≥ THESIS_EXIT_MIN_ENTRY_PRICE` 0.10), still-exitable (`bid ≥ THESIS_EXIT_MIN_BID`), not-near-close
+     (`minutes_to_close ≥ THESIS_EXIT_MIN_MINUTES_TO_CLOSE` 60) position whose ROI has COLLAPSED past
+     `THESIS_EXIT_MAX_ROI_PCT` (−85%) exits early. Cheap tails / stale / near-close all KEEP HOLDING to
+     resolution. Both reuse `pm._close_position(pos, price, 'manual')` (so the ledger/balance/paper-log/PnL stay
+     correct) then overwrite `pos.exit_reason` to `flip_timeout` / `thesis_invalidated`.
+4. **WIRED `dashboard.py`**: import + `self.peak_cluster`; `exit_policies.check_flip_exits/.check_thesis_exits`
+   in the 300s resolution cycle (after `check_risk_triggers`); quick_flip concurrent cap
+   (`QUICK_FLIP_MAX_CONCURRENT` 6) + carries `pos.flip_max_hold_minutes`; NEW peak_cluster strategy block
+   (gated `PEAK_CLUSTER_ENABLED` default True, skipped in lock window unless `PEAK_CLUSTER_TRADE_DECIDED`); logs
+   `🧺 CLUSTER`; run_loop banner shows `PeakCluster`. Grep-verified `condition_ids`/`early_exit_price`/`grade`/
+   `in_lock_window` are all in `_evaluate_market` scope.
+
+### CONFIG NOTE (IMPORTANT for next agent / user)
+NO `config.py` and NO `position_manager.py` edit this round. All new tunables are read via `getattr(Config, NAME,
+DEFAULT)`, so the code runs as-is with sensible defaults and **peak_cluster is ON by default**. They can be
+exposed in `config.py` later for env/UI (/settings) control on request. New getattr knobs:
+- quick_flip: `QUICK_FLIP_{MIN_DELTA_C 1.0, MIN_CONFIDENCE 0.6, MAX_ENTRY 0.85, MAX_HOLD_MIN 120, TARGET_ROI 15,
+  SIZE_PCT 0.05, MAX_SIZE_USD 10, SIGNAL_COOLDOWN_MIN 30, WINDOW_MIN 20, WINDOW_BOOST 0.10, STALE_BOOST 0.10,
+  STALE_EPS 0.01, MAX_CONCURRENT 6, TIME_EXIT True}`.
+- peak_cluster: `PEAK_CLUSTER_{ENABLED True, SPAN 2, MAX_COST=BASKET_MAX_COST(0.85), MIN_LEGS 2, MAX_LEGS 5,
+  MIN_EDGE 0.03, MIN_CONF 0.55, MAX_CENTER_PRICE 0.85, BASE_FRACTION 0.05, MAX_FRACTION 0.20, MAX_USD 15,
+  TRADE_DECIDED False}`.
+- thesis exit: `THESIS_EXIT_{ENABLED True, MAX_ROI_PCT -85, MIN_ENTRY_PRICE 0.10, MIN_BID 0.02,
+  MIN_MINUTES_TO_CLOSE 60}`.
+
+### WHEN / WHY pushed
+June 12, 2026 ~16:00 IST. ONE atomic commit `fbb63ddbe5154c1cbcffa24d9b0d894756186d36` carried all 4 files
+(`strategies/quick_flip.py`, `strategies/peak_cluster.py`, `trading/exit_policies.py`, `dashboard.py`); this
+SESSION_MEMORY append is a follow-up diary commit. HEAD = `fbb63ddb`.
+New log lines to watch for: `🧺 CLUSTER`, `⏲️ FLIP BOOK/CUT`, `🚫 THESIS EXIT`, `RUN CHANGE`, `⏸️ FLIP CAP`,
+`FLIP[...+window+stale]`.
+
+### STILL PENDING (user / next agent)
+- **User → Railway:** REDEPLOY (this commit AND the prior `e8cbbc5b` Telegram commit both need a redeploy). Keep
+  PAPER mode; send the next log so we can confirm: quick_flip now fires on `RUN CHANGE` (not jitter) and actually
+  books/cuts (`⏲️ FLIP BOOK/CUT`); `🧺 CLUSTER` baskets appear with combined cost < $1; `🚫 THESIS EXIT` only
+  hits genuinely very-bad positions while most still hold to resolution.
+- **Optional next:** expose the new getattr knobs in `config.py` (+ /settings) for live tuning; add a
+  cluster-specific dedup so it doesn't rebuy an already-held basket; backtest peak_cluster leg-sizing.
+- **Deferred (unchanged):** extract `decide_placement()` for offline tests; CI (pytest+ruff); cap
+  `data/paper_trades.jsonl`; extend Open-Meteo round-robin into `data/observed_weather.py`; weather.gov stray `{`;
+  3 `no_coords` cities.
