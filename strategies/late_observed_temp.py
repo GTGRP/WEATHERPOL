@@ -79,25 +79,48 @@ class DecideParams:
     no_min_price: float = 0.04       # only NO a dead bucket if book still prices it richly
     no_max_price: float = 0.97       # NO token price ceiling (avoid ~$1 no-edge fills)
     taker: bool = True
-    base_fraction: float = 0.06      # base stake as fraction of balance
-    max_fraction: float = 0.25       # cap per-leg stake fraction
-    kelly_cap: float = 0.25
+    base_fraction: float = 0.06      # (legacy) base stake as fraction of balance
+    max_fraction: float = 0.25       # per-trade balance-fraction SAFETY cap
+    kelly_cap: float = 0.25          # (legacy, unused by the tiered sizer)
     max_legs: int = 4
     min_order_usd: float = 1.0
+    # --- Signal-strength → absolute-USD allocation ladder ---------------
+    # Replaces the old flat %-of-bankroll Kelly stake (which hit a 25%-of-
+    # balance ceiling = $25 on $100 with NO dollar cap, draining the bankroll).
+    # The stake now scales with a composite signal-strength score in [0, 1]
+    # built from the post-fee edge and the weather-stability grade, laddered
+    # between size_floor_usd (a barely-passing signal) and size_max_usd (a very
+    # strong edge on a stable day). A very good signal therefore deploys MORE
+    # capital instead of being capped at a flat amount; weak-but-valid signals
+    # stay small. max_fraction above is still a per-trade balance safety.
+    size_floor_usd: float = 3.0      # weakest valid signal stake (~user's "good $3-4")
+    size_max_usd: float = 20.0       # strongest signal stake (~user's "very good $20")
+    edge_full: float = 0.25          # post-fee edge that counts as max strength
+    w_edge: float = 0.6              # weight of edge in the strength score
+    w_grade: float = 0.4             # weight of grade in the strength score
 
 
 def _stake_usd(prob_win: float, price: float, balance: float, grade: float,
-               params: DecideParams) -> float:
-    """Edge/grade/Kelly-blended stake, clamped to fraction caps and balance."""
-    kelly = fees.kelly_fraction(prob_win, price, cap=params.kelly_cap)
-    frac = params.base_fraction + kelly
-    frac = min(frac, params.max_fraction)
-    frac *= max(0.0, min(1.5, grade / 0.6)) if grade else 1.0
-    size = frac * balance
-    size = min(size, balance * params.max_fraction)
-    if size < params.min_order_usd:
-        size = params.min_order_usd
-    return round(min(size, balance), 2)
+               edge: float, params: DecideParams) -> float:
+    """Signal-strength → absolute-USD allocation.
+
+    A composite strength score (post-fee ``edge`` + weather ``grade``) in [0, 1]
+    is laddered linearly between ``size_floor_usd`` and ``size_max_usd`` so a
+    stronger signal deploys MORE capital (up to the max) and a barely-passing
+    one stays near the floor. The result is clamped to a per-trade balance
+    fraction and the balance itself, so a single leg can never over-commit a
+    small bankroll.
+    """
+    edge_norm = max(0.0, min(1.0, edge / params.edge_full)) if params.edge_full > 0 else 0.0
+    grade_norm = max(0.0, min(1.0, grade)) if grade else 0.0
+    strength = params.w_edge * edge_norm + params.w_grade * grade_norm
+    strength = max(0.0, min(1.0, strength))
+    usd = params.size_floor_usd + (params.size_max_usd - params.size_floor_usd) * strength
+    # Safety: never exceed a fraction of the bankroll or the bankroll itself.
+    usd = min(usd, balance * params.max_fraction, balance)
+    if usd < params.min_order_usd:
+        usd = params.min_order_usd
+    return round(min(usd, balance), 2)
 
 
 def decide_legs(
@@ -129,7 +152,7 @@ def decide_legs(
                     bucket_label=label, side="YES", token_id=ytid, price=yp,
                     our_probability=p_win, edge=edge,
                     ev_per_contract=fees.ev_per_contract(p_win, yp, params.taker),
-                    size_usd=_stake_usd(p_win, yp, balance, grade, params),
+                    size_usd=_stake_usd(p_win, yp, balance, grade, edge, params),
                     reason=f"observed P(win)={p_win:.0%} vs YES px {yp:.0%}, edge {edge:+.0%}",
                 ))
                 continue  # don't also NO a bucket we're going YES on
@@ -148,7 +171,7 @@ def decide_legs(
                 bucket_label=label, side="NO", token_id=ntid, price=np_,
                 our_probability=prob_no, edge=edge,
                 ev_per_contract=fees.ev_per_contract(prob_no, np_, params.taker),
-                size_usd=_stake_usd(prob_no, np_, balance, grade, params),
+                size_usd=_stake_usd(prob_no, np_, balance, grade, edge, params),
                 reason=f"observed P(no)={prob_no:.0%} vs NO px {np_:.0%}, edge {edge:+.0%}",
             ))
 
@@ -181,6 +204,11 @@ class LateObservedTempStrategy:
             kelly_cap=float(g("KELLY_FRACTION", 0.15)) + 0.10,
             max_legs=int(g("LATE_OBSERVED_MAX_LEGS", 4)),
             min_order_usd=float(g("MIN_ORDER_SIZE", 1.0)),
+            size_floor_usd=float(g("LATE_OBSERVED_SIZE_FLOOR_USD", 3.0)),
+            size_max_usd=float(g("LATE_OBSERVED_SIZE_MAX_USD", 20.0)),
+            edge_full=float(g("LATE_OBSERVED_EDGE_FULL", 0.25)),
+            w_edge=float(g("LATE_OBSERVED_W_EDGE", 0.6)),
+            w_grade=float(g("LATE_OBSERVED_W_GRADE", 0.4)),
         )
 
     def evaluate(
