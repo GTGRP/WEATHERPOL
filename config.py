@@ -247,6 +247,62 @@ class Config:
     SNIPER_MIN_PROBABILITY = float(os.getenv('SNIPER_MIN_PROBABILITY', '0.12'))
 
     # ===================================================================
+    # QUICK_FLIP v2 — run-boundary forecast-change flip (book-or-cut exit).
+    # Fires only when a NEW forecast RUN actually moves the ensemble mean (not
+    # cycle noise). KEEPS BOTH entry paths: a genuine forecast move AND a stale
+    # market (stale adds a confidence BOOST, it is NOT a hard gate). Dedups
+    # re-signals, sizes small, and TRULY exits via book-or-cut at the hold cap.
+    # All values below equal the in-code getattr defaults — editable here now.
+    # ===================================================================
+    QUICK_FLIP_MIN_DELTA_C = float(os.getenv('QUICK_FLIP_MIN_DELTA_C', '1.0'))            # min ensemble-mean move (C) across runs to signal
+    QUICK_FLIP_MIN_CONFIDENCE = float(os.getenv('QUICK_FLIP_MIN_CONFIDENCE', '0.6'))      # min confidence required after boosts
+    QUICK_FLIP_MAX_ENTRY = float(os.getenv('QUICK_FLIP_MAX_ENTRY', '0.85'))               # don't chase an already-priced bucket
+    QUICK_FLIP_MAX_HOLD_MIN = int(os.getenv('QUICK_FLIP_MAX_HOLD_MIN', '120'))            # book-or-cut after this many minutes
+    QUICK_FLIP_TARGET_ROI = float(os.getenv('QUICK_FLIP_TARGET_ROI', '15.0'))             # take-profit ROI% target
+    QUICK_FLIP_SIZE_PCT = float(os.getenv('QUICK_FLIP_SIZE_PCT', '0.05'))                 # base size as % of balance
+    QUICK_FLIP_MAX_SIZE_USD = float(os.getenv('QUICK_FLIP_MAX_SIZE_USD', '10.0'))         # hard $ cap per flip
+    QUICK_FLIP_SIGNAL_COOLDOWN_MIN = int(os.getenv('QUICK_FLIP_SIGNAL_COOLDOWN_MIN', '30'))  # dedup: don't re-signal same bucket within N min
+    QUICK_FLIP_WINDOW_MIN = int(os.getenv('QUICK_FLIP_WINDOW_MIN', '20'))                 # publish-window length (min) for the boost
+    QUICK_FLIP_WINDOW_BOOST = float(os.getenv('QUICK_FLIP_WINDOW_BOOST', '0.10'))         # confidence boost inside the publish window
+    QUICK_FLIP_STALE_BOOST = float(os.getenv('QUICK_FLIP_STALE_BOOST', '0.10'))           # confidence boost when the market price is stale
+    QUICK_FLIP_STALE_EPS = float(os.getenv('QUICK_FLIP_STALE_EPS', '0.01'))               # |price-prev| below this counts as stale
+    QUICK_FLIP_MAX_CONCURRENT = int(os.getenv('QUICK_FLIP_MAX_CONCURRENT', '6'))          # max simultaneous open flips
+    QUICK_FLIP_TIME_EXIT = os.getenv('QUICK_FLIP_TIME_EXIT', '1') == '1'                  # enforce book-or-cut at the hold cap
+
+    # ===================================================================
+    # PEAK_CLUSTER — NEW parallel any-one-wins basket. Estimate the peak bucket
+    # (argmax model probability), buy a window of adjacent buckets whose
+    # COMBINED per-share cost stays below PEAK_CLUSTER_MAX_COST, so ANY single
+    # winning leg pays $1 > cost = net profit after fees. Holds to resolution.
+    # Runs ALONGSIDE the other strategies (parallel, non-disturbing). ON by
+    # default; set PEAK_CLUSTER_ENABLED=0 to disable. Values = code defaults.
+    # ===================================================================
+    PEAK_CLUSTER_ENABLED = os.getenv('PEAK_CLUSTER_ENABLED', '1') == '1'
+    PEAK_CLUSTER_SPAN = int(os.getenv('PEAK_CLUSTER_SPAN', '2'))                          # +/- buckets around the estimated peak
+    PEAK_CLUSTER_MAX_COST = float(os.getenv('PEAK_CLUSTER_MAX_COST', str(BASKET_MAX_COST)))  # combined per-share cost ceiling (defaults to BASKET_MAX_COST)
+    PEAK_CLUSTER_MIN_LEGS = int(os.getenv('PEAK_CLUSTER_MIN_LEGS', '2'))                  # minimum legs for a valid basket
+    PEAK_CLUSTER_MAX_LEGS = int(os.getenv('PEAK_CLUSTER_MAX_LEGS', '5'))                  # cap legs at 3-5 per the design
+    PEAK_CLUSTER_MIN_EDGE = float(os.getenv('PEAK_CLUSTER_MIN_EDGE', '0.03'))             # combined prob - cost minimum
+    PEAK_CLUSTER_MIN_CONF = float(os.getenv('PEAK_CLUSTER_MIN_CONF', '0.55'))             # min center-bucket confidence
+    PEAK_CLUSTER_MAX_CENTER_PRICE = float(os.getenv('PEAK_CLUSTER_MAX_CENTER_PRICE', '0.85'))  # skip if the peak is already fully priced
+    PEAK_CLUSTER_BASE_FRACTION = float(os.getenv('PEAK_CLUSTER_BASE_FRACTION', '0.05'))   # base % of balance per basket
+    PEAK_CLUSTER_MAX_FRACTION = float(os.getenv('PEAK_CLUSTER_MAX_FRACTION', '0.20'))     # max % of balance per basket
+    PEAK_CLUSTER_MAX_USD = float(os.getenv('PEAK_CLUSTER_MAX_USD', '15.0'))               # hard $ cap per basket
+    PEAK_CLUSTER_TRADE_DECIDED = os.getenv('PEAK_CLUSTER_TRADE_DECIDED', '0') == '1'      # run inside the lock window? off by default
+
+    # ===================================================================
+    # THESIS-INVALIDATION EXIT — STRICT early exit. Most positions HOLD to
+    # resolution; only a non-tail position whose ROI has COLLAPSED (very bad)
+    # exits early. Cheap tails, stale prices, and near-close positions all KEEP
+    # HOLDING. Values = code defaults; set THESIS_EXIT_ENABLED=0 to disable.
+    # ===================================================================
+    THESIS_EXIT_ENABLED = os.getenv('THESIS_EXIT_ENABLED', '1') == '1'
+    THESIS_EXIT_MAX_ROI_PCT = float(os.getenv('THESIS_EXIT_MAX_ROI_PCT', '-85.0'))        # exit ONLY if ROI <= this (very bad)
+    THESIS_EXIT_MIN_ENTRY_PRICE = float(os.getenv('THESIS_EXIT_MIN_ENTRY_PRICE', '0.10')) # tails below this are HELD, never thesis-exited
+    THESIS_EXIT_MIN_BID = float(os.getenv('THESIS_EXIT_MIN_BID', '0.02'))                 # need a real bid to exit into
+    THESIS_EXIT_MIN_MINUTES_TO_CLOSE = float(os.getenv('THESIS_EXIT_MIN_MINUTES_TO_CLOSE', '60.0'))  # near-close positions are HELD
+
+    # ===================================================================
     # OUTCOME-DECIDED GATE — only HARD-skip a market once its measurement day is
     # FULLY OVER in the city's local time (value recorded, just awaiting UMA).
     # The intraday lock-hour window (same local day, after the peak) is exactly
@@ -427,10 +483,16 @@ class Config:
         print(f"Balance:     ${cls.STARTING_BALANCE:.2f} pUSD")
         print(f"Primary:     LateObserved {'ON' if cls.LATE_OBSERVED_ENABLED else 'OFF'} "
               f"(NO-side {'ON' if cls.LATE_OBSERVED_NO_SIDE else 'OFF'})")
-        print(f"QuickFlip:   {'ON' if cls.QUICK_FLIP_ENABLED else 'OFF'}")
+        print(f"QuickFlip:   {'ON' if cls.QUICK_FLIP_ENABLED else 'OFF'} "
+              f"(<{cls.QUICK_FLIP_MIN_DELTA_C}C move, hold<={cls.QUICK_FLIP_MAX_HOLD_MIN}m, max {cls.QUICK_FLIP_MAX_CONCURRENT})")
+        print(f"PeakCluster: {'ON' if cls.PEAK_CLUSTER_ENABLED else 'OFF'} "
+              f"(span+/-{cls.PEAK_CLUSTER_SPAN}, {cls.PEAK_CLUSTER_MIN_LEGS}-{cls.PEAK_CLUSTER_MAX_LEGS} legs, cost<{cls.PEAK_CLUSTER_MAX_COST})")
+        print(f"ThesisExit:  {'ON' if cls.THESIS_EXIT_ENABLED else 'OFF'} "
+              f"(only ROI<={cls.THESIS_EXIT_MAX_ROI_PCT:.0f}% & entry>={cls.THESIS_EXIT_MIN_ENTRY_PRICE})")
         print(f"Lock-window: LateObs={'Y' if cls.LATE_OBSERVED_TRADE_DECIDED else 'N'} "
               f"Flip={'Y' if cls.QUICK_FLIP_TRADE_DECIDED else 'N'} "
               f"Peak={'Y' if cls.PEAK_BASKET_TRADE_DECIDED else 'N'} "
+              f"Cluster={'Y' if cls.PEAK_CLUSTER_TRADE_DECIDED else 'N'} "
               f"Confident={'Y' if cls.CONFIDENT_TRADE_DECIDED else 'N'}")
         print(f"Min Edge:    {cls.MIN_EDGE_TO_ENTER*100:.0f}% | fee-aware taker={cls.ASSUME_TAKER_FILLS}")
         print(f"Kelly:       {cls.KELLY_FRACTION}")
