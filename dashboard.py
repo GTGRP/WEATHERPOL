@@ -83,6 +83,11 @@ class WeatherBot:
         self.station_resolver = StationResolver()
         self.resolution_verifier = ResolutionVerifier() if ResolutionVerifier else None
         self.telegram = TelegramBot(position_manager=self.pm, scanner=self.scanner)
+        # Route close/resolution alerts (stop-loss, take-profit, trailing-stop,
+        # won/lost) through Telegram. Flip/thesis exits are notified directly in
+        # run_once (their reason is relabeled 'manual' after close, so the hook
+        # below skips them to avoid a double-notify).
+        self.pm._notify_close = self.telegram.notify_close
         self.scan_count = 0
         self.signals_generated = 0
         self.trades_placed = 0
@@ -107,8 +112,15 @@ class WeatherBot:
         if time.time() - self._last_resolution_check > 300:
             self._check_resolutions()
             self.pm.check_risk_triggers()  # stop-loss / take-profit
-            exit_policies.check_flip_exits(self.pm)    # quick_flip book-or-cut (time-boxed)
-            exit_policies.check_thesis_exits(self.pm)  # strict thesis-invalidation (very bad only)
+            flip_exits = exit_policies.check_flip_exits(self.pm)    # quick_flip book-or-cut (time-boxed)
+            thesis_exits = exit_policies.check_thesis_exits(self.pm)  # strict thesis-invalidation (very bad only)
+            # Flip/thesis closes use reason 'manual' (relabeled after close), so
+            # the PM _notify_close hook deliberately skips them — notify here.
+            for _p in (flip_exits or []) + (thesis_exits or []):
+                try:
+                    self.telegram.notify_close(_p)
+                except Exception as e:
+                    log.debug(f"flip/thesis notify failed: {e}")
             self.pm.cleanup_contexts()     # free closed market memory
             self.pm.record_performance_snapshot()  # log + persist our own paper/live performance
             self._last_resolution_check = time.time()

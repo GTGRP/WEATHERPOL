@@ -60,9 +60,9 @@ class TelegramBot:
         """HTML-escape dynamic text so market names with &/</> don't break parse."""
         return html.escape(str(s if s is not None else ''))
 
-    # ════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════
     # SEND MESSAGES
-    # ════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════
 
     def send(self, text: str, parse_mode: str = 'HTML', reply_markup: dict = None) -> bool:
         """Send a message to the configured chat (optionally with an inline keyboard)."""
@@ -145,6 +145,50 @@ class TelegramBot:
         )
         self.send(msg)
 
+    def notify_close(self, pos):
+        """Send a close/resolution alert for ANY closed position — stop-loss,
+        take-profit, trailing-stop, flip/thesis exit, or won/lost resolution.
+
+        Wired via PositionManager._notify_close (risk-trigger & resolution
+        closes) and called directly by the dashboard for flip/thesis exits
+        (whose reason is relabeled 'manual' after close, so the PM hook skips
+        them to avoid a double-notify). Fully defensive — never raises."""
+        try:
+            reason = getattr(pos, 'exit_reason', '') or ''
+            status = getattr(pos, 'status', '') or ''
+            pnl = getattr(pos, 'pnl', 0.0) or 0.0
+            roi = getattr(pos, 'roi_pct', 0.0) or 0.0
+            if status == 'won':
+                head = '✅ <b>RESOLVED WON</b>'
+            elif status == 'lost':
+                head = '❌ <b>RESOLVED LOST</b>'
+            else:
+                head = {
+                    'take_profit': '🎯 <b>TAKE PROFIT</b>',
+                    'stop_loss': '🛑 <b>STOP LOSS</b>',
+                    'trailing_stop': '📉 <b>TRAILING STOP</b>',
+                    'flip_timeout': '⏲️ <b>FLIP book-or-cut</b>',
+                    'thesis_invalidated': '🚫 <b>THESIS EXIT</b>',
+                    'manual': '🔴 <b>SOLD</b>',
+                }.get(reason, '🔴 <b>SOLD</b>')
+            entry = getattr(pos, 'entry_price', 0.0) or 0.0
+            exit_px = getattr(pos, 'exit_price', None)
+            if exit_px is None:
+                exit_px = getattr(pos, 'current_price', 0.0) or 0.0
+            shares = getattr(pos, 'shares', 0.0) or 0.0
+            name = self._esc(getattr(pos, 'bucket_label', '') or getattr(pos, 'market_title', ''))
+            mode = '📋 PAPER' if Config.is_paper() else '🔴 LIVE'
+            msg = (
+                f"{head} — {self._esc(getattr(pos, 'strategy', ''))}\n"
+                f"📍 {self._esc(getattr(pos, 'city', ''))} | {name}\n"
+                f"💵 entry ${entry:.4f} → exit ${exit_px:.4f} | {shares:.0f}sh\n"
+                f"📊 PnL ${pnl:+.2f} ({roi:+.0f}%)\n"
+                f"{mode}"
+            )
+            self.send(msg)
+        except Exception as e:
+            log.debug(f"notify_close failed: {e}")
+
     def notify_redeems_recent(self):
         """Find positions that have newly become 'redeemed' since the last call
         and announce them in full detail. Self-discovers from the position
@@ -201,9 +245,9 @@ class TelegramBot:
         )
         self.send(msg)
 
-    # ════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════
     # POSITIONS VIEW (paginated + sortable)
-    # ════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════
 
     def _sorted_open(self, sort_key: str) -> List:
         open_pos = self.pm.get_open_positions() if self.pm else []
@@ -326,9 +370,9 @@ class TelegramBot:
         )
         self.send(msg)
 
-    # ════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════
     # COMMAND HANDLER (polls for incoming commands)
-    # ════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════
 
     def start_polling(self):
         """Start polling for commands in a background thread."""
@@ -394,9 +438,9 @@ class TelegramBot:
         except Exception:
             pass
 
-    # ════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════
     # SETTINGS PANEL (live tunables + tick-box toggles)
-    # ════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════
 
     _LABELS = {
         'TRADING_ENABLED': 'Trading', 'SNIPER_ENABLED': 'Sniper',
