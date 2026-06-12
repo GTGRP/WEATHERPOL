@@ -519,3 +519,56 @@ commit. User said "yes ship it" after I explained the two-source split in plain 
 - **Deferred (unchanged):** quick_flip duplicate-guard cooldown (re-signals held buckets each cycle → add-skip
   ~13/cycle); relax/reprice the quick_flip 5c floor; extend the Open-Meteo round-robin endpoints into
   `data/observed_weather.py` too; investigate the 3 `no_coords` cities.
+
+---
+
+## June 12, 2026 (Notion AI / GTGRP, ~15:30 IST) — TELEGRAM UI: detailed redemption alerts + paginated/sortable positions + full market names
+
+Same agent (Notion AI) / same remote `https://github.com/GTGRP/WEATHERPOL` branch `main`, via GitHub MCP
+(sandbox offline, `py_compile`-clean). Single file changed: `bot/telegram_ui.py`. Commit `e8cbbc5b`.
+
+### WHY (user's complaint, verbatim intent)
+"In Telegram I can't see WHICH position resolved — it blindly says 'Redeemed N positions' with no detail. Need a
+full message per redemption: full market name, entry/exit price, profit/PnL. Also /status and /positions only
+show 8 of ~50 open — make it paged (10 per page, next/prev). Add SORT options (PnL / losses / ROI / recent) to
+both /status and /positions to find winners/losers. And the rows don't show the FULL market name ('lowest in …'
+is truncated) — show full details."
+
+### WHAT I CHANGED (bot/telegram_ui.py ONLY — dashboard.py deliberately UNTOUCHED → zero risk to the core bot)
+1. DETAILED REDEMPTIONS (replaces the blind "💰 Redeemed N winning positions!"):
+   - `notify_redeems(positions)` — one block per redeemed position: full market name (`bucket_label or
+     market_title`), `entry → exit` price, `cost → payout`, realized `PnL ($ and ROI%)`, plus a header total.
+     Chunks at ~3900 chars to respect Telegram's 4096 cap.
+   - `notify_redeems_recent()` — self-discovers newly-redeemed positions from `pm.positions`
+     (status=='redeemed' not yet announced), deduped via `self._announced_redeemed` (seeded at __init__ with
+     existing redeemed ids so a restart doesn't re-announce the backlog). Called every poll cycle (~3s) in
+     `_poll_loop`, and on `/redeem`.
+   - `send()` now INTERCEPTS the legacy blind "💰 Redeemed N positions!" string and replaces it with the
+     detailed breakdown — so the dashboard's existing generic message becomes the detailed one WITHOUT editing
+     dashboard.py (the detailed header starts "<b>REDEEMED" so it never re-matches → no recursion).
+2. PAGINATION (10/page) + SORT for BOTH /status and /positions:
+   - `_positions_view(page, sort, with_summary)` builds page text + inline keyboard: Prev / page-indicator /
+     Next nav row + a sort row (💰 PnL / 📉 Losses / 📈 ROI / 🕒 Recent, current sort marked with •).
+   - `_sorted_open(sort)` sorts open positions by unrealized_pnl desc (pnl), asc (loss), roi desc, or entry_time
+     desc (recent).
+   - Callback `pos:<page>:<sort>:<with_summary>` edits the message in place when a button is tapped.
+   - `/status` = summary header + page 0 (with_summary=True); `/positions` = page 0 (with_summary=False).
+3. FULL MARKET NAMES + per-row detail: each row now shows `bucket_label or market_title` in full, plus
+   `entry → current` price, shares, cost, strategy, 🔒 preclose-lock + ~stale flags, $PnL and ROI%. HTML-escaped
+   via `_esc` so market names with &/</> don't break Telegram's HTML parse.
+4. Fixed a `base_url` bug introduced while authoring (a literal-brace artifact) → now plain
+   `https://api.telegram.org/bot<token>`. File `py_compile`-clean (548 lines). Settings panel + all existing
+   commands/notifications preserved.
+
+### WHEN / WHY pushed
+June 12, 2026 ~15:30 IST. Single commit `e8cbbc5b` (`bot/telegram_ui.py`); this SESSION_MEMORY append as a
+follow-up diary commit.
+
+### STILL PENDING (user / next agent)
+- **User → Railway:** REDEPLOY, then in Telegram try /status, /positions, the Next/Prev + sort buttons, and
+  confirm the next redemption shows the detailed per-position message.
+- **Next (analysis only, no code yet — delivered to the user in chat this session):** (a) how to improve
+  quick_flip win-rate (it's 0% WR / dead weight: dup-guard re-signals held buckets, the 5c sellability floor
+  blocks sub-5c flips, early_exit fires into the correction); (b) research why no SELL actions fire
+  (observed/confident legs set hold_hint=True → take_profit≈0.99 → effectively hold-to-resolution; stop_loss
+  skipped for entry<3c) and a hold-vs-sell take at 62% WR.
