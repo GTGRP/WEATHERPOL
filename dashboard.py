@@ -34,12 +34,14 @@ from strategies.peak_basket import PeakBasketStrategy
 from strategies.confident_strategy import ConfidentStrategy
 from strategies.late_observed_temp import LateObservedTempStrategy
 from strategies.quick_flip import QuickFlipStrategy
+from strategies.peak_cluster import PeakClusterStrategy
 from data.stability import StabilityEngine
 from data.liquidity_guard import LiquidityGuard
 from data.clob_client import ClobClient
 from data.market_timing import outcome_decided, city_local_now
 from data.resolution_rules import StationResolver
 from trading.position_manager import PositionManager
+from trading import exit_policies
 from bot.telegram_ui import TelegramBot
 from bot import settings_store
 from ml.decision_engine import MLDecisionEngine
@@ -64,6 +66,9 @@ class WeatherBot:
         # Forecast-change arbitrage: enter a freshly mispriced bucket before the
         # book digests new model data; flips quick or holds if structural.
         self.quick_flip = QuickFlipStrategy()
+        # Parallel peak-cluster basket: buy an adjacent bucket basket around the
+        # estimated peak (combined per-share cost < $1) so any single winning leg profits.
+        self.peak_cluster = PeakClusterStrategy()
         self.observed = ObservedWeather()
         self.stability_engine = StabilityEngine()
         # Stability GRADE + liquidity guard (applied across ALL strategies)
@@ -102,6 +107,8 @@ class WeatherBot:
         if time.time() - self._last_resolution_check > 300:
             self._check_resolutions()
             self.pm.check_risk_triggers()  # stop-loss / take-profit
+            exit_policies.check_flip_exits(self.pm)    # quick_flip book-or-cut (time-boxed)
+            exit_policies.check_thesis_exits(self.pm)  # strict thesis-invalidation (very bad only)
             self.pm.cleanup_contexts()     # free closed market memory
             self.pm.record_performance_snapshot()  # log + persist our own paper/live performance
             self._last_resolution_check = time.time()
@@ -586,6 +593,12 @@ class WeatherBot:
             except Exception as e:
                 flip_signals = []
                 log.debug(f"quick_flip eval failed {city}: {e}")
+            # Concurrent-flip cap: a flip is a fast, small information-arb trade;
+            # don't let many pile up and tie down capital.
+            open_flips = sum(1 for p in self.pm.get_open_positions() if p.strategy == 'quick_flip')
+            if flip_signals and open_flips >= int(getattr(Config, 'QUICK_FLIP_MAX_CONCURRENT', 6)):
+                log.info(f"   ⏸️  FLIP CAP {city} — {open_flips} open flips ≥ cap, skipping new flips")
+                flip_signals = []
             for fsig in flip_signals:
                 self.signals_generated += 1
                 log.info(
@@ -614,12 +627,65 @@ class WeatherBot:
                     signal='quick_flip',
                 )
                 if pos:
+                    # Carry the flip's hold window so the loop can book-or-cut it.
+                    pos.flip_max_hold_minutes = fsig.expected_hold_minutes
                     self.trades_placed += 1
                     self.telegram.notify_trade(
                         'BUY', fsig.bucket_label, pos.entry_price,
                         pos.cost_usd, pos.shares, 'quick_flip',
                         edge=fsig.expected_roi_pct / 100.0, city=city,
                     )
+
+        # ------------------------------------------------------
+        # PEAK CLUSTER — parallel adjacent-bucket basket around the estimated
+        # peak. Buys 3-5 neighbouring buckets whose COMBINED per-share cost is
+        # < $1, so any single winning leg profits after fees. Forecast-based →
+        # skipped once the extreme is locked (no edge in the lock window).
+        # Runs alongside the other strategies without disturbing them.
+        # ------------------------------------------------------
+        if getattr(Config, 'PEAK_CLUSTER_ENABLED', True) and (
+            not in_lock_window or getattr(Config, 'PEAK_CLUSTER_TRADE_DECIDED', False)
+        ):
+            try:
+                cluster_signals = self.peak_cluster.evaluate(
+                    market.title, bucket_probs, market_prices, token_ids,
+                    balance, city=city, grade=grade,
+                )
+            except Exception as e:
+                cluster_signals = []
+                log.debug(f"peak_cluster eval failed {city}: {e}")
+            for sig in cluster_signals:
+                self.signals_generated += 1
+                log.info(f"   🧺 CLUSTER {city} | {sig.reason}")
+                for leg in sig.legs:
+                    if not leg.token_id:
+                        continue
+                    pos = self._place(
+                        token_id=leg.token_id,
+                        condition_id=condition_ids.get(leg.bucket_label, ''),
+                        entry_price=leg.price,
+                        base_size_usd=leg.size_usd,
+                        market_title=market.title,
+                        bucket_label=leg.bucket_label,
+                        strategy='peak_cluster',
+                        city=city,
+                        slug=market.slug,
+                        resolution_time=market.resolution_time,
+                        edge=sig.combined_prob - sig.total_cost,
+                        grade=grade,
+                        hold_hint=True,          # basket pays off at resolution
+                        early_exit_price=early_exit_price,
+                        apply_grade_size=False,  # cluster sizes its own legs
+                        reason=sig.reason,
+                        signal='peak_cluster',
+                    )
+                    if pos:
+                        self.trades_placed += 1
+                        self.telegram.notify_trade(
+                            'BUY', leg.bucket_label, pos.entry_price,
+                            pos.cost_usd, pos.shares, 'peak_cluster',
+                            edge=sig.combined_prob - sig.total_cost, city=city,
+                        )
 
         # ------------------------------------------------------
         # PEAK BASKET — forecast-only directional-peak strategy (DEMOTED, opt-in).
@@ -803,6 +869,7 @@ class WeatherBot:
         strats = []
         if Config.LATE_OBSERVED_ENABLED: strats.append('LateObserved*')
         if getattr(Config, 'QUICK_FLIP_ENABLED', False): strats.append('QuickFlip')
+        if getattr(Config, 'PEAK_CLUSTER_ENABLED', True): strats.append('PeakCluster')
         if Config.PEAK_BASKET_ENABLED: strats.append('PeakBasket')
         if Config.CONFIDENT_ENABLED: strats.append('Confident')
         if Config.SNIPER_ENABLED: strats.append('Sniper')
