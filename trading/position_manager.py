@@ -182,6 +182,11 @@ class PositionManager:
         self.total_trades = 0
         self.wins = 0
         self.losses = 0
+        # Optional callback invoked after a position is closed/resolved (set by
+        # the dashboard to route Telegram close/resolution alerts). The hook
+        # skips reason=='manual' (flip/thesis exits notify directly, otherwise
+        # they'd be double-notified with the wrong label).
+        self._notify_close = None
         self._state_file = 'data/positions.json'
         self._weekly_file = 'data/weekly_memory.json'
         self._paper_trades_file = _cfg('PAPER_TRADE_LOG', 'data/paper_trades.jsonl')
@@ -703,6 +708,16 @@ class PositionManager:
             action = 'SETTLE' if reason in ('won', 'lost') else 'SELL'
             self._log_paper_trade(action, pos)
 
+        # Fire the close/resolution alert callback (Telegram), if wired. Skip
+        # 'manual': exit_policies relabels flip/thesis exits AFTER close and the
+        # dashboard notifies those directly, so this avoids a double-notify with
+        # the wrong label.
+        if reason != 'manual' and getattr(self, '_notify_close', None):
+            try:
+                self._notify_close(pos)
+            except Exception as e:
+                log.debug(f"close notify failed: {e}")
+
 
     # ═══════════════════════════════════════════════════════════
     # RESOLUTION & REDEMPTION
@@ -805,12 +820,15 @@ class PositionManager:
                     pos.redeemable = True
                     pos.settle_source = 'clob'
                     self._close_position(pos, 1.0, 'won')
+                    log.info(f"✅ RESOLVED WON (legacy): {pos.city} {pos.bucket_label[:30]} @ ${price:.3f}")
                 elif price <= 0.01 and pos.is_expired:
                     pos.settle_source = 'clob'
                     self._close_position(pos, 0.0, 'lost')
+                    log.info(f"❌ RESOLVED LOST (legacy): {pos.city} {pos.bucket_label[:30]} @ ${price:.3f}")
             elif resp.status_code == 404 and pos.is_expired:
                 pos.settle_source = 'clob'
                 self._close_position(pos, 0.0, 'lost')
+                log.info(f"❌ RESOLVED LOST (legacy 404): {pos.city} {pos.bucket_label[:30]} — expired, no book")
         except Exception:
             pass
 
