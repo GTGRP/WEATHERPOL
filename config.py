@@ -182,6 +182,18 @@ class Config:
     LATE_OBSERVED_BASE_FRACTION = float(os.getenv('LATE_OBSERVED_BASE_FRACTION', '0.06'))
     LATE_OBSERVED_MAX_FRACTION = float(os.getenv('LATE_OBSERVED_MAX_FRACTION', '0.25'))
     LATE_OBSERVED_MAX_LEGS = int(os.getenv('LATE_OBSERVED_MAX_LEGS', '4'))
+    # --- Signal-strength -> absolute-USD allocation ladder (replaces flat %-Kelly) ---
+    # The late-observed stake now scales with a composite signal-strength score
+    # (post-fee edge + weather grade): a VERY good signal deploys up to
+    # SIZE_MAX_USD, a mid one lands mid-ladder, a barely-passing one stays near
+    # SIZE_FLOOR_USD. This fixes the "every buy suddenly uses ~25% of balance /
+    # ~$25" drain — MAX_FRACTION above is now only a per-trade SAFETY cap vs the
+    # live balance, not the sizing target. Tune the ladder here.
+    LATE_OBSERVED_SIZE_FLOOR_USD = float(os.getenv('LATE_OBSERVED_SIZE_FLOOR_USD', '3.0'))   # weakest valid signal (~$3-4)
+    LATE_OBSERVED_SIZE_MAX_USD = float(os.getenv('LATE_OBSERVED_SIZE_MAX_USD', '20.0'))      # strongest signal (~$20)
+    LATE_OBSERVED_EDGE_FULL = float(os.getenv('LATE_OBSERVED_EDGE_FULL', '0.25'))            # post-fee edge counted as max strength
+    LATE_OBSERVED_W_EDGE = float(os.getenv('LATE_OBSERVED_W_EDGE', '0.6'))                   # weight of edge in the strength score
+    LATE_OBSERVED_W_GRADE = float(os.getenv('LATE_OBSERVED_W_GRADE', '0.4'))                 # weight of grade in the strength score
 
     # ===================================================================
     # CITY FILTER (which cities to trade — empty = all)
@@ -482,7 +494,8 @@ class Config:
         print(f"Mode:        {mode}")
         print(f"Balance:     ${cls.STARTING_BALANCE:.2f} pUSD")
         print(f"Primary:     LateObserved {'ON' if cls.LATE_OBSERVED_ENABLED else 'OFF'} "
-              f"(NO-side {'ON' if cls.LATE_OBSERVED_NO_SIDE else 'OFF'})")
+              f"(NO-side {'ON' if cls.LATE_OBSERVED_NO_SIDE else 'OFF'}, "
+              f"size ${cls.LATE_OBSERVED_SIZE_FLOOR_USD:.0f}-${cls.LATE_OBSERVED_SIZE_MAX_USD:.0f})")
         print(f"QuickFlip:   {'ON' if cls.QUICK_FLIP_ENABLED else 'OFF'} "
               f"(<{cls.QUICK_FLIP_MIN_DELTA_C}C move, hold<={cls.QUICK_FLIP_MAX_HOLD_MIN}m, max {cls.QUICK_FLIP_MAX_CONCURRENT})")
         print(f"PeakCluster: {'ON' if cls.PEAK_CLUSTER_ENABLED else 'OFF'} "
