@@ -660,3 +660,155 @@ New log lines to watch for: `🧺 CLUSTER`, `⏲️ FLIP BOOK/CUT`, `🚫 THESIS
 - **Deferred (unchanged):** extract `decide_placement()` for offline tests; CI (pytest+ruff); cap
   `data/paper_trades.jsonl`; extend Open-Meteo round-robin into `data/observed_weather.py`; weather.gov stray `{`;
   3 `no_coords` cities.
+
+---
+
+## June 12-13, 2026 (Notion AI / GTGRP, ~11:09 PM IST 12 Jun → ~12:20 AM IST 13 Jun) — REQUEST 17 AUDIT + REQUEST 18: FACTOR-TIERED USD SIZING + FULL ALERT WIRING (+ two-log forensics)
+
+Same agent (Notion AI) / same remote `https://github.com/GTGRP/WEATHERPOL` branch `main`, via GitHub MCP
+(sandbox offline; `py_compile`-level reasoning only — dashboard/config/telegram not import-testable offline).
+Continues the ~16:00 QUICK_FLIP v2 / PEAK_CLUSTER entry above. SETTLEMENT DESIGN STILL LOCKED by the user:
+paper closes as real ~99% (weather-API = CONFIRMATION only; Polymarket resolved value = truth). NOT touched.
+
+### USER TONE CORRECTION (in force for all future agents)
+Mid-session the user corrected my writing tone: use a NORMAL technical tone, NOT an ELI10 / childish
+explain-like-I'm-10 style. Keep explanations precise and engineer-level.
+
+### REQUEST 17 (~11:09 PM IST 12 Jun) — AUDIT ONLY (no code changed)
+User report (verbatim intent): "balance is draining, I get NO Telegram sale/redeem messages, the dashboard shows
+38 trades but only 32 open, and a status went to 1-loss with NO notification." I ran a log forensics pass and
+delivered the audit in chat (no code edits in this step).
+- **Log analysed:** `/data/logs_v7.json` — 16,062 entries, 11:33→17:31 UTC, deployment `2a358a28…`. Analysis
+  scripts saved to `/data/an.py … an6.py`.
+- **CONFIRMED root finding (an6.py):** a 1-loss status change happened SILENTLY between SCAN #318 → #319 via
+  `position_manager._legacy_resolution_check` — that legacy resolution path had NO log line and NO Telegram
+  alert, so wins/losses resolved there were invisible. THIS is the "status went to 1-loss with no notification"
+  and a big part of "no sale/redeem messages".
+- **WHY the alerts were missing (design gap):** the only Telegram notifier wired into the loop was
+  `notify_trade` (BUY side) + the redeem interceptor. There was NO close/resolution notifier at all for
+  stop-loss / take-profit / trailing-stop / flip / thesis / won / lost. `notify_resolution` existed but was DEAD
+  (never called). So every SELL/SETTLE was silent — exactly the user's complaint. (Fixed in Request 18 below.)
+- **38 trades vs 32 open** = expected: 38 = lifetime total_trades counter; 32 = currently-open. The 6 delta are
+  closed/resolved (some silently, per above). Not a bug, but the silent closes made it LOOK like one.
+- **Balance drain** = 100% deployed across many positions + silent losses not surfaced; the "waiting for N
+  positions to resolve" line prints every scan when free balance < min order (NOT a bug — capital is just fully
+  deployed and frees up as positions resolve).
+
+### REQUEST 18 (~11:30 PM IST 12 Jun) — IMPLEMENT (user verbatim intent)
+"Fix all the alerts and wire properly — all paper trade should close as real 99% (we already implemented this,
+KEEP it). Also: before the update I sent you the log with an 84-trade, +$32-ish PnL run; in that the FIRST buy
+of observed-YES was around $4 — it bought 0.45 × 10 shares = $4.38. Why does the paper bot SUDDENLY use much
+more capital now on first/second buys? Don't we have a system where, based on signal / strategy / probability /
+all factors being strong, we ADJUST allocation — very good signals use large funds (~$20), a mid-good one ~$10,
+a decent one ~$3-4 — like that (just an example)?" + "I too initially thought max $10 a position, but if it's a
+VERY good signal that can bring more profit, why stop at $10 — it can give more."
+
+### WHERE THE USER "MISSED TO TELL ME" EARLIER (scope that only surfaced now — record for future AI)
+- The user had a STANDING mental cap of "max $10 per position" that was NEVER stated in earlier requests, then
+  EXPLICITLY LIFTED it this session: strong/very-good signals SHOULD deploy MORE than $10 (e.g. ~$20). So the
+  sizing model must be a FACTOR-TIERED ladder, NOT a flat cap. (Do not silently re-introduce a $10 cap.)
+- The earlier sizing model was never specified by the user as "Kelly / fraction-of-bankroll"; that was an
+  implementation detail from an earlier commit. When the per-buy size jumped from ~$4.38 to ~$25 the user (rightly)
+  noticed and asked why — see root cause below. The user's intent all along was "size by how good the signal is",
+  which earlier code did NOT really do for late_observed.
+
+### ROOT CAUSE of the "$4.38 → ~$25" size jump (explained to user in chat)
+The sizing MODEL changed between the two logs. In the GOOD/earlier log the late_observed first buy was an almost
+FIXED ~10-share clip (0.45 × 10 = $4.38). After the overhaul, late_observed sized via Kelly / fraction-of-bankroll
+with `LATE_OBSERVED_MAX_FRACTION = 0.25` and NO absolute-dollar cap → 25% of a $100 bankroll = ~$25 per leg. That
+is why first/second buys suddenly consumed far more capital. The fix (below) replaces that with a tiered absolute-USD
+ladder.
+
+### WHAT I CHANGED + WHY (commits, GTGRP/WEATHERPOL main — Request 18)
+1. `9cf90347` **strategies/late_observed_temp.py** — FACTOR-TIERED ABSOLUTE-USD SIZING (replaces the flat
+   %-bankroll Kelly clip):
+   - New `DecideParams` fields `size_floor_usd=3.0, size_max_usd=20.0, edge_full=0.25, w_edge=0.6, w_grade=0.4`
+     (kept `base_fraction`/`max_fraction`/`kelly_cap` for safety-clamp + back-compat).
+   - Rewrote `_stake_usd(prob_win, price, balance, grade, edge, params)` as a strength LADDER:
+     `strength = clamp01(0.6 · clamp01(edge / 0.25) + 0.4 · clamp01(grade))`, then
+     `stake = size_floor_usd + (size_max_usd − size_floor_usd) · strength`, finally CLAMPED to
+     `balance · max_fraction` and to `balance`, and floored at `min_order_usd`. So a VERY good signal
+     (high edge + high grade) deploys toward $20, a mid one ~$10, a weak-but-tradeable one ~$3-4 — exactly the
+     user's ladder. Both `decide_legs` call sites now pass `edge`. `__init__` reads 5 new `LATE_OBSERVED_*` env
+     tunables.
+2. `2de603f7` **config.py** — baked the 5 tunables as defaults after `LATE_OBSERVED_MAX_LEGS`:
+   `LATE_OBSERVED_SIZE_FLOOR_USD=3.0, LATE_OBSERVED_SIZE_MAX_USD=20.0, LATE_OBSERVED_EDGE_FULL=0.25,
+   LATE_OBSERVED_W_EDGE=0.6, LATE_OBSERVED_W_GRADE=0.4`; `print_status()` Primary line now shows `size $3-$20`.
+   ⚠️ NOTE FOR HISTORY: this commit's MESSAGE wrongly claimed it also wired the alerts — it did NOT; only
+   config.py was in that push. The alert files were pushed afterwards (see 3 + 4). No harm, just a mislabeled
+   commit message.
+3. `98395d56` **trading/position_manager.py** — alert PLUMBING + legacy-loss visibility:
+   - Added optional `self._notify_close = None` hook in `__init__`; at the end of `_close_position` it calls
+     `self._notify_close(pos)` for every close EXCEPT `reason=='manual'` (flip/thesis use 'manual' then relabel
+     after close, so the dashboard notifies those directly — avoids a double-notify + wrong label).
+   - Added `log.info` lines to the previously-SILENT `_legacy_resolution_check` (the Request-17 culprit):
+     `✅ RESOLVED WON (legacy)`, `❌ RESOLVED LOST (legacy)`, `❌ RESOLVED LOST (legacy 404 expired)`.
+4. `823eff5d` **bot/telegram_ui.py + dashboard.py** — the actual alert WIRING:
+   - telegram_ui: NEW `notify_close(pos)` — formats a Telegram alert for ANY closed position, headers by
+     status/reason: `✅ RESOLVED WON`, `❌ RESOLVED LOST`, `🎯 TAKE PROFIT`, `🛑 STOP LOSS`, `📉 TRAILING STOP`,
+     `⏲️ FLIP book-or-cut`, `🚫 THESIS EXIT`, else `🔴 SOLD`; body = strategy, city|market, entry→exit + shares,
+     PnL $ and ROI%, PAPER/LIVE tag. Fully defensive (whole body in try/except → never raises).
+   - dashboard: registered `self.pm._notify_close = self.telegram.notify_close` right after building Telegram;
+     captured the flip/thesis exit lists (`flip_exits = exit_policies.check_flip_exits(self.pm)` /
+     `thesis_exits = exit_policies.check_thesis_exits(self.pm)`) and notify them DIRECTLY in `run_once` (their
+     reason is relabeled 'manual' after close, so the PM hook skips them by design).
+   - ALERT ROUTING (final): take_profit / stop_loss / trailing_stop / won / lost → PM `_notify_close` hook;
+     flip / thesis → dashboard explicit `notify_close`. Redeem alerts (the detailed `notify_redeems_recent`) are
+     unchanged; a WON position therefore gets BOTH a "RESOLVED WON" close alert AND the later detailed redeem
+     alert (acceptable).
+
+### ⚠️ PROCESS SLIP (recorded honestly for future AI)
+This session I twice pushed an INCOMPLETE file set while the commit message implied the full alert wiring: first
+`2de603f7` (config only) then a commit that carried ONLY `position_manager.py` (→ `98395d56`). The remaining two
+alert files (`telegram_ui.py`, `dashboard.py`) landed in `823eff5d`. `push_files` only commits the EXACT files
+in its `files` array — there is NO implicit carryover — so always double-check the array matches the message.
+Net state is correct: all alert wiring is on `main` as of `823eff5d`.
+
+### LOG FORENSICS — the two logs the user referenced (crucial details for future AI; NOT the full logs)
+**LOG A — the GOOD one ("84-trade, ~+$32-36 PnL"), BEST run so far.**
+- WHEN / STAGE: taken on a commit stage AFTER the observed two-source fix (`b990c630`, Jun 12 ~00:20 IST) and
+  the Telegram UI commit (`e8cbbc5b`, ~15:30 IST) but BEFORE the PEAK_CLUSTER / QUICK_FLIP-v2 commit
+  (`fbb63ddb`, ~16:00 IST). So: pre-peak_cluster, pre-tiered-sizing.
+- SIZING THEN: late_observed first observed-YES buy was an almost FIXED ~10-share clip — 0.45 × 10 = **$4.38**
+  (small, even per-leg sizing). This is the behaviour the user liked and the reference point for the new ladder
+  (floor $3 / max $20).
+- PERFORMANCE: ~84 trades, roughly **+$32-36 PnL** — by far the best paper run to date.
+- WIN-RATE READ (user's + my forensics): the OBSERVED/primary legs did NOT carry a good win rate in this run;
+  the profit was driven largely by **quick_flip** (and small even-sized observed tails that held cheap). PROOF /
+  REASON: small fixed clips meant losers cost little while the occasional cheap tail / flip that resolved paid
+  out multiples — positive expectancy came from MANY small bets, not big single bets.
+- MY FEEDBACK (for future AI): this is strong evidence that SMALL, MANY, factor-scaled clips beat a few large
+  %-bankroll clips on these wide-spread weather books. The new tiered ladder ($3-$20) is meant to KEEP that
+  small-clip behaviour for weak/mid signals while only sizing UP when edge AND grade are both genuinely strong.
+  Do NOT regress to flat 25%-bankroll Kelly.
+**LOG B — the LATEST one (Request-17 audit log, `/data/logs_v7.json`).**
+- WHEN: 16,062 entries, 11:33→17:31 UTC, deployment `2a358a28…` (post-`fbb63ddb`, i.e. AFTER peak_cluster +
+  the bigger %-bankroll sizing).
+- PROBLEMS SEEN: balance draining; NO Telegram sale/redeem messages; 38 lifetime trades vs 32 open; a status
+  flipped to **1 loss with NO notification** (the silent `_legacy_resolution_check` close between SCAN
+  #318→#319). Per-buy capital had jumped to ~$25 (the 0.25 max_fraction Kelly clip) — the regression the user
+  flagged.
+- WIN-RATE READ: poor visibility (that was the core complaint) — losses were resolving SILENTLY so the surfaced
+  win-rate was misleading; combined with oversized clips, the bankroll drained faster than Log A. This log is
+  precisely WHY Request 18 did (a) tiered sizing to undo the oversize and (b) full close/resolution alerts +
+  legacy-loss logging to end the silent closes.
+
+### WHEN / WHY pushed (Request 18, GTGRP/WEATHERPOL main)
+Jun 12 ~11:30 PM → Jun 13 ~12:20 AM IST. Order: `9cf90347` (tiered sizing) → `2de603f7` (config tunables) →
+`98395d56` (PM hook + legacy logs) → `823eff5d` (telegram_ui notify_close + dashboard wiring). HEAD after the
+code pushes = `823eff5d`; this SESSION_MEMORY append is a follow-up diary commit. Settlement logic untouched.
+New log / Telegram lines to watch for: `✅ RESOLVED WON (legacy)`, `❌ RESOLVED LOST (legacy)`, and Telegram
+close alerts `🎯 TAKE PROFIT` / `🛑 STOP LOSS` / `📉 TRAILING STOP` / `⏲️ FLIP book-or-cut` / `🚫 THESIS EXIT` /
+`✅ RESOLVED WON` / `❌ RESOLVED LOST`.
+
+### STILL PENDING (user / next agent)
+- **User → Railway:** REDEPLOY (needs the code commits `9cf90347` + `2de603f7` + `98395d56` + `823eff5d`). Keep
+  PAPER mode; confirm in Telegram that closes/resolutions now fire alerts and that first/second buys are back to
+  small factor-scaled clips (~$3-4 for weak, up to ~$20 only for very strong). Tune live via Telegram, e.g.
+  `/set LATE_OBSERVED_SIZE_MAX_USD 25`.
+- **Watch:** confirm the silent `_legacy_resolution_check` losses now print + alert; confirm tiered sizing makes
+  the bankroll behave like the BEST run (Log A) again — many small clips, not a few $25 clips.
+- **Deferred (unchanged):** extract testable `decide_placement()`; CI (pytest+ruff); cap
+  `data/paper_trades.jsonl`; Open-Meteo round-robin into `data/observed_weather.py`; weather.gov stray `{`;
+  3 `no_coords` cities; cluster dedup; backtest peak_cluster leg-sizing; expose new getattr knobs / sizing knobs
+  in /settings for live tuning.
