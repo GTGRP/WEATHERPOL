@@ -647,3 +647,96 @@ class TelegramBot:
         # Positions pager/sorter: "pos:<page>:<sort>:<with_summary>"
         if data.startswith('pos:'):
             try:
+                _, page_s, sort_key, sm = data.split(':')
+                page = int(page_s)
+            except (ValueError, IndexError):
+                self._answer_callback(callback_id)
+                return
+            self._answer_callback(callback_id)
+            self.send_positions(page=page, sort=sort_key,
+                                with_summary=(sm == '1'),
+                                edit_message_id=message_id)
+            return
+
+        try:
+            action, key = data.split(':', 1)
+        except ValueError:
+            self._answer_callback(callback_id)
+            return
+        ok, msg = False, 'no change'
+        if action == 'tg':
+            ok, msg = settings_store.toggle(key)
+        elif action == 'up':
+            ok, msg = settings_store.bump(key, +1)
+        elif action == 'dn':
+            ok, msg = settings_store.bump(key, -1)
+        self._answer_callback(callback_id, msg)
+        if ok and message_id is not None:
+            self.send_settings(edit_message_id=message_id)
+
+    def _handle_command(self, text: str):
+        """Handle incoming bot commands."""
+        cmd = text.lower().split()[0] if text else ''
+        parts = text.split()
+
+        if cmd == '/start' or cmd == '/resume':
+            from bot import settings_store
+            settings_store.set_value('TRADING_ENABLED', True)
+            self.send("🟢 <b>Trading ENABLED</b> — the bot will place new trades.")
+        elif cmd == '/stop' or cmd == '/pause':
+            from bot import settings_store
+            settings_store.set_value('TRADING_ENABLED', False)
+            self.send("🔴 <b>Trading DISABLED</b> — monitoring & resolving only, no new buys.")
+        elif cmd == '/settings' or cmd == '/config':
+            self.send_settings()
+        elif cmd == '/set':
+            from bot import settings_store
+            if len(parts) >= 3:
+                ok, msg = settings_store.set_value(parts[1], parts[2])
+                self.send(("✅ " if ok else "⚠️ ") + msg)
+            else:
+                self.send("Usage: <code>/set KEY VALUE</code>  e.g. <code>/set BASKET_MAX_COST 0.80</code>")
+        elif cmd == '/toggle':
+            from bot import settings_store
+            if len(parts) >= 2:
+                ok, msg = settings_store.toggle(parts[1])
+                self.send(("✅ " if ok else "⚠️ ") + msg)
+            else:
+                self.send("Usage: <code>/toggle KEY</code>  e.g. <code>/toggle SNIPER_ENABLED</code>")
+        elif cmd == '/status' or cmd == '/stats':
+            self.send_status()
+        elif cmd == '/balance' or cmd == '/bal':
+            bal = self.pm.get_balance() if self.pm else 0
+            self.send(f"💰 Balance: ${bal:.2f}")
+        elif cmd == '/pnl':
+            pnl = self.pm.get_total_pnl() if self.pm else 0
+            self.send(f"📊 Total PnL: ${pnl:+.2f}")
+        elif cmd == '/positions' or cmd == '/pos':
+            self.send_positions(page=0, sort='recent', with_summary=False)
+        elif cmd == '/markets':
+            self.send_markets_summary()
+        elif cmd == '/redeem':
+            if self.pm:
+                count = self.pm.redeem_all_winning()
+                # redeem_all_winning may return a count (int) or a list.
+                n = len(count) if isinstance(count, list) else count
+                self.notify_redeems_recent()
+                self.send(f"💰 Redeemed {n} positions")
+        elif cmd == '/help':
+            self.send(
+                "🌤️ <b>Weather Sniper Commands</b>\n"
+                "<b>/start</b> — enable trading\n"
+                "<b>/stop</b> — disable trading (monitor only)\n"
+                "<b>/settings</b> — toggle strategies & tune gates (buttons)\n"
+                "/set KEY VALUE — set a gate, e.g. /set BASKET_MAX_COST 0.80\n"
+                "/toggle KEY — flip a toggle, e.g. /toggle SNIPER_ENABLED\n"
+                "/status — summary + positions (paged, sortable)\n"
+                "/balance — current balance\n"
+                "/pnl — total profit/loss\n"
+                "/positions — open positions (10/page; sort by PnL/Losses/ROI/Recent)\n"
+                "/markets — active weather markets\n"
+                "/redeem — redeem winning positions\n"
+                "/help — this message"
+            )
+        elif cmd.startswith('/'):
+            self.send(f"❓ Unknown command. Try /help")
