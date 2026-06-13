@@ -42,6 +42,7 @@ from data.market_timing import outcome_decided, city_local_now
 from data.resolution_rules import StationResolver
 from trading.position_manager import PositionManager
 from trading import exit_policies
+from trading import sizing
 from bot.telegram_ui import TelegramBot
 from bot import settings_store
 from ml.decision_engine import MLDecisionEngine
@@ -88,10 +89,18 @@ class WeatherBot:
         # run_once (their reason is relabeled 'manual' after close, so the hook
         # below skips them to avoid a double-notify).
         self.pm._notify_close = self.telegram.notify_close
+        # Peak-cluster baskets resolve as ONE grouped summary (winner + payout,
+        # losing buckets + loss, net) instead of one won/lost alert per leg.
+        self.pm._notify_cluster_close = self.telegram.notify_cluster_resolution
         self.scan_count = 0
         self.signals_generated = 0
         self.trades_placed = 0
         self._funnel = Counter()          # per-scan placement funnel (diagnostics)
+        # Per-scan capital-deployment guard counters (reset every run_once). Stop
+        # the old "dump the whole bankroll on the first cycle" behaviour: cap how
+        # many NEW buys and how much NEW capital one scan may deploy.
+        self._scan_buys = 0
+        self._scan_deployed_usd = 0.0
         self._last_resolution_check = 0
         self._last_daily_summary = ''
         self._last_weekly_record = ''
@@ -100,6 +109,10 @@ class WeatherBot:
         """Run a single scan cycle."""
         self.scan_count += 1
         self._funnel = Counter()  # reset per-cycle diagnostics funnel
+        # Reset the per-scan capital-deployment guard so each scan gets a fresh
+        # buy-count / deploy-$ budget (see _can_deploy).
+        self._scan_buys = 0
+        self._scan_deployed_usd = 0.0
         now = datetime.now(timezone.utc)
         log.info(f"\n{'═'*60}")
         log.info(f"🔍 SCAN #{self.scan_count} — {now.strftime('%Y-%m-%d %H:%M:%S UTC')}")
@@ -184,6 +197,110 @@ class WeatherBot:
         lo, hi = Config.GRADE_SIZE_MIN_MULT, Config.GRADE_SIZE_MAX_MULT
         return lo + (hi - lo) * g
 
+    # -----------------------------------------------------------------
+    # BEST-KELLY FACTOR SIZING + PORTFOLIO GUARD (Req-23)
+    # -----------------------------------------------------------------
+    def _sizing_params(self):
+        """Build a sizing.SizingParams from the live Config (so Telegram
+        /settings overrides flow straight into the allocator)."""
+        return sizing.SizingParams(
+            base_usd=Config.KELLY_TIER_BASE_USD,
+            good_usd=Config.KELLY_TIER_GOOD_USD,
+            vgood_usd=Config.KELLY_TIER_VGOOD_USD,
+            perfect_usd=Config.KELLY_TIER_PERFECT_USD,
+            good_strength=Config.KELLY_GOOD_STRENGTH,
+            vgood_strength=Config.KELLY_VGOOD_STRENGTH,
+            perfect_strength=Config.KELLY_PERFECT_STRENGTH,
+            w_edge=Config.KELLY_W_EDGE,
+            w_prob=Config.KELLY_W_PROB,
+            w_grade=Config.KELLY_W_GRADE,
+            w_winrate=Config.KELLY_W_WINRATE,
+            edge_full=Config.KELLY_EDGE_FULL,
+            winrate_prior=Config.KELLY_WINRATE_PRIOR,
+            winrate_full_trust_n=Config.KELLY_WINRATE_FULL_TRUST_N,
+            max_fraction=Config.KELLY_MAX_FRACTION,
+            min_order_usd=Config.MIN_ORDER_SIZE,
+        )
+
+    def _strategy_win_rate(self, strategy: str):
+        """Realized (win_rate, n_trades) for a strategy from the PM ledger.
+
+        Returns (None, 0) when the strategy has no closed trades yet, so the
+        sizing model falls back to its neutral win-rate prior.
+        """
+        try:
+            stats = self.pm.get_per_strategy_stats() or {}
+        except Exception:
+            return None, 0
+        s = stats.get(strategy)
+        if not s:
+            return None, 0
+        n = int(s.get('trades', 0) or 0)
+        if n <= 0:
+            return None, 0
+        wins = float(s.get('wins', 0) or 0)
+        return (wins / n), n
+
+    def _strategy_size_mult(self, strategy: str) -> float:
+        """Per-strategy size bias — boost what wins, trim what bleeds."""
+        try:
+            table = getattr(Config, 'STRATEGY_SIZE_MULT', {}) or {}
+        except Exception:
+            table = {}
+        return float(table.get(strategy, 1.0))
+
+    def _ml_adjust(self, *, size_usd, city, bucket_label, entry_price, our_prob, edge):
+        """Consult the ML decision engine (finally wired into the trade path).
+
+        Returns (new_size_usd, ok, reason). A high-confidence SKIP vetoes the
+        buy (ok=False); otherwise the ML confidence scales size between
+        ML_SIZE_MIN_MULT and ML_SIZE_MAX_MULT. Safe no-op when the engine is
+        disabled / has no API key (it returns a local BUY@0.7 fallback).
+        """
+        try:
+            res = self.ml.validate_signal(
+                city, bucket_label, entry_price, our_prob, edge,
+            )
+        except Exception as e:
+            log.debug(f"ML validate failed: {e}")
+            return size_usd, True, 'ml-error→allow'
+        action = str(res.get('action', 'BUY') or 'BUY').upper()
+        conf = float(res.get('confidence', 0.5) or 0.5)
+        if action == 'SKIP' and conf >= float(getattr(Config, 'ML_VETO_CONF', 0.66)):
+            return size_usd, False, f"ML VETO {conf:.0%}: {res.get('reason', '')[:40]}"
+        lo = float(getattr(Config, 'ML_SIZE_MIN_MULT', 0.7))
+        hi = float(getattr(Config, 'ML_SIZE_MAX_MULT', 1.2))
+        mult = lo + (hi - lo) * max(0.0, min(1.0, conf))
+        return size_usd * mult, True, f"ML {action} {conf:.0%}→x{mult:.2f}"
+
+    def _can_deploy(self, size_usd: float, count_as_buy: bool = True):
+        """Portfolio guard: keep dry powder for good markets later in the scan.
+
+        Enforces a cash reserve, a max-deployed ceiling, a per-scan deploy cap,
+        and a per-scan max-buys cap. Returns (ok, why).
+        """
+        if not getattr(Config, 'PORTFOLIO_GUARD_ENABLED', True):
+            return True, 'ok'
+        try:
+            balance = self.pm.get_balance()
+            pv = self.pm.get_portfolio_value()
+        except Exception as e:
+            log.debug(f"portfolio-guard read failed: {e}")
+            return True, 'ok'
+        if pv <= 0:
+            return True, 'ok'
+        if count_as_buy and self._scan_buys >= int(getattr(Config, 'MAX_BUYS_PER_SCAN', 6)):
+            return False, f"max {Config.MAX_BUYS_PER_SCAN} buys/scan reached"
+        reserve = pv * float(getattr(Config, 'PORTFOLIO_RESERVE_PCT', 0.15))
+        if balance - size_usd < reserve:
+            return False, f"would breach {Config.PORTFOLIO_RESERVE_PCT:.0%} cash reserve (${reserve:.2f})"
+        deployed = pv - balance
+        if deployed + size_usd > pv * float(getattr(Config, 'PORTFOLIO_MAX_DEPLOY_PCT', 0.85)):
+            return False, f"would exceed {Config.PORTFOLIO_MAX_DEPLOY_PCT:.0%} deployed cap"
+        if self._scan_deployed_usd + size_usd > pv * float(getattr(Config, 'MAX_DEPLOY_PER_SCAN_PCT', 0.30)):
+            return False, f"would exceed {Config.MAX_DEPLOY_PER_SCAN_PCT:.0%} per-scan deploy cap"
+        return True, 'ok'
+
     def _resolve_station(self, market, city, lat, lon):
         """Confirm/adjust the EXACT resolution station for a market.
 
@@ -243,16 +360,29 @@ class WeatherBot:
                market_title, bucket_label, strategy, city, slug,
                resolution_time, edge=0.0, grade=None, hold_hint=False,
                early_exit_price=None, apply_grade_size=True,
-               reason='', lock_confidence=0.0, signal=''):
+               reason='', lock_confidence=0.0, signal='',
+               our_prob=0.0, use_factor_kelly=False, use_ml=False,
+               cluster_box='', count_as_buy=True):
         """Single placement path for ALL strategies.
 
-        Applies the stability GRADE (gate + size multiplier), the LIQUIDITY
-        guard (maker-at-bid entry, skip thin/wide books), then opens the
-        position and sets the grade-based exit. Returns the position or None.
+        Applies the stability GRADE (gate + size multiplier), the best-Kelly
+        FACTOR sizing (when use_factor_kelly), the ML decision engine (when
+        use_ml), the LIQUIDITY guard (maker-at-bid entry, skip thin/wide books),
+        and the PORTFOLIO guard, then opens the position and sets the
+        grade-based exit. Returns the position or None.
 
-        `apply_grade_size=False` skips the size multiplier (used by the
-        stability basket, which already scales its legs by the score) while
-        still enforcing the grade gate, liquidity guard, and exit rule.
+        `apply_grade_size=False` skips the grade size multiplier (used by
+        strategies that already size their own legs) while still enforcing the
+        grade gate, liquidity guard, and exit rule.
+
+        `use_factor_kelly=True` replaces base_size_usd with the multi-factor
+        Kelly stake (trading/sizing.py): tiered $3/$5/$10/$15 by signal strength
+        (edge + P(win) + grade + realized win-rate) × per-strategy bias.
+
+        `use_ml=True` consults the ML engine for a veto + size scale.
+
+        `cluster_box` tags a peak-cluster leg with its "Box N" group label so
+        the UI can render the basket as one unit and exempt it from stops.
 
         `reason` / `lock_confidence` / `signal` are observability metadata
         carried into the position so paper logs record WHY each buy fired.
@@ -288,9 +418,26 @@ class WeatherBot:
             log.info(f"   ⏭️  PRICE FLOOR {strategy}:{bucket_label[:18]} — ask ${entry_price:.4f} < ${Config.MIN_ENTRY_PRICE:.2f} (no exit bid)")
             return None
 
-        # -- Grade sizing --
-        mult = self._grade_multiplier(grade) if apply_grade_size else 1.0
-        size_usd = base_size_usd * mult
+        # -- SIZING --
+        # Best-Kelly factor sizing (Req-23) when the caller opts in, otherwise
+        # the legacy grade-scaled base size. Either way a per-strategy bias is
+        # applied so we lean toward the strategy that actually wins.
+        strat_mult = self._strategy_size_mult(strategy)
+        if use_factor_kelly and getattr(Config, 'KELLY_FACTOR_SIZING_ENABLED', True):
+            wr, n = self._strategy_win_rate(strategy)
+            size_usd = sizing.factor_kelly_stake(
+                edge=edge, prob_win=our_prob, balance=self.pm.get_balance(),
+                grade=grade, win_rate=wr, n_trades=n,
+                strategy_mult=strat_mult, params=self._sizing_params(),
+            )
+            log.info(f"   🎚️  KELLY {strategy}:{bucket_label[:18]} → ${size_usd:.2f} "
+                     f"[{sizing.describe(edge, our_prob, grade, wr, n, strat_mult, self._sizing_params())}]")
+            if size_usd <= 0:
+                self._funnel['kelly_zero'] += 1
+                return None
+        else:
+            mult = self._grade_multiplier(grade) if apply_grade_size else 1.0
+            size_usd = base_size_usd * mult * strat_mult
 
         # -- Liquidity AWARENESS (adapt, don't block) --
         # Read the book and adjust: enter MAKER at best_bid, trim size on
@@ -344,6 +491,29 @@ class WeatherBot:
             self._funnel['price_floor'] += 1
             log.info(f"   ⏭️  PRICE FLOOR {strategy}:{bucket_label[:18]} — maker fill ${fill_price:.4f} < ${Config.MIN_ENTRY_PRICE:.2f} (no exit bid)")
             return None
+
+        # -- ML DECISION (veto + size scale) --
+        if use_ml and getattr(Config, 'ML_DECISION_ENABLED', True):
+            size_usd, ml_ok, ml_reason = self._ml_adjust(
+                size_usd=size_usd, city=city, bucket_label=bucket_label,
+                entry_price=fill_price, our_prob=our_prob, edge=edge,
+            )
+            if not ml_ok:
+                self._funnel['ml_veto'] += 1
+                log.info(f"   🤖 {ml_reason} — skip {strategy}:{bucket_label[:18]}")
+                return None
+            log.debug(f"   🤖 {ml_reason} {strategy}:{bucket_label[:18]} → ${size_usd:.2f}")
+
+        # -- PORTFOLIO GUARD (keep dry powder for later/better markets) --
+        ok, why = self._can_deploy(size_usd, count_as_buy=count_as_buy)
+        if not ok:
+            self._funnel['portfolio_guard'] += 1
+            log.info(f"   🏦 GUARD {strategy}:{bucket_label[:18]} — {why}")
+            return None
+
+        if size_usd < Config.MIN_ORDER_SIZE:
+            self._funnel['below_min'] += 1
+            return None
         shares = size_usd / fill_price
 
         pos = self.pm.add_position(
@@ -363,9 +533,15 @@ class WeatherBot:
             grade=grade,
             lock_confidence=lock_confidence,
             signal=signal or strategy,
+            hold_to_resolution=bool(hold_hint),
+            cluster_box=cluster_box,
         )
         if pos:
             self._funnel['placed'] += 1
+            # Tally per-scan capital deployment (portfolio guard budget).
+            self._scan_deployed_usd += size_usd
+            if count_as_buy:
+                self._scan_buys += 1
             # Grade-based exit: stable/rain → hold to resolution; else take profit early.
             if hold_hint:
                 pos.take_profit_price = 0.99
@@ -578,6 +754,9 @@ class WeatherBot:
                             reason=sig.reason,
                             lock_confidence=sig.lock_confidence,
                             signal=f'late_observed_{side}',
+                            our_prob=getattr(leg, 'our_probability', 0.0),
+                            use_factor_kelly=True,   # best-Kelly factor sizing
+                            use_ml=True,             # ML veto + size scale
                         )
                         if pos:
                             self.trades_placed += 1
@@ -618,6 +797,8 @@ class WeatherBot:
                     f"→ ${fsig.target_price:.3f} ({fsig.expected_roi_pct:.0f}% ROI, "
                     f"{fsig.expected_hold_minutes}m) | {fsig.entry_reason}"
                 )
+                qf_prob = getattr(fsig, 'our_prob', 0.0)
+                qf_edge = max(0.0, qf_prob - fsig.entry_price) if qf_prob else (fsig.expected_roi_pct / 100.0)
                 pos = self._place(
                     token_id=fsig.token_id,
                     condition_id=condition_ids.get(fsig.bucket_label, ''),
@@ -629,7 +810,7 @@ class WeatherBot:
                     city=city,
                     slug=market.slug,
                     resolution_time=market.resolution_time,
-                    edge=fsig.expected_roi_pct / 100.0,
+                    edge=qf_edge,
                     grade=grade,
                     hold_hint=False,            # quick-flip EXITS into the correction
                     early_exit_price=fsig.target_price,
@@ -637,6 +818,9 @@ class WeatherBot:
                     reason=fsig.entry_reason,
                     lock_confidence=fsig.confidence,
                     signal='quick_flip',
+                    our_prob=qf_prob,
+                    use_factor_kelly=True,      # best-Kelly factor sizing
+                    use_ml=True,                # ML veto + size scale
                 )
                 if pos:
                     # Carry the flip's hold window so the loop can book-or-cut it.
@@ -645,15 +829,17 @@ class WeatherBot:
                     self.telegram.notify_trade(
                         'BUY', fsig.bucket_label, pos.entry_price,
                         pos.cost_usd, pos.shares, 'quick_flip',
-                        edge=fsig.expected_roi_pct / 100.0, city=city,
+                        edge=qf_edge, city=city,
                     )
 
         # ------------------------------------------------------
         # PEAK CLUSTER — parallel adjacent-bucket basket around the estimated
-        # peak. Buys 3-5 neighbouring buckets whose COMBINED per-share cost is
-        # < $1, so any single winning leg profits after fees. Forecast-based →
-        # skipped once the extreme is locked (no edge in the lock window).
-        # Runs alongside the other strategies without disturbing them.
+        # peak. Buys 2-7 neighbouring buckets whose COMBINED per-share cost is
+        # < PEAK_CLUSTER_MAX_COST, so ANY single winning leg profits after fees.
+        # HOLDS TO RESOLUTION (never stop-lossed/trailed — the basket only works
+        # if every leg rides to settlement). Forecast-based → skipped once the
+        # extreme is locked. Each basket is grouped as "Peak Cluster Box N":
+        # ONE Telegram alert + one status group for all its legs.
         # ------------------------------------------------------
         if getattr(Config, 'PEAK_CLUSTER_ENABLED', True) and (
             not in_lock_window or getattr(Config, 'PEAK_CLUSTER_TRADE_DECIDED', False)
@@ -668,7 +854,11 @@ class WeatherBot:
                 log.debug(f"peak_cluster eval failed {city}: {e}")
             for sig in cluster_signals:
                 self.signals_generated += 1
-                log.info(f"   🧺 CLUSTER {city} | {sig.reason}")
+                # Reserve the next box label for this basket (peek; commit only
+                # if at least one leg actually fills).
+                box_label = self.pm.peek_cluster_box()
+                log.info(f"   🧺 CLUSTER {city} [{box_label}] | {sig.reason}")
+                placed_legs = []
                 for leg in sig.legs:
                     if not leg.token_id:
                         continue
@@ -685,19 +875,39 @@ class WeatherBot:
                         resolution_time=market.resolution_time,
                         edge=sig.combined_prob - sig.total_cost,
                         grade=grade,
-                        hold_hint=True,          # basket pays off at resolution
+                        hold_hint=True,          # basket pays off at resolution (NEVER stop/trail)
                         early_exit_price=early_exit_price,
-                        apply_grade_size=False,  # cluster sizes its own legs
+                        apply_grade_size=False,  # cluster sizes its own legs (equal-share basket math)
                         reason=sig.reason,
                         signal='peak_cluster',
+                        our_prob=getattr(leg, 'prob', 0.0),
+                        use_factor_kelly=False,  # keep the basket's equal-share legs intact
+                        use_ml=False,            # the basket is ONE unit; don't veto single legs
+                        cluster_box=box_label,
+                        count_as_buy=False,      # whole basket counts as ONE buy (below)
                     )
                     if pos:
                         self.trades_placed += 1
-                        self.telegram.notify_trade(
-                            'BUY', leg.bucket_label, pos.entry_price,
-                            pos.cost_usd, pos.shares, 'peak_cluster',
-                            edge=sig.combined_prob - sig.total_cost, city=city,
+                        placed_legs.append(pos)
+                if placed_legs:
+                    # Consume the box number and tag every placed leg with it.
+                    committed = self.pm.commit_cluster_box()
+                    for lp in placed_legs:
+                        lp.cluster_box = committed
+                    # Whole basket = ONE buy toward the per-scan budget.
+                    self._scan_buys += 1
+                    try:
+                        self.pm._save_state()
+                    except Exception:
+                        pass
+                    # ONE grouped Telegram alert for the whole basket (no per-leg spam).
+                    try:
+                        self.telegram.notify_cluster(
+                            committed, city, market.title, placed_legs,
+                            sig.total_cost, sig.combined_prob, sig.expected_roi_pct,
                         )
+                    except Exception as e:
+                        log.debug(f"cluster notify failed: {e}")
 
         # ------------------------------------------------------
         # PEAK BASKET — forecast-only directional-peak strategy (DEMOTED, opt-in).
@@ -835,12 +1045,15 @@ class WeatherBot:
             log.info(f"     ✅ placed={placed}   ⛔ add-skip dup/min/bal={f.get('add_reject', 0)}")
             log.info(f"     ⏭️  price_floor={f.get('price_floor', 0)}  dust={f.get('dust', 0)}  "
                      f"grade_skip={f.get('grade_skip', 0)}  liq_skip={f.get('liq_skip', 0)}")
+            log.info(f"     🏦 portfolio_guard={f.get('portfolio_guard', 0)}  🤖 ml_veto={f.get('ml_veto', 0)}  "
+                     f"🎚️ kelly_zero={f.get('kelly_zero', 0)}  below_min={f.get('below_min', 0)}")
             log.info(f"     💧 liq_thin_hold={f.get('liq_thin', 0)}  liq_nobook_hold={f.get('liq_nobook', 0)}")
             log.info(f"     🔓 lock_window={f.get('lock_window', 0)}  ⛔ over={f.get('over', 0)}  "
                      f"🌡️  primary_signal={f.get('primary_signal', 0)}  🌙 primary_no_data={f.get('primary_no_data', 0)}")
             log.info(f"     ⚠️  no_forecast={f.get('no_forecast', 0)}  no_coords={f.get('no_coords', 0)}")
         deployed = stats['portfolio_value'] - stats['balance']
-        log.info(f"  💰 deployed ${deployed:.2f} across {len(open_pos)} pos | free ${stats['balance']:.2f}")
+        log.info(f"  💰 deployed ${deployed:.2f} across {len(open_pos)} pos | free ${stats['balance']:.2f} "
+                 f"| this scan: {self._scan_buys} buys / ${self._scan_deployed_usd:.2f}")
         log.info(f"{'─'*60}")
 
         if open_pos:
@@ -849,10 +1062,11 @@ class WeatherBot:
                 pnl_e = '+' if p.unrealized_pnl >= 0 else ''
                 lock = ' 🔒' if getattr(p, 'preclose_locked', False) else ''
                 stale = ' ~stale' if getattr(p, 'current_price_stale', False) else ''
+                box = f" [{p.cluster_box}]" if getattr(p, 'cluster_box', '') else ''
                 log.info(
                     f"    {pnl_e} {p.city:12} {p.bucket_label[:30]:30} "
                     f"${p.entry_price:.4f}->${p.current_price:.4f} "
-                    f"({p.roi_pct:+.0f}%){lock}{stale}"
+                    f"({p.roi_pct:+.0f}%){box}{lock}{stale}"
                 )
 
         if pending:
