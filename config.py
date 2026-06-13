@@ -132,10 +132,70 @@ class Config:
     # "Stop-loss" only applies to LOCK-IN trades that went wrong
     STOP_LOSS_PCT = float(os.getenv('STOP_LOSS_PCT', '-95'))  # almost never triggers
     TRAILING_STOP_PCT = float(os.getenv('TRAILING_STOP_PCT', '30'))
+    # Only arm the trailing stop after a BIG run-up (peak >= this multiple of
+    # entry). Higher = give winners more room before a trailing exit can fire.
+    # The user flagged trailing/stop exits cutting good positions too early.
+    TRAILING_MIN_PEAK_MULT = float(os.getenv('TRAILING_MIN_PEAK_MULT', '3.0'))
     # PROFIT-TAKE: sell if price rises above this BEFORE resolution (early profit)
     EARLY_PROFIT_THRESHOLD = float(os.getenv('EARLY_PROFIT_THRESHOLD', '0.60'))
     # For confident strategy: never sell (hold to resolution)
     CONFIDENT_NEVER_SELL = os.getenv('CONFIDENT_NEVER_SELL', '1') == '1'
+
+    # ===================================================================
+    # BEST-KELLY FACTOR SIZING (trading/sizing.py) — multi-factor allocation.
+    # Replaces the flat %-Kelly that dumped ~25% of balance on the first signal
+    # and starved later (better) markets. Stake now scales with a composite
+    # signal-strength score (edge + win-probability + grade + realized win-rate)
+    # onto an ABSOLUTE-USD tier ladder: base $3, good $5, very good $10, perfect
+    # $15 MAX per position. A portfolio RESERVE + per-scan deploy caps keep cash
+    # for opportunities that appear later in the same scan.
+    # ===================================================================
+    KELLY_FACTOR_SIZING_ENABLED = os.getenv('KELLY_FACTOR_SIZING_ENABLED', '1') == '1'
+    KELLY_TIER_BASE_USD = float(os.getenv('KELLY_TIER_BASE_USD', '3.0'))       # weakest valid signal
+    KELLY_TIER_GOOD_USD = float(os.getenv('KELLY_TIER_GOOD_USD', '5.0'))       # good signal
+    KELLY_TIER_VGOOD_USD = float(os.getenv('KELLY_TIER_VGOOD_USD', '10.0'))    # very good signal
+    KELLY_TIER_PERFECT_USD = float(os.getenv('KELLY_TIER_PERFECT_USD', '15.0'))  # perfect signal (HARD MAX)
+    KELLY_GOOD_STRENGTH = float(os.getenv('KELLY_GOOD_STRENGTH', '0.40'))      # strength >= -> good tier
+    KELLY_VGOOD_STRENGTH = float(os.getenv('KELLY_VGOOD_STRENGTH', '0.65'))    # strength >= -> very-good tier
+    KELLY_PERFECT_STRENGTH = float(os.getenv('KELLY_PERFECT_STRENGTH', '0.85'))  # strength >= -> perfect tier
+    KELLY_W_EDGE = float(os.getenv('KELLY_W_EDGE', '0.35'))                    # weight: post-fee edge
+    KELLY_W_PROB = float(os.getenv('KELLY_W_PROB', '0.25'))                    # weight: P(win)
+    KELLY_W_GRADE = float(os.getenv('KELLY_W_GRADE', '0.20'))                  # weight: stability grade
+    KELLY_W_WINRATE = float(os.getenv('KELLY_W_WINRATE', '0.20'))             # weight: realized strategy win-rate
+    KELLY_EDGE_FULL = float(os.getenv('KELLY_EDGE_FULL', '0.25'))              # edge counted as max strength
+    KELLY_WINRATE_PRIOR = float(os.getenv('KELLY_WINRATE_PRIOR', '0.45'))      # win-rate prior before enough trades
+    KELLY_WINRATE_FULL_TRUST_N = int(os.getenv('KELLY_WINRATE_FULL_TRUST_N', '20'))  # trades to fully trust observed WR
+    KELLY_MAX_FRACTION = float(os.getenv('KELLY_MAX_FRACTION', '0.25'))        # per-trade safety cap vs live balance
+
+    # PORTFOLIO GUARD — stop the "allocates all funds immediately" drain. Keep a
+    # cash reserve, cap how much of the portfolio is deployed, and cap how much
+    # NEW money + how many NEW buys a single scan may place, so capital is left
+    # for the good markets that appear later in the same scan.
+    PORTFOLIO_GUARD_ENABLED = os.getenv('PORTFOLIO_GUARD_ENABLED', '1') == '1'
+    PORTFOLIO_RESERVE_PCT = float(os.getenv('PORTFOLIO_RESERVE_PCT', '0.15'))  # always keep >= this % of portfolio in cash
+    PORTFOLIO_MAX_DEPLOY_PCT = float(os.getenv('PORTFOLIO_MAX_DEPLOY_PCT', '0.85'))  # never deploy beyond this % of portfolio
+    MAX_DEPLOY_PER_SCAN_PCT = float(os.getenv('MAX_DEPLOY_PER_SCAN_PCT', '0.30'))  # new $ per scan <= this % of portfolio
+    MAX_BUYS_PER_SCAN = int(os.getenv('MAX_BUYS_PER_SCAN', '6'))               # max NEW buys placed in one scan
+
+    # PER-STRATEGY SIZE MULTIPLIER — lean toward what wins, away from what loses.
+    # peak_cluster is the only net-positive strategy in the logs -> boost it;
+    # late_observed_yes was 0% WR over 21 trades -> shrink it. 1.0 = neutral.
+    STRATEGY_SIZE_MULT = {
+        'peak_cluster': float(os.getenv('SIZE_MULT_PEAK_CLUSTER', '1.25')),
+        'late_observed_yes': float(os.getenv('SIZE_MULT_LATE_OBSERVED_YES', '0.6')),
+        'late_observed_no': float(os.getenv('SIZE_MULT_LATE_OBSERVED_NO', '1.0')),
+        'quick_flip': float(os.getenv('SIZE_MULT_QUICK_FLIP', '1.0')),
+    }
+
+    # ML SIZING/VETO INFLUENCE — the ML engine (ml/decision_engine.py) is now
+    # actually consulted on the trade path (it was wired but never called).
+    # A SKIP with high confidence vetoes the buy; otherwise its confidence
+    # scales size between MIN and MAX mult. Safe no-op when ML_API_KEY is unset
+    # (the engine returns a local BUY@0.7 fallback, so nothing is blocked).
+    ML_DECISION_ENABLED = os.getenv('ML_DECISION_ENABLED', '1') == '1'
+    ML_VETO_CONF = float(os.getenv('ML_VETO_CONF', '0.66'))                    # SKIP with conf >= this vetoes the buy
+    ML_SIZE_MIN_MULT = float(os.getenv('ML_SIZE_MIN_MULT', '0.7'))            # size mult at low ML confidence
+    ML_SIZE_MAX_MULT = float(os.getenv('ML_SIZE_MAX_MULT', '1.2'))            # size mult at high ML confidence
 
     # ===================================================================
     # FEATURE TOGGLES (enable/disable without breaking anything)
@@ -190,7 +250,7 @@ class Config:
     # ~$25" drain — MAX_FRACTION above is now only a per-trade SAFETY cap vs the
     # live balance, not the sizing target. Tune the ladder here.
     LATE_OBSERVED_SIZE_FLOOR_USD = float(os.getenv('LATE_OBSERVED_SIZE_FLOOR_USD', '3.0'))   # weakest valid signal (~$3-4)
-    LATE_OBSERVED_SIZE_MAX_USD = float(os.getenv('LATE_OBSERVED_SIZE_MAX_USD', '20.0'))      # strongest signal (~$20)
+    LATE_OBSERVED_SIZE_MAX_USD = float(os.getenv('LATE_OBSERVED_SIZE_MAX_USD', '15.0'))      # strongest signal (HARD MAX $15)
     LATE_OBSERVED_EDGE_FULL = float(os.getenv('LATE_OBSERVED_EDGE_FULL', '0.25'))            # post-fee edge counted as max strength
     LATE_OBSERVED_W_EDGE = float(os.getenv('LATE_OBSERVED_W_EDGE', '0.6'))                   # weight of edge in the strength score
     LATE_OBSERVED_W_GRADE = float(os.getenv('LATE_OBSERVED_W_GRADE', '0.4'))                 # weight of grade in the strength score
@@ -259,14 +319,18 @@ class Config:
     SNIPER_MIN_PROBABILITY = float(os.getenv('SNIPER_MIN_PROBABILITY', '0.12'))
 
     # ===================================================================
-    # QUICK_FLIP v2 — run-boundary forecast-change flip (book-or-cut exit).
-    # Fires only when a NEW forecast RUN actually moves the ensemble mean (not
-    # cycle noise). KEEPS BOTH entry paths: a genuine forecast move AND a stale
-    # market (stale adds a confidence BOOST, it is NOT a hard gate). Dedups
-    # re-signals, sizes small, and TRULY exits via book-or-cut at the hold cap.
-    # All values below equal the in-code getattr defaults — editable here now.
+    # QUICK_FLIP v2 — run-boundary forecast-change flip + EARLY-MISPRICING entry.
+    # KEEPS BOTH entry paths: (a) an early/opening mispricing where a bucket's
+    # model probability sits well above its market price (edge >= MIN_EDGE), and
+    # (b) a NEW forecast RUN that moved the ensemble mean (run-change = BOOST,
+    # not a hard gate). Stale book + publish window add confidence BOOSTS. Dedups
+    # re-signals, sizes small, caps candidates per market, and TRULY exits via
+    # book-or-cut at the hold cap. All values below equal the in-code getattr
+    # defaults — editable here now.
     # ===================================================================
     QUICK_FLIP_MIN_DELTA_C = float(os.getenv('QUICK_FLIP_MIN_DELTA_C', '1.0'))            # min ensemble-mean move (C) across runs to signal
+    QUICK_FLIP_MIN_EDGE = float(os.getenv('QUICK_FLIP_MIN_EDGE', '0.08'))                 # early-mispricing entry: model prob - price >= this
+    QUICK_FLIP_MAX_PER_MARKET = int(os.getenv('QUICK_FLIP_MAX_PER_MARKET', '3'))          # cap flip candidates per market per scan
     QUICK_FLIP_MIN_CONFIDENCE = float(os.getenv('QUICK_FLIP_MIN_CONFIDENCE', '0.6'))      # min confidence required after boosts
     QUICK_FLIP_MAX_ENTRY = float(os.getenv('QUICK_FLIP_MAX_ENTRY', '0.85'))               # don't chase an already-priced bucket
     QUICK_FLIP_MAX_HOLD_MIN = int(os.getenv('QUICK_FLIP_MAX_HOLD_MIN', '120'))            # book-or-cut after this many minutes
@@ -285,15 +349,16 @@ class Config:
     # PEAK_CLUSTER — NEW parallel any-one-wins basket. Estimate the peak bucket
     # (argmax model probability), buy a window of adjacent buckets whose
     # COMBINED per-share cost stays below PEAK_CLUSTER_MAX_COST, so ANY single
-    # winning leg pays $1 > cost = net profit after fees. Holds to resolution.
-    # Runs ALONGSIDE the other strategies (parallel, non-disturbing). ON by
-    # default; set PEAK_CLUSTER_ENABLED=0 to disable. Values = code defaults.
+    # winning leg pays $1 > cost = net profit after fees. HOLDS TO RESOLUTION
+    # (never stop-lossed/trailed — the whole basket only works if every leg rides
+    # to settlement). Widened per Req-23: span +/-3, up to 7 legs, combined cost
+    # up to 0.97 ("under 95-97¢ after fees is OK"). Runs ALONGSIDE the others.
     # ===================================================================
     PEAK_CLUSTER_ENABLED = os.getenv('PEAK_CLUSTER_ENABLED', '1') == '1'
-    PEAK_CLUSTER_SPAN = int(os.getenv('PEAK_CLUSTER_SPAN', '2'))                          # +/- buckets around the estimated peak
-    PEAK_CLUSTER_MAX_COST = float(os.getenv('PEAK_CLUSTER_MAX_COST', str(BASKET_MAX_COST)))  # combined per-share cost ceiling (defaults to BASKET_MAX_COST)
+    PEAK_CLUSTER_SPAN = int(os.getenv('PEAK_CLUSTER_SPAN', '3'))                          # +/- buckets around the estimated peak
+    PEAK_CLUSTER_MAX_COST = float(os.getenv('PEAK_CLUSTER_MAX_COST', '0.97'))             # combined per-share cost ceiling (any win still profits after fees)
     PEAK_CLUSTER_MIN_LEGS = int(os.getenv('PEAK_CLUSTER_MIN_LEGS', '2'))                  # minimum legs for a valid basket
-    PEAK_CLUSTER_MAX_LEGS = int(os.getenv('PEAK_CLUSTER_MAX_LEGS', '5'))                  # cap legs at 3-5 per the design
+    PEAK_CLUSTER_MAX_LEGS = int(os.getenv('PEAK_CLUSTER_MAX_LEGS', '7'))                  # 2-7 neighbouring buckets per the design
     PEAK_CLUSTER_MIN_EDGE = float(os.getenv('PEAK_CLUSTER_MIN_EDGE', '0.03'))             # combined prob - cost minimum
     PEAK_CLUSTER_MIN_CONF = float(os.getenv('PEAK_CLUSTER_MIN_CONF', '0.55'))             # min center-bucket confidence
     PEAK_CLUSTER_MAX_CENTER_PRICE = float(os.getenv('PEAK_CLUSTER_MAX_CENTER_PRICE', '0.85'))  # skip if the peak is already fully priced
@@ -496,19 +561,27 @@ class Config:
         print(f"Primary:     LateObserved {'ON' if cls.LATE_OBSERVED_ENABLED else 'OFF'} "
               f"(NO-side {'ON' if cls.LATE_OBSERVED_NO_SIDE else 'OFF'}, "
               f"size ${cls.LATE_OBSERVED_SIZE_FLOOR_USD:.0f}-${cls.LATE_OBSERVED_SIZE_MAX_USD:.0f})")
+        print(f"Kelly:       factor-sizing {'ON' if cls.KELLY_FACTOR_SIZING_ENABLED else 'OFF'} "
+              f"(tiers ${cls.KELLY_TIER_BASE_USD:.0f}/${cls.KELLY_TIER_GOOD_USD:.0f}/"
+              f"${cls.KELLY_TIER_VGOOD_USD:.0f}/${cls.KELLY_TIER_PERFECT_USD:.0f})")
+        print(f"Portfolio:   guard {'ON' if cls.PORTFOLIO_GUARD_ENABLED else 'OFF'} "
+              f"(reserve {cls.PORTFOLIO_RESERVE_PCT:.0%}, per-scan {cls.MAX_DEPLOY_PER_SCAN_PCT:.0%}, "
+              f"max {cls.MAX_BUYS_PER_SCAN} buys)")
+        print(f"ML:          decision {'ON' if cls.ML_DECISION_ENABLED else 'OFF'} "
+              f"(veto>={cls.ML_VETO_CONF:.0%}, size x{cls.ML_SIZE_MIN_MULT}-{cls.ML_SIZE_MAX_MULT})")
         print(f"QuickFlip:   {'ON' if cls.QUICK_FLIP_ENABLED else 'OFF'} "
-              f"(<{cls.QUICK_FLIP_MIN_DELTA_C}C move, hold<={cls.QUICK_FLIP_MAX_HOLD_MIN}m, max {cls.QUICK_FLIP_MAX_CONCURRENT})")
+              f"(edge>={cls.QUICK_FLIP_MIN_EDGE:.0%} or run-change, hold<={cls.QUICK_FLIP_MAX_HOLD_MIN}m, max {cls.QUICK_FLIP_MAX_CONCURRENT})")
         print(f"PeakCluster: {'ON' if cls.PEAK_CLUSTER_ENABLED else 'OFF'} "
-              f"(span+/-{cls.PEAK_CLUSTER_SPAN}, {cls.PEAK_CLUSTER_MIN_LEGS}-{cls.PEAK_CLUSTER_MAX_LEGS} legs, cost<{cls.PEAK_CLUSTER_MAX_COST})")
+              f"(span+/-{cls.PEAK_CLUSTER_SPAN}, {cls.PEAK_CLUSTER_MIN_LEGS}-{cls.PEAK_CLUSTER_MAX_LEGS} legs, cost<{cls.PEAK_CLUSTER_MAX_COST}, HOLD)")
         print(f"ThesisExit:  {'ON' if cls.THESIS_EXIT_ENABLED else 'OFF'} "
               f"(only ROI<={cls.THESIS_EXIT_MAX_ROI_PCT:.0f}% & entry>={cls.THESIS_EXIT_MIN_ENTRY_PRICE})")
+        print(f"Trailing:    {cls.TRAILING_STOP_PCT:.0f}% from peak, armed after {cls.TRAILING_MIN_PEAK_MULT}x entry")
         print(f"Lock-window: LateObs={'Y' if cls.LATE_OBSERVED_TRADE_DECIDED else 'N'} "
               f"Flip={'Y' if cls.QUICK_FLIP_TRADE_DECIDED else 'N'} "
               f"Peak={'Y' if cls.PEAK_BASKET_TRADE_DECIDED else 'N'} "
               f"Cluster={'Y' if cls.PEAK_CLUSTER_TRADE_DECIDED else 'N'} "
               f"Confident={'Y' if cls.CONFIDENT_TRADE_DECIDED else 'N'}")
         print(f"Min Edge:    {cls.MIN_EDGE_TO_ENTER*100:.0f}% | fee-aware taker={cls.ASSUME_TAKER_FILLS}")
-        print(f"Kelly:       {cls.KELLY_FRACTION}")
         print(f"Liquidity:   {'STRICT' if cls.LIQUIDITY_STRICT_BLOCK else 'adaptive'} (thin x{cls.LIQUIDITY_THIN_SIZE_MULT})")
         print(f"Paper:       realistic-fill={cls.PAPER_REALISTIC_FILL} preclose>={cls.PAPER_PRECLOSE_LOCK_PCT:.0%} freeze={cls.PAPER_FREEZE_ON_BAD_PRICE}")
         print(f"Resolve:     station-verify={'ON' if cls.RESOLUTION_VERIFY_ENABLED else 'OFF'} (min_conf={cls.RESOLUTION_VERIFY_MIN_CONF})")
