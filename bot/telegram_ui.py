@@ -4,9 +4,10 @@ Telegram Bot Integration — Notifications + Commands.
 Features:
 - Send trade alerts (entry, exit, win, loss)
 - Detailed redemption alerts (full market, entry/exit, profit/PnL)
+- ONE grouped "Peak Cluster Box N" alert per basket (not one per leg)
 - Send daily summary
 - Commands: /status, /positions, /balance, /pnl, /markets, /stop
-- Paginated + sortable positions view (10 per page)
+- Paginated + sortable positions view (10 per page), peak-cluster legs grouped
 - Non-blocking (runs in background thread)
 """
 
@@ -60,9 +61,9 @@ class TelegramBot:
         """HTML-escape dynamic text so market names with &/</> don't break parse."""
         return html.escape(str(s if s is not None else ''))
 
-    # ══════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════
     # SEND MESSAGES
-    # ══════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════
 
     def send(self, text: str, parse_mode: str = 'HTML', reply_markup: dict = None) -> bool:
         """Send a message to the configured chat (optionally with an inline keyboard)."""
@@ -133,6 +134,98 @@ class TelegramBot:
         mode = '📋 PAPER' if Config.is_paper() else '🔴 LIVE'
         msg += f"\n{mode}"
         self.send(msg)
+
+    def notify_cluster(self, box_label: str, city: str, market_title: str,
+                       legs: List, total_cost: float, combined_prob: float,
+                       roi_pct: float):
+        """ONE grouped alert for a whole peak-cluster basket.
+
+        Replaces the old behaviour of firing a separate notify_trade per leg
+        (6 buckets => 6 messages). Now a single "🧺 PEAK CLUSTER Box N" message
+        lists every bucket bought, the combined basket cost, and the any-one-
+        wins ROI. `legs` is the list of placed TrackedPositions in the basket.
+        """
+        try:
+            n = len(legs)
+            total_cost_usd = sum(getattr(l, 'cost_usd', 0.0) or 0.0 for l in legs)
+            head = (
+                f"🧺 <b>PEAK CLUSTER {self._esc(box_label)}</b> — {n} bucket{'s' if n != 1 else ''}\n"
+                f"📍 {self._esc(city)} | {self._esc((market_title or '')[:60])}\n"
+            )
+            lines = []
+            for l in legs:
+                lines.append(
+                    f"   • {self._esc(getattr(l, 'bucket_label', ''))} "
+                    f"@ ${getattr(l, 'entry_price', 0.0):.3f} × "
+                    f"{getattr(l, 'shares', 0.0):.0f} = ${getattr(l, 'cost_usd', 0.0):.2f}\n"
+                )
+            foot = (
+                f"💰 basket cost ${total_cost_usd:.2f} "
+                f"(per-share ${total_cost:.3f}) | P(any)~{combined_prob:.0%}\n"
+                f"🎯 ROI ~{roi_pct:.0f}% if ANY bucket wins | holds → resolution "
+                f"(never stop-lossed)\n"
+            )
+            mode = '📋 PAPER' if Config.is_paper() else '🔴 LIVE'
+            self.send(head + ''.join(lines) + foot + f"\n{mode}")
+        except Exception as e:
+            log.debug(f"notify_cluster failed: {e}")
+
+    def notify_cluster_resolution(self, box_label: str, legs: List):
+        """ONE grouped resolution summary for a peak-cluster basket once EVERY
+        leg has settled. Shows which bucket WON and the amount it won, plus the
+        losing buckets and their loss, and the net basket PnL. Replaces the
+        per-leg won/lost spam for cluster baskets.
+
+        `legs` is the list of resolved TrackedPositions in the basket (fed by
+        PositionManager._maybe_notify_cluster_close once none are open/pending).
+        """
+        try:
+            if not legs:
+                return
+            city = self._esc(getattr(legs[0], 'city', ''))
+            market_title = self._esc((getattr(legs[0], 'market_title', '') or '')[:60])
+            winners = [l for l in legs if getattr(l, 'status', '') in ('won', 'redeemed')]
+            losers = [l for l in legs if getattr(l, 'status', '') == 'lost']
+            others = [l for l in legs if l not in winners and l not in losers]
+            net = sum(getattr(l, 'pnl', 0.0) or 0.0 for l in legs)
+            cost = sum(getattr(l, 'cost_usd', 0.0) or 0.0 for l in legs)
+            ret = cost + net
+            head_emoji = '✅' if net >= 0 else '🔴'
+            head = (
+                f"{head_emoji} 🧺 <b>PEAK CLUSTER {self._esc(box_label)} RESOLVED</b>\n"
+                f"📍 {city} | {market_title}\n"
+            )
+            lines = []
+            if winners:
+                for l in winners:
+                    payout = (getattr(l, 'shares', 0.0) or 0.0) * 1.0
+                    lines.append(
+                        f"   ✅ WON {self._esc(getattr(l, 'bucket_label', ''))} "
+                        f"→ ${getattr(l, 'pnl', 0.0):+.2f} "
+                        f"(entry ${getattr(l, 'entry_price', 0.0):.3f} × "
+                        f"{getattr(l, 'shares', 0.0):.0f}sh → payout ${payout:.2f})\n"
+                    )
+            else:
+                lines.append("   ⚠️ No winning bucket in this basket.\n")
+            for l in losers:
+                lines.append(
+                    f"   ❌ {self._esc(getattr(l, 'bucket_label', ''))} "
+                    f"→ ${getattr(l, 'pnl', 0.0):+.2f} "
+                    f"(cost ${getattr(l, 'cost_usd', 0.0):.2f} lost)\n"
+                )
+            for l in others:
+                lines.append(
+                    f"   • {self._esc(getattr(l, 'bucket_label', ''))} "
+                    f"→ ${getattr(l, 'pnl', 0.0):+.2f} ({self._esc(getattr(l, 'status', ''))})\n"
+                )
+            foot = (
+                f"💰 <b>Basket net PnL ${net:+.2f}</b> "
+                f"(cost ${cost:.2f} → return ${ret:.2f})\n"
+            )
+            mode = '📋 PAPER' if Config.is_paper() else '🔴 LIVE'
+            self.send(head + ''.join(lines) + foot + f"\n{mode}")
+        except Exception as e:
+            log.debug(f"notify_cluster_resolution failed: {e}")
 
     def notify_resolution(self, won: bool, bucket_label: str, pnl: float, city: str = ''):
         """Send simple resolution notification (kept for compatibility)."""
@@ -245,20 +338,48 @@ class TelegramBot:
         )
         self.send(msg)
 
-    # ══════════════════════════════════════════════════════════════════
-    # POSITIONS VIEW (paginated + sortable)
-    # ══════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════
+    # POSITIONS VIEW (paginated + sortable, peak-cluster legs GROUPED)
+    # ═══════════════════════════════════════════════════════════════
 
-    def _sorted_open(self, sort_key: str) -> List:
+    def _open_units(self, sort_key: str) -> List[dict]:
+        """Group open positions into display UNITS so a peak-cluster basket shows
+        as ONE entry ("Box N" + all its legs) instead of N separate rows.
+
+        Each unit: {kind, box, positions, pnl, roi, recent}. Non-cluster
+        positions are single-position units. Units are sorted as a whole.
+        """
         open_pos = self.pm.get_open_positions() if self.pm else []
+        clusters: Dict[str, list] = {}
+        units: List[dict] = []
+        for p in open_pos:
+            box = getattr(p, 'cluster_box', '') or ''
+            if box and getattr(p, 'strategy', '') == 'peak_cluster':
+                clusters.setdefault(box, []).append(p)
+            else:
+                units.append({
+                    'kind': 'single', 'box': '', 'positions': [p],
+                    'pnl': p.unrealized_pnl, 'roi': p.roi_pct,
+                    'recent': p.entry_time,
+                })
+        for box, legs in clusters.items():
+            pnl = sum(l.unrealized_pnl for l in legs)
+            cost = sum(l.cost_usd for l in legs)
+            roi = (pnl / cost * 100.0) if cost > 0 else 0.0
+            recent = max(l.entry_time for l in legs)
+            units.append({
+                'kind': 'cluster', 'box': box, 'positions': legs,
+                'pnl': pnl, 'roi': roi, 'recent': recent,
+            })
         if sort_key == 'pnl':
-            return sorted(open_pos, key=lambda p: p.unrealized_pnl, reverse=True)
-        if sort_key == 'loss':
-            return sorted(open_pos, key=lambda p: p.unrealized_pnl)
-        if sort_key == 'roi':
-            return sorted(open_pos, key=lambda p: p.roi_pct, reverse=True)
-        # 'recent' (default): newest entry first
-        return sorted(open_pos, key=lambda p: p.entry_time, reverse=True)
+            units.sort(key=lambda u: u['pnl'], reverse=True)
+        elif sort_key == 'loss':
+            units.sort(key=lambda u: u['pnl'])
+        elif sort_key == 'roi':
+            units.sort(key=lambda u: u['roi'], reverse=True)
+        else:  # 'recent'
+            units.sort(key=lambda u: u['recent'], reverse=True)
+        return units
 
     def _fmt_position(self, p, idx: int) -> str:
         pe = '🟢' if p.unrealized_pnl >= 0 else '🔴'
@@ -273,15 +394,41 @@ class TelegramBot:
             f"{p.shares:.0f}sh | cost ${p.cost_usd:.2f} | {self._esc(p.strategy)}\n\n"
         )
 
+    def _fmt_cluster_unit(self, unit: dict, idx: int) -> str:
+        """Render a whole peak-cluster basket as ONE grouped block: a "Box N"
+        header with the aggregate PnL, then each bucket leg indented under it."""
+        legs = unit['positions']
+        pe = '🟢' if unit['pnl'] >= 0 else '🔴'
+        city = self._esc(getattr(legs[0], 'city', '') if legs else '')
+        cost = sum(l.cost_usd for l in legs)
+        out = (
+            f"{idx}. {pe} 🧺 <b>Peak Cluster {self._esc(unit['box'])}</b> — {city}  "
+            f"${unit['pnl']:+.2f} ({unit['roi']:+.0f}%)\n"
+            f"   {len(legs)} buckets | cost ${cost:.2f} | hold → resolution\n"
+        )
+        for l in legs:
+            name = self._esc(l.bucket_label or l.market_title)
+            out += (
+                f"      • {name}: ${l.entry_price:.3f}→${l.current_price:.3f} "
+                f"{l.shares:.0f}sh (${l.unrealized_pnl:+.2f})\n"
+            )
+        out += "\n"
+        return out
+
     def _positions_view(self, page: int = 0, sort: str = 'recent',
                         with_summary: bool = False):
-        """Build (text, inline_keyboard) for a page of open positions."""
-        positions = self._sorted_open(sort)
-        total = len(positions)
-        pages = max(1, (total + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        """Build (text, inline_keyboard) for a page of open positions.
+
+        Pagination is by display UNIT (a peak-cluster basket counts as one
+        unit), so a 6-leg basket no longer eats 6 of the 10 page slots.
+        """
+        units = self._open_units(sort)
+        total_units = len(units)
+        total_pos = sum(len(u['positions']) for u in units)
+        pages = max(1, (total_units + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
         page = max(0, min(page, pages - 1))
         start = page * self.PAGE_SIZE
-        chunk = positions[start:start + self.PAGE_SIZE]
+        chunk = units[start:start + self.PAGE_SIZE]
 
         text = ''
         if with_summary and self.pm:
@@ -297,13 +444,16 @@ class TelegramBot:
             )
         sort_name = self._SORT_NAMES.get(sort, sort)
         shown_to = start + len(chunk)
-        text += (f"<b>Open positions {start + 1}–{shown_to} of {total}</b> "
-                 f"· sorted: {sort_name}\n\n")
+        text += (f"<b>Open {start + 1}–{shown_to} of {total_units} "
+                 f"({total_pos} positions)</b> · sorted: {sort_name}\n\n")
         if not chunk:
             text += "No open positions.\n"
         else:
-            for i, p in enumerate(chunk, start=start + 1):
-                text += self._fmt_position(p, i)
+            for i, u in enumerate(chunk, start=start + 1):
+                if u['kind'] == 'cluster':
+                    text += self._fmt_cluster_unit(u, i)
+                else:
+                    text += self._fmt_position(u['positions'][0], i)
 
         sm = '1' if with_summary else '0'
         nav = []
@@ -370,9 +520,9 @@ class TelegramBot:
         )
         self.send(msg)
 
-    # ══════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════
     # COMMAND HANDLER (polls for incoming commands)
-    # ══════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════
 
     def start_polling(self):
         """Start polling for commands in a background thread."""
@@ -438,9 +588,9 @@ class TelegramBot:
         except Exception:
             pass
 
-    # ══════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════
     # SETTINGS PANEL (live tunables + tick-box toggles)
-    # ══════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════
 
     _LABELS = {
         'TRADING_ENABLED': 'Trading', 'SNIPER_ENABLED': 'Sniper',
@@ -497,96 +647,3 @@ class TelegramBot:
         # Positions pager/sorter: "pos:<page>:<sort>:<with_summary>"
         if data.startswith('pos:'):
             try:
-                _, page_s, sort_key, sm = data.split(':')
-                page = int(page_s)
-            except (ValueError, IndexError):
-                self._answer_callback(callback_id)
-                return
-            self._answer_callback(callback_id)
-            self.send_positions(page=page, sort=sort_key,
-                                with_summary=(sm == '1'),
-                                edit_message_id=message_id)
-            return
-
-        try:
-            action, key = data.split(':', 1)
-        except ValueError:
-            self._answer_callback(callback_id)
-            return
-        ok, msg = False, 'no change'
-        if action == 'tg':
-            ok, msg = settings_store.toggle(key)
-        elif action == 'up':
-            ok, msg = settings_store.bump(key, +1)
-        elif action == 'dn':
-            ok, msg = settings_store.bump(key, -1)
-        self._answer_callback(callback_id, msg)
-        if ok and message_id is not None:
-            self.send_settings(edit_message_id=message_id)
-
-    def _handle_command(self, text: str):
-        """Handle incoming bot commands."""
-        cmd = text.lower().split()[0] if text else ''
-        parts = text.split()
-
-        if cmd == '/start' or cmd == '/resume':
-            from bot import settings_store
-            settings_store.set_value('TRADING_ENABLED', True)
-            self.send("🟢 <b>Trading ENABLED</b> — the bot will place new trades.")
-        elif cmd == '/stop' or cmd == '/pause':
-            from bot import settings_store
-            settings_store.set_value('TRADING_ENABLED', False)
-            self.send("🔴 <b>Trading DISABLED</b> — monitoring & resolving only, no new buys.")
-        elif cmd == '/settings' or cmd == '/config':
-            self.send_settings()
-        elif cmd == '/set':
-            from bot import settings_store
-            if len(parts) >= 3:
-                ok, msg = settings_store.set_value(parts[1], parts[2])
-                self.send(("✅ " if ok else "⚠️ ") + msg)
-            else:
-                self.send("Usage: <code>/set KEY VALUE</code>  e.g. <code>/set BASKET_MAX_COST 0.80</code>")
-        elif cmd == '/toggle':
-            from bot import settings_store
-            if len(parts) >= 2:
-                ok, msg = settings_store.toggle(parts[1])
-                self.send(("✅ " if ok else "⚠️ ") + msg)
-            else:
-                self.send("Usage: <code>/toggle KEY</code>  e.g. <code>/toggle SNIPER_ENABLED</code>")
-        elif cmd == '/status' or cmd == '/stats':
-            self.send_status()
-        elif cmd == '/balance' or cmd == '/bal':
-            bal = self.pm.get_balance() if self.pm else 0
-            self.send(f"💰 Balance: ${bal:.2f}")
-        elif cmd == '/pnl':
-            pnl = self.pm.get_total_pnl() if self.pm else 0
-            self.send(f"📊 Total PnL: ${pnl:+.2f}")
-        elif cmd == '/positions' or cmd == '/pos':
-            self.send_positions(page=0, sort='recent', with_summary=False)
-        elif cmd == '/markets':
-            self.send_markets_summary()
-        elif cmd == '/redeem':
-            if self.pm:
-                count = self.pm.redeem_all_winning()
-                # redeem_all_winning may return a count (int) or a list.
-                n = len(count) if isinstance(count, list) else count
-                self.notify_redeems_recent()
-                self.send(f"💰 Redeemed {n} positions")
-        elif cmd == '/help':
-            self.send(
-                "🌤️ <b>Weather Sniper Commands</b>\n"
-                "<b>/start</b> — enable trading\n"
-                "<b>/stop</b> — disable trading (monitor only)\n"
-                "<b>/settings</b> — toggle strategies & tune gates (buttons)\n"
-                "/set KEY VALUE — set a gate, e.g. /set BASKET_MAX_COST 0.80\n"
-                "/toggle KEY — flip a toggle, e.g. /toggle SNIPER_ENABLED\n"
-                "/status — summary + positions (paged, sortable)\n"
-                "/balance — current balance\n"
-                "/pnl — total profit/loss\n"
-                "/positions — open positions (10/page; sort by PnL/Losses/ROI/Recent)\n"
-                "/markets — active weather markets\n"
-                "/redeem — redeem winning positions\n"
-                "/help — this message"
-            )
-        elif cmd.startswith('/'):
-            self.send(f"❓ Unknown command. Try /help")

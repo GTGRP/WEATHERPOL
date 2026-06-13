@@ -106,6 +106,10 @@ class TrackedPosition:
     current_price_stale: bool = False # True when live price could not be read
     preclose_locked: bool = False     # flagged near-certain win before close
     settle_source: str = ''           # 'polymarket' | 'preclose_lock' | 'clob'
+    # --- Request-23 fields ---
+    hold_to_resolution: bool = False  # baskets / hold legs: never stop/trail/thesis-exit
+    cluster_box: str = ''             # peak-cluster grouping label, e.g. 'Box 1'
+    flip_max_hold_minutes: float = 0.0  # quick_flip book-or-cut window (persisted)
 
 
     @property
@@ -182,11 +186,18 @@ class PositionManager:
         self.total_trades = 0
         self.wins = 0
         self.losses = 0
+        # Monotonic counter for naming peak-cluster baskets ("Box 1", "Box 2"...).
+        self.cluster_box_seq = 0
         # Optional callback invoked after a position is closed/resolved (set by
         # the dashboard to route Telegram close/resolution alerts). The hook
         # skips reason=='manual' (flip/thesis exits notify directly, otherwise
         # they'd be double-notified with the wrong label).
         self._notify_close = None
+        # Grouped peak-cluster resolution: fire ONE summary per basket once ALL
+        # its legs have settled (wired by the dashboard). `_announced_cluster_close`
+        # de-dupes so each "Box N" is summarised exactly once.
+        self._notify_cluster_close = None
+        self._announced_cluster_close = set()
         self._state_file = 'data/positions.json'
         self._weekly_file = 'data/weekly_memory.json'
         self._paper_trades_file = _cfg('PAPER_TRADE_LOG', 'data/paper_trades.jsonl')
@@ -197,9 +208,9 @@ class PositionManager:
         self._load_state()
         self._load_weekly()
 
-    # ═══════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════
     # BALANCE
-    # ═══════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════
 
     def get_balance(self) -> float:
         if Config.is_paper():
@@ -230,16 +241,18 @@ class PositionManager:
             return None
 
 
-    # ═══════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════
     # POSITION LIFECYCLE
-    # ═══════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════
 
     def add_position(self, token_id: str, condition_id: str, entry_price: float,
                      shares: float, cost_usd: float, market_title: str,
                      bucket_label: str, strategy: str, city: str = '',
                      slug: str = '', resolution_time: datetime = None,
                      edge: float = 0.0, reason: str = '', grade: float = 0.0,
-                     lock_confidence: float = 0.0, signal: str = '') -> Optional[TrackedPosition]:
+                     lock_confidence: float = 0.0, signal: str = '',
+                     hold_to_resolution: bool = False, cluster_box: str = '',
+                     flip_max_hold_minutes: float = 0.0) -> Optional[TrackedPosition]:
         """Add new position — checks balance FIRST, only tracks if order succeeds."""
         # ═══ VALIDATE SHARES (must be positive) ═══
         if shares <= 0 or cost_usd <= 0 or entry_price <= 0:
@@ -387,6 +400,11 @@ class PositionManager:
         pos.lock_confidence = lock_confidence
         pos.signal = signal or strategy
         pos.last_good_price = pos.current_price
+        # Request-23: hold-to-resolution flag (baskets + observed/forced holds)
+        # and peak-cluster grouping label. peak_cluster is ALWAYS hold-to-res.
+        pos.hold_to_resolution = bool(hold_to_resolution) or strategy == 'peak_cluster'
+        pos.cluster_box = cluster_box
+        pos.flip_max_hold_minutes = float(flip_max_hold_minutes or 0.0)
 
         # Register market context
         if slug and slug not in self.market_contexts:
@@ -624,10 +642,25 @@ class PositionManager:
     def get_redeemable_positions(self) -> List[TrackedPosition]:
         return [p for p in self.positions if p.redeemable and p.status in ('open', 'won')]
 
+    # ═══ Peak-cluster basket numbering ("Box 1", "Box 2", ...) ═══
+    def peek_cluster_box(self) -> str:
+        """Label for the NEXT basket WITHOUT consuming the number."""
+        return f"Box {self.cluster_box_seq + 1}"
 
-    # ═══════════════════════════════════════════════════════════
+    def commit_cluster_box(self) -> str:
+        """Consume + persist the next basket number; returns its label."""
+        self.cluster_box_seq += 1
+        self._save_state()
+        return f"Box {self.cluster_box_seq}"
+
+    def next_cluster_box(self) -> str:
+        """Back-compat convenience: peek + commit."""
+        return self.commit_cluster_box()
+
+
+    # ═════════════════════════════════════════════
     # STOP-LOSS & TAKE-PROFIT
-    # ═══════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════
 
     def check_risk_triggers(self) -> List[TrackedPosition]:
         """Check all open positions for stop-loss / take-profit triggers."""
@@ -636,6 +669,17 @@ class PositionManager:
             # Update peak price for trailing stop
             if pos.current_price > pos.peak_price:
                 pos.peak_price = pos.current_price
+
+            # HOLD-TO-RESOLUTION EXEMPTION (peak_cluster baskets + observed/forced
+            # hold legs): an any-one-wins basket only profits if EVERY leg rides to
+            # settlement (one winning bucket pays $1 and covers the whole basket),
+            # and observed hold legs are EV+ to resolution. So we NEVER
+            # stop-loss / trailing-stop / take-profit-exit these here — they settle
+            # in check_resolutions. (Very-bad observed legs may still be cut by the
+            # STRICT thesis-exit, which itself exempts baskets.) This fixes the bug
+            # where the stop-loss kept closing peak-cluster legs on a dip.
+            if getattr(pos, 'hold_to_resolution', False):
+                continue
 
             # TAKE-PROFIT: price rose above target
             if pos.current_price >= pos.take_profit_price:
@@ -658,8 +702,12 @@ class PositionManager:
                          f"@ ${pos.current_price:.4f} (ROI={pos.roi_pct:.0f}%)")
                 continue
 
-            # TRAILING STOP (if enabled): price dropped X% from peak
-            if pos.peak_price > pos.entry_price * 2:
+            # TRAILING STOP (if enabled): price dropped X% from peak. Only after a
+            # BIG run-up (>= TRAILING_MIN_PEAK_MULT x entry) so we don't choke a
+            # good position that still has room to run — the user flagged trailing
+            # exits firing too early on winners.
+            min_peak_mult = float(_cfg('TRAILING_MIN_PEAK_MULT', 3.0))
+            if pos.peak_price > pos.entry_price * min_peak_mult:
                 trail_threshold = pos.peak_price * (1 - Config.TRAILING_STOP_PCT / 100)
                 if pos.current_price < trail_threshold:
                     self._close_position(pos, pos.current_price, 'trailing_stop')
@@ -712,16 +760,48 @@ class PositionManager:
         # 'manual': exit_policies relabels flip/thesis exits AFTER close and the
         # dashboard notifies those directly, so this avoids a double-notify with
         # the wrong label.
-        if reason != 'manual' and getattr(self, '_notify_close', None):
-            try:
-                self._notify_close(pos)
-            except Exception as e:
-                log.debug(f"close notify failed: {e}")
+        # Peak-cluster legs are GROUPED: instead of one won/lost alert per leg,
+        # we wait until EVERY leg of the basket ("Box N") has resolved, then emit
+        # ONE grouped resolution summary (which leg won + payout, the losing
+        # legs + their loss, net basket PnL). Non-cluster closes notify per-pos.
+        if reason != 'manual':
+            box = getattr(pos, 'cluster_box', '') or ''
+            if box and getattr(pos, 'strategy', '') == 'peak_cluster':
+                self._maybe_notify_cluster_close(box)
+            elif getattr(self, '_notify_close', None):
+                try:
+                    self._notify_close(pos)
+                except Exception as e:
+                    log.debug(f"close notify failed: {e}")
 
 
-    # ═══════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════
     # RESOLUTION & REDEMPTION
-    # ═══════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════
+
+    def _maybe_notify_cluster_close(self, box: str):
+        """Once ALL legs of a peak-cluster basket ("Box N") have resolved, emit
+        ONE grouped resolution summary via the wired callback. Fires only once
+        per box (de-duped through `_announced_cluster_close`)."""
+        if not box:
+            return
+        legs = [p for p in self.positions
+                if (getattr(p, 'cluster_box', '') or '') == box
+                and getattr(p, 'strategy', '') == 'peak_cluster']
+        if not legs:
+            return
+        # Hold the summary until no leg is still open/pending.
+        if any(l.status in ('open', 'pending') for l in legs):
+            return
+        if box in self._announced_cluster_close:
+            return
+        self._announced_cluster_close.add(box)
+        cb = getattr(self, '_notify_cluster_close', None)
+        if cb:
+            try:
+                cb(box, legs)
+            except Exception as e:
+                log.debug(f"cluster close notify failed: {e}")
 
     def check_resolutions(self):
         """Resolve open positions using Polymarket's ACTUAL settled outcome.
@@ -900,9 +980,9 @@ class PositionManager:
                 count += 1
         return count
 
-    # ═══════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════
     # PRICE UPDATES
-    # ═══════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════
 
     def update_prices(self):
         """Batch update prices for open positions.
@@ -947,9 +1027,9 @@ class PositionManager:
         self._save_state()
 
 
-    # ═══════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════
     # CONTEXT MANAGEMENT (free memory for closed markets)
-    # ═══════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════
 
     def _maybe_free_context(self, slug: str):
         """Free market context if no open positions remain for it."""
@@ -973,9 +1053,9 @@ class PositionManager:
         """How many active market contexts we're tracking."""
         return sum(1 for v in self.market_contexts.values() if v.active)
 
-    # ═══════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════
     # PAPER TRADE LOG + LEDGER INVARIANT
-    # ═══════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════
 
     def _log_paper_trade(self, action: str, pos: TrackedPosition, extra: Optional[Dict] = None):
         """Append one structured record per BUY / SELL / SETTLE / REDEEM /
@@ -1045,9 +1125,9 @@ class PositionManager:
                         f"deposited=${self.total_deposited:.2f}")
         return ok
 
-    # ═══════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════
     # WEEKLY MEMORY
-    # ═══════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════
 
     def record_weekly_stats(self):
         """Snapshot current week's performance for ML memory."""
@@ -1107,9 +1187,9 @@ class PositionManager:
         return " | ".join(lines)
 
 
-    # ═══════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════
     # STATISTICS (per-position + aggregate)
-    # ═══════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════
 
     def get_stats(self) -> Dict:
         """Comprehensive stats."""
@@ -1232,9 +1312,9 @@ class PositionManager:
         return summary
 
 
-    # ═══════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════
     # PERSISTENCE
-    # ═══════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════
 
     def _save_state(self):
         """Save positions to disk."""
@@ -1247,6 +1327,7 @@ class PositionManager:
                 'total_trades': self.total_trades,
                 'wins': self.wins,
                 'losses': self.losses,
+                'cluster_box_seq': self.cluster_box_seq,
                 'positions': [self._pos_to_dict(p) for p in self.positions[-500:]],
                 'market_contexts': {
                     k: {'slug': v.slug, 'city': v.city, 'active': v.active,
@@ -1278,6 +1359,9 @@ class PositionManager:
             'sig': p.signal, 'why': p.reason, 'lgp': p.last_good_price,
             'stale': p.current_price_stale, 'plk': p.preclose_locked,
             'ss': p.settle_source,
+            # request-23 fields
+            'h2r': p.hold_to_resolution, 'cbox': p.cluster_box,
+            'fmh': p.flip_max_hold_minutes,
         }
 
     def _load_state(self):
@@ -1293,6 +1377,7 @@ class PositionManager:
             self.total_trades = state.get('total_trades', 0)
             self.wins = state.get('wins', 0)
             self.losses = state.get('losses', 0)
+            self.cluster_box_seq = state.get('cluster_box_seq', 0)
             for pd in state.get('positions', []):
                 try:
                     pos = TrackedPosition(
@@ -1330,6 +1415,9 @@ class PositionManager:
                         current_price_stale=pd.get('stale', False),
                         preclose_locked=pd.get('plk', False),
                         settle_source=pd.get('ss', ''),
+                        hold_to_resolution=pd.get('h2r', False),
+                        cluster_box=pd.get('cbox', ''),
+                        flip_max_hold_minutes=pd.get('fmh', 0.0),
                     )
                     self.positions.append(pos)
                 except Exception:
