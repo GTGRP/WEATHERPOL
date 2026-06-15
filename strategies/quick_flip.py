@@ -112,6 +112,7 @@ class QuickFlipSignal:
     expected_roi_pct: float
     size_usd: float
     shares: float
+    our_prob: float = 0.0
 
 
 class QuickFlipStrategy:
@@ -148,6 +149,10 @@ class QuickFlipStrategy:
         self.window_boost = float(g('QUICK_FLIP_WINDOW_BOOST', 0.10))
         self.stale_boost = float(g('QUICK_FLIP_STALE_BOOST', 0.10))
         self.stale_eps = float(g('QUICK_FLIP_STALE_EPS', 0.01))
+        # Req-23 REVIVAL: plain-mispricing entry threshold (run change no longer
+        # required) + per-market cap so one market can't eat the whole scan.
+        self.min_edge = float(g('QUICK_FLIP_MIN_EDGE', 0.08))
+        self.max_per_market = int(g('QUICK_FLIP_MAX_PER_MARKET', 3))
 
     def should_poll_forecasts(self) -> bool:
         """True when we're inside the actionable window after a publish."""
@@ -236,26 +241,44 @@ class QuickFlipStrategy:
         run_id, model, minutes = _current_run()
         in_window = minutes < self.window_min
 
+        # Req-23 REVIVAL: the run-boundary change is now an OPTIONAL confidence
+        # BOOST, NOT a hard gate. The old v2 returned here whenever there was no
+        # fresh model run, so quick_flip placed 0 trades in the Req-22/25 logs --
+        # it could ONLY ever fire on a run boundary. We now ALSO take plain
+        # mispricing (edge >= min_edge); a real run move just corroborates it.
         change = self.detect_changes(city, market_type, bucket_probs, now, run_id)
-        if not change:
-            self._update_last_prices(city, market_type, market_prices)
-            return signals
+        changed_labels = set(change.affected_buckets) if change else set()
+        if change:
+            log.info(
+                f"  RUN CHANGE: {city} {market_type} {change.station_icao} "
+                f"shifted {change.delta_c:.1f}C ({change.old_primary_bucket}->"
+                f"{change.new_primary_bucket}) on {model} run"
+            )
 
-        log.info(
-            f"  RUN CHANGE: {city} {market_type} {change.station_icao} "
-            f"shifted {change.delta_c:.1f}C ({change.old_primary_bucket}->"
-            f"{change.new_primary_bucket}) on {model} run"
-        )
-
-        for label in change.affected_buckets:
-            bp = next((b for b in bucket_probs if b.bucket_label == label), None)
-            if not bp:
-                continue
+        # Rank every bucket by edge (our_prob - market_price); most mispriced first.
+        ranked = []
+        for bp in bucket_probs:
+            label = bp.bucket_label
             token_id = token_ids.get(label)
             if not token_id:
                 continue
             market_price = float(market_prices.get(label, 0.99) or 0.99)
+            our_prob = float(getattr(bp, 'probability', 0.0) or 0.0)
+            ranked.append((our_prob - market_price, bp, label, token_id, market_price, our_prob))
+        ranked.sort(key=lambda r: r[0], reverse=True)
+
+        placed = 0
+        for edge, bp, label, token_id, market_price, our_prob in ranked:
+            if placed >= self.max_per_market:
+                break
             if market_price > self.max_entry_price or market_price < 0.03:
+                continue
+
+            # TWO entry paths: (a) EARLY-MISPRICING -- our model sees edge >=
+            # min_edge even with NO fresh run; (b) RUN-CHANGE -- a bucket the new
+            # model run actually moved. Either qualifies; both can be true.
+            run_changed = label in changed_labels
+            if edge < self.min_edge and not run_changed:
                 continue
 
             # Dedup cooldown: don't re-signal the same token repeatedly.
@@ -263,7 +286,6 @@ class QuickFlipStrategy:
             if last and (now - last).total_seconds() / 60.0 < self.cooldown_min:
                 continue
 
-            our_prob = bp.probability
             target_price = min(0.95, our_prob * 0.9)
             if target_price <= market_price * 1.05:
                 continue
@@ -271,10 +293,16 @@ class QuickFlipStrategy:
             if expected_roi < self.target_roi_pct:
                 continue
 
-            # Confidence = ensemble agreement + boosts (stale book / publish window).
+            # Confidence is DERIVED FROM EDGE (so the early path can actually
+            # fire), taking the max of the edge-confidence and the ensemble
+            # agreement, then boosted by a real run move / publish window / stale book.
             prev_price = self._last_prices.get(f"{city}_{market_type}_{label}")
             stale = prev_price is not None and abs(market_price - prev_price) < self.stale_eps
-            conf = float(getattr(bp, 'confidence', 0.0) or 0.0)
+            edge_conf = max(0.0, min(1.0, edge / max(self.min_edge, 0.01) * 0.6))
+            agree = float(getattr(bp, 'confidence', 0.0) or 0.0)
+            conf = max(edge_conf, agree)
+            if run_changed:
+                conf += self.window_boost
             if in_window:
                 conf += self.window_boost
             if stale:
@@ -287,8 +315,10 @@ class QuickFlipStrategy:
             if size_usd < 1.0:
                 continue
             shares = size_usd / market_price if market_price > 0 else 0
-            hold_minutes = min(self.max_hold_minutes, 30 + int(abs(change.delta_c) * 10))
-            tags = ("+window" if in_window else "") + ("+stale" if stale else "")
+            delta_c = abs(change.delta_c) if change else 0.0
+            hold_minutes = min(self.max_hold_minutes, 30 + int(delta_c * 10))
+            path = "+run" if run_changed else "+early"
+            tags = path + ("+window" if in_window else "") + ("+stale" if stale else "")
 
             signals.append(QuickFlipSignal(
                 market_title=market_title,
@@ -298,10 +328,9 @@ class QuickFlipStrategy:
                 entry_price=market_price,
                 target_price=target_price,
                 entry_reason=(
-                    f"FLIP[{model}{tags}]: {change.station_icao} {change.delta_c:.1f}C "
-                    f"({change.old_primary_bucket}->{change.new_primary_bucket}). "
-                    f"Buy {label} @ {market_price:.3f} -> {target_price:.3f} "
-                    f"({expected_roi:.0f}% ROI, conf {conf:.0%}, ≤{hold_minutes}m)"
+                    f"FLIP[{model}{tags}]: edge {edge:+.0%} "
+                    f"buy {label} @ {market_price:.3f} -> {target_price:.3f} "
+                    f"({expected_roi:.0f}% ROI, conf {conf:.0%}, <={hold_minutes}m)"
                 ),
                 forecast_change=change,
                 confidence=conf,
@@ -309,8 +338,10 @@ class QuickFlipStrategy:
                 expected_roi_pct=expected_roi,
                 size_usd=size_usd,
                 shares=shares,
+                our_prob=our_prob,
             ))
             self._recent_signals[token_id] = now
+            placed += 1
 
         self._update_last_prices(city, market_type, market_prices)
         return signals
