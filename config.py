@@ -97,6 +97,26 @@ class Config:
     WEATHER_FORECAST_CACHE_SECONDS = int(os.getenv('WEATHER_FORECAST_CACHE_SECONDS', '300'))
 
     # ===================================================================
+    # WEATHER-API FAILOVER (Req-25 fix #5) — survive Open-Meteo rate / IP limits.
+    # When the primary forecast provider returns a rate/IP-limit response
+    # (HTTP status in WEATHER_RATELIMIT_STATUS — e.g. 429/403 — or an Open-Meteo
+    # JSON error whose reason mentions "limit"), that endpoint is put on a
+    # COOLDOWN and the fetchers transparently fail over to the next available
+    # source: another OPEN_METEO_ENDPOINTS mirror (plus any
+    # OPEN_METEO_FAILOVER_ENDPOINTS), then OpenWeatherMap, then weather.gov. The
+    # cooled endpoint is retried automatically once its cooldown expires, so the
+    # primary recovers on its own.
+    # ===================================================================
+    WEATHER_FAILOVER_ENABLED = os.getenv('WEATHER_FAILOVER_ENABLED', '1') == '1'
+    # Seconds to rest a forecast endpoint after a rate/IP-limit hit before retrying it.
+    WEATHER_PROVIDER_COOLDOWN_SECONDS = int(os.getenv('WEATHER_PROVIDER_COOLDOWN_SECONDS', '600'))
+    # HTTP status codes treated as rate/IP-limited (comma-sep) -> cooldown + failover.
+    WEATHER_RATELIMIT_STATUS = [int(s.strip()) for s in os.getenv('WEATHER_RATELIMIT_STATUS', '429,403').split(',') if s.strip()]
+    # Extra Open-Meteo mirror endpoints used as failover ONLY when the primary
+    # endpoints are cooling down (comma-sep; supplements OPEN_METEO_ENDPOINTS).
+    OPEN_METEO_FAILOVER_ENDPOINTS = [e.strip() for e in os.getenv('OPEN_METEO_FAILOVER_ENDPOINTS', '').split(',') if e.strip()]
+
+    # ===================================================================
     # TRADING PARAMETERS
     # ===================================================================
     # Sniper strategy: buy buckets priced below this when forecast is strong
@@ -622,5 +642,7 @@ class Config:
         print(f"Liquidity:   {'STRICT' if cls.LIQUIDITY_STRICT_BLOCK else 'adaptive'} (thin x{cls.LIQUIDITY_THIN_SIZE_MULT})")
         print(f"Paper:       realistic-fill={cls.PAPER_REALISTIC_FILL} preclose>={cls.PAPER_PRECLOSE_LOCK_PCT:.0%} freeze={cls.PAPER_FREEZE_ON_BAD_PRICE}")
         print(f"Resolve:     station-verify={'ON' if cls.RESOLUTION_VERIFY_ENABLED else 'OFF'} (min_conf={cls.RESOLUTION_VERIFY_MIN_CONF})")
+        print(f"Failover:    weather {'ON' if cls.WEATHER_FAILOVER_ENABLED else 'OFF'} "
+              f"(cooldown {cls.WEATHER_PROVIDER_COOLDOWN_SECONDS}s, limit-status {cls.WEATHER_RATELIMIT_STATUS})")
         print(f"Scan:        every {cls.SCAN_INTERVAL_SECONDS}s")
         print(f"{'='*60}\n")
