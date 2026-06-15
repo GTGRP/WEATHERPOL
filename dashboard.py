@@ -35,6 +35,7 @@ from strategies.confident_strategy import ConfidentStrategy
 from strategies.late_observed_temp import LateObservedTempStrategy
 from strategies.quick_flip import QuickFlipStrategy
 from strategies.peak_cluster import PeakClusterStrategy
+from strategies.safety_peak import SafetyPeakStrategy
 from data.stability import StabilityEngine
 from data.liquidity_guard import LiquidityGuard
 from data.clob_client import ClobClient
@@ -70,6 +71,9 @@ class WeatherBot:
         # Parallel peak-cluster basket: buy an adjacent bucket basket around the
         # estimated peak (combined per-share cost < $1) so any single winning leg profits.
         self.peak_cluster = PeakClusterStrategy()
+        # Safety-peak: focused HIGH-confidence peak + ONE directional neighbour
+        # (equal shares; any-one-wins covers the other leg's loss + profit after fees).
+        self.safety_peak = SafetyPeakStrategy()
         self.observed = ObservedWeather()
         self.stability_engine = StabilityEngine()
         # Stability GRADE + liquidity guard (applied across ALL strategies)
@@ -910,6 +914,73 @@ class WeatherBot:
                         log.debug(f"cluster notify failed: {e}")
 
         # ------------------------------------------------------
+        # SAFETY PEAK — focused HIGH-confidence directional peak (Req-25 fix #4).
+        # The tightest, most PATIENT peak play: fires ONLY when the peak estimate
+        # is accurate + high-confidence (tight ensemble std, many agreeing
+        # models, strong grade, high peak-bucket confidence), then buys the peak
+        # bucket + EXACTLY ONE directional safety neighbour (warming→+1 /
+        # cooling→−1 / stable→the shoulder the mean leans toward) in EQUAL
+        # SHARES, so whichever single bucket resolves to $1 covers the other
+        # leg's loss PLUS net profit after fees. HOLDS TO RESOLUTION. Forecast-
+        # based → skipped once the extreme is locked (unless TRADE_DECIDED).
+        # ------------------------------------------------------
+        if getattr(Config, 'SAFETY_PEAK_ENABLED', False) and (
+            not in_lock_window or getattr(Config, 'SAFETY_PEAK_TRADE_DECIDED', False)
+        ):
+            try:
+                safety_signals = self.safety_peak.evaluate(
+                    market.title, bucket_probs, market_prices, token_ids, balance,
+                    city=city, stability=stab, grade=grade,
+                )
+            except Exception as e:
+                safety_signals = []
+                log.debug(f"safety_peak eval failed {city}: {e}")
+            for sig in safety_signals:
+                self.signals_generated += 1
+                log.info(
+                    f"   🛡️  SAFETY PEAK {city} | {sig.direction} | peak={sig.forecast_max_c:.1f}°C "
+                    f"conf={sig.confidence:.0%} | {len(sig.legs)} legs | {sig.reason}"
+                )
+                placed_safety = []
+                for leg in sig.legs:
+                    if not leg.token_id:
+                        continue
+                    pos = self._place(
+                        token_id=leg.token_id,
+                        condition_id=condition_ids.get(leg.bucket_label, ''),
+                        entry_price=leg.market_price,
+                        base_size_usd=leg.size_usd,
+                        market_title=market.title,
+                        bucket_label=leg.bucket_label,
+                        strategy=f'safety_peak_{leg.role}',
+                        city=city,
+                        slug=market.slug,
+                        resolution_time=market.resolution_time,
+                        edge=sig.combined_prob - sig.total_cost,
+                        grade=grade,
+                        hold_hint=True,          # any-one-wins basket pays off at resolution (NEVER stop/trail)
+                        early_exit_price=early_exit_price,
+                        apply_grade_size=False,  # safety_peak sizes its own equal-share legs
+                        reason=sig.reason,
+                        signal=f'safety_peak_{leg.role}',
+                        our_prob=getattr(leg, 'our_probability', 0.0),
+                        use_factor_kelly=False,  # keep the equal-share basket legs intact
+                        use_ml=False,            # the basket is ONE unit; don't veto single legs
+                        count_as_buy=False,      # whole basket counts as ONE buy (below)
+                    )
+                    if pos:
+                        self.trades_placed += 1
+                        placed_safety.append(pos)
+                        self.telegram.notify_trade(
+                            'BUY', leg.bucket_label, pos.entry_price,
+                            pos.cost_usd, pos.shares, f'safety_peak_{leg.role}',
+                            edge=sig.combined_prob - sig.total_cost, city=city,
+                        )
+                if placed_safety:
+                    # The peak + neighbour basket = ONE buy toward the per-scan budget.
+                    self._scan_buys += 1
+
+        # ------------------------------------------------------
         # PEAK BASKET — forecast-only directional-peak strategy (DEMOTED, opt-in).
         # Buys the ensemble forecast peak + ONE trend-directional neighbor.
         # Off by default now that the observed strategy supersedes it. Skipped in
@@ -1096,6 +1167,7 @@ class WeatherBot:
         if Config.LATE_OBSERVED_ENABLED: strats.append('LateObserved*')
         if getattr(Config, 'QUICK_FLIP_ENABLED', False): strats.append('QuickFlip')
         if getattr(Config, 'PEAK_CLUSTER_ENABLED', True): strats.append('PeakCluster')
+        if getattr(Config, 'SAFETY_PEAK_ENABLED', False): strats.append('SafetyPeak')
         if Config.PEAK_BASKET_ENABLED: strats.append('PeakBasket')
         if Config.CONFIDENT_ENABLED: strats.append('Confident')
         if Config.SNIPER_ENABLED: strats.append('Sniper')
