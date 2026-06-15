@@ -301,6 +301,13 @@ class Config:
     PEAK_BASE_FRACTION = float(os.getenv('PEAK_BASE_FRACTION', '0.05'))       # base % of balance per basket
     PEAK_MAX_FRACTION = float(os.getenv('PEAK_MAX_FRACTION', '0.25'))         # max % of balance per basket (when everything aligns)
     PEAK_MIN_MODELS = int(os.getenv('PEAK_MIN_MODELS', '2'))                  # minimum ensemble models required
+    # Fee-aware profit floor (Req-25 equal-shares correction): the per-share
+    # basket cost must satisfy  cost <= 1 - PEAK_FEE_BUFFER - PEAK_MIN_NET_PROFIT,
+    # so whichever single leg wins ($1/share under equal-shares allocation)
+    # covers the WHOLE basket cost PLUS a net profit margin AFTER fees. These two
+    # knobs cap the effective max basket cost alongside PEAK_MAX_BASKET_COST.
+    PEAK_FEE_BUFFER = float(os.getenv('PEAK_FEE_BUFFER', '0.02'))             # taker-fee headroom reserved on the winning leg
+    PEAK_MIN_NET_PROFIT = float(os.getenv('PEAK_MIN_NET_PROFIT', '0.03'))     # minimum net profit margin required after fees
 
     # ===================================================================
     # BASKET QUALITY — predict the max temp, then buy an adjacent basket whose
