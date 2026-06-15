@@ -914,6 +914,8 @@ HELD to resolution — the stop-loss must NOT close those legs); and group peak_
    boost — a new model run that moves the mean still boosts confidence. Confidence is now DERIVED from edge so the
    early path can actually fire. Carries `our_prob` for factor-Kelly. WHY: quick_flip was the 62%-WR profit engine
    and had gone silent; the early-mispricing path is the "buy early / mispriced as soon as the market opens" idea.
+   ⚠️ SEE JUNE 15 REQUEST 26 ENTRY BELOW: this revival did NOT actually land in the file that reached `dev` — the
+   pushed `quick_flip.py` stayed the Req-14 v2 run-boundary-only version. It was re-applied and verified on June 15.
 
 ### WHEN / WHY pushed (Request 23, GTGRP/WEATHERPOL main)
 June 13, 2026 ~10:30 PM IST. Pushed in 2 commits: `8445c146` carried `trading/sizing.py` (the new engine);
@@ -938,3 +940,48 @@ New log / Telegram lines to watch for: factor-Kelly size lines, `portfolio_guard
   (pytest+ruff); cap `data/paper_trades.jsonl`; Open-Meteo round-robin into `data/observed_weather.py`;
   weather.gov stray `{`; 3 `no_coords` cities; expose the new sizing/guard/ML knobs in Telegram `/settings`
   (`settings_store.BOOL_KEYS` / `NUM_KEYS`).
+
+---
+
+## June 15-16, 2026 (Notion AI / GTGRP) — REQUEST 24-25: SIX-FIX OVERHAUL ON NEW `dev` BRANCH (dynamic peak_cluster legs + peaker +1 SAFETY_PEAK + thesis-not-lost + weather API failover + /analysis telegram report) + REQUEST 26: QUICK_FLIP MISSING-REVIVAL FOUND, RE-APPLIED & VERIFIED
+
+Same agent (Notion AI) / same remote `https://github.com/GTGRP/WEATHERPOL`, via GitHub MCP (sandbox offline;
+every file `py_compile`-clean; pure modules unit-tested offline with injected fakes; dashboard/config reasoned).
+SETTLEMENT DESIGN STILL LOCKED (paper closes as real ~99%; weather-API = CONFIRMATION only; Polymarket resolved
+value = truth). Tone: normal technical. **BRANCH CHANGE: all Req-24/25/26 work is on a NEW `dev` branch**
+(created at `0448b93f`, off main), NOT `main` — so the user can review/redeploy `dev` before merging to `main`.
+
+### REQUEST 25 (verbatim intent, condensed)
+"Continue pushing the missed one … peak cluster buys only one/two baskets — the strategies must buy 3 to 7
+buckets; as a basket wins it must cover the loss of the other baskets PLUS profit after fees. The one/two-basket
+behaviour must live in OTHER strategies, like the peaker: estimate the peak temp accurately, high-confidence,
+and for SAFETY buy +1 degree higher bucket too. API limits — if a limit appears, switch to another API
+(Wunderground or any available) and retry the old API until it recovers. Also add a `/analysis` telegram command
+that fetches all buys/sells/everything and tells what strategies, how many buys per strategy, win rate,
+performance — plus a downloadable log of buys, sells, redeemed, and exits. Also the bot must NOT count a thesis
+exit as a loss — fix that." Survey answers (Jun 15 21:44): branch = `dev`; do all 6 fixes in order; cluster legs
+DYNAMIC by estimated peak temp; peaker = high-confidence peak +1 neighbour (warming) / −1 (cooling) / stable;
+any one leg landing covers the basket + profit after fees.
+
+### THE SIX FIXES (Req-24/25) — all on `dev`, each its own verified commit
+1. **FIX #1 `strategies/peak_cluster.py` (commit `20031090`, 171L)** — DYNAMIC leg count driven by the estimated
+   peak temp + spread (no longer just 1–2 legs). Floors to 3 legs, up to 7, around the argmax peak bucket;
+   greedy neighbour add while combined cost < ceiling; any single winner covers the basket + profit after fees.
+2. **FIX #2 `trading/position_manager.py` (commit `809792fe`)** — THESIS-EXIT IS NOT A LOSS. A new
+   `_closed_outcome` classifier counts W/L by realized PnL sign (and treats thesis/flip book-or-cut neutral/by-PnL)
+   instead of blindly logging every early exit as a loss. All market-sells now classify correctly in W/L stats.
+3. **FIX #3 `strategies/peak_basket.py` (commit `2ba680e2`, 370L + config `PEAK_FEE_BUFFER 0.02` /
+   `PEAK_MIN_NET_PROFIT 0.03`)** — corrected the existing peak basket so a basket only fires when the combined
+   cost leaves net profit after fees.
+4. **FIX #4 NEW `strategies/safety_peak.py` (commit `008f0436`, 346L; config `27631bd1`; dashboard wiring
+   `048d2736`)** — the PEAKER +1 SAFETY strategy the user asked for: estimate the peak bucket at high confidence
+   (≥ MIN_CONFIDENCE, ≥ MIN_MODELS, ≤ MAX_STD), then buy the peak PLUS the safety neighbour (+1 bucket if
+   warming trend, −1 if cooling, stable otherwise). Any one landing covers cost + profit. DISABLED by default
+   (`SAFETY_PEAK_ENABLED 0`) pending user opt-in.
+5. **FIX #5 WEATHER API FAILOVER (commit `6265d59a` config + `ef2985c8` weather_fetcher 443L + `3f716a5d`
+   observed_weather 453L)** — when an Open-Meteo endpoint returns a rate-limit status (`WEATHER_RATELIMIT_STATUS
+   [429,403]`), switch to the next provider/endpoint and put the throttled one on a
+   `WEATHER_PROVIDER_COOLDOWN_SECONDS` (600s) cooldown, retrying it after it recovers. `WEATHER_FAILOVER_ENABLED 1`.
+6. **FIX #6 `/analysis` TELEGRAM REPORT (commit `c2846b00`, `bot/telegram_ui.py` 876L, blob `5f7ada53`)** — new
+   `/analysis` (`/analyze` `/report`) command: builds a full performance report from `pm.get_stats()` +
+   `get_per_strategy_stats()` + `get_
