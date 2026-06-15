@@ -58,8 +58,17 @@ class PeakClusterStrategy:
         g = lambda n, d: getattr(Config, n, d)
         self.span = int(g('PEAK_CLUSTER_SPAN', 2))
         self.max_cost = float(g('PEAK_CLUSTER_MAX_COST', g('BASKET_MAX_COST', 0.85)))
-        self.min_legs = int(g('PEAK_CLUSTER_MIN_LEGS', 2))
-        self.max_legs = int(g('PEAK_CLUSTER_MAX_LEGS', 5))
+        # MIN LEGS — peak_cluster is the DEDICATED any-one-wins basket and must
+        # spread across 3-7 neighbouring buckets so a single winning leg covers
+        # the OTHER losing legs AND still nets profit after fees. A 1- or 2-leg
+        # "basket" is NOT this strategy (that is the high-confidence single /
+        # +1-degree safety play), so HARD-FLOOR the minimum at 3 regardless of
+        # the configured value. The window/greedy fill below keeps the actual
+        # leg count DYNAMIC (3..max) based on what the live market offers.
+        self.min_legs = max(3, int(g('PEAK_CLUSTER_MIN_LEGS', 3)))
+        self.max_legs = int(g('PEAK_CLUSTER_MAX_LEGS', 7))
+        if self.max_legs < self.min_legs:
+            self.max_legs = self.min_legs
         self.min_edge = float(g('PEAK_CLUSTER_MIN_EDGE', 0.03))
         self.min_conf = float(g('PEAK_CLUSTER_MIN_CONF', 0.55))
         self.max_center_price = float(g('PEAK_CLUSTER_MAX_CENTER_PRICE', 0.85))
