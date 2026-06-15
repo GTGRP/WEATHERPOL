@@ -10,18 +10,24 @@ cheap tier has negative unconditional edge). The REAL edge is superior forecasti
 WHAT THIS STRATEGY DOES:
 1. Determines the ensemble forecast peak (weighted blend of ECMWF, GFS, ICON,
    JMA, GEM, OWM, NWS, UKMO — 7+ models, airport-station coordinates).
-2. Adds ONE directional neighbor as insurance:
-   - warming trend → upper neighbor (+1°C)
-   - cooling trend → lower neighbor (-1°C)
-   - stable/flat → peak only (no neighbor needed)
-3. Scales capital dynamically: more when stability/edge/models all align,
+2. Adds directional neighbour(s) as insurance:
+   - warming trend → upper neighbour (+1°C)
+   - cooling trend → lower neighbour (-1°C)
+   - stable/flat → SYMMETRIC: BOTH shoulders (±1°C), since a flat day can miss
+     either way and we want it covered.
+3. Buys EQUAL SHARES on every leg, so whichever single bucket resolves to $1
+   pays the same — ANY one winner covers the WHOLE basket cost + profit. (An
+   unequal dollar split could let a cheap winning leg still lose money.)
+4. Scales capital dynamically: more when stability/edge/models all align,
    less when uncertain. Never bets > 25% of balance on one basket.
-4. Every leg must pass the price floor (5¢ — unsellable below this).
-5. Total basket cost must be < 95¢ → any single winning leg nets profit.
+5. Every leg must pass the price floor (5¢ — unsellable below this).
+6. Per-share basket cost must leave room for profit AFTER fees: any single
+   winning leg nets profit (cost <= 1 - fee_buffer - min_net).
 
 DESIGN RULES (from 0-for-61 live lesson):
 - Never buy a leg below 5¢ — no bid exists, instant 100% loss.
-- Never buy blind neighbors on both sides — only the trend direction.
+- Only buy both shoulders when the day is genuinely stable/flat (no trend);
+  with a clear trend, buy only the trend-direction neighbour.
 - Never buy when the peak is already priced > 85¢ — market already knows.
 - Always hold to resolution — thin books make early exits losing.
 - The neighbour is INSURANCE, not a separate bet. Skip it if mispriced.
@@ -160,26 +166,30 @@ class PeakBasketStrategy:
         center_i = min(range(len(indexed)), key=lambda i: abs(indexed[i][0] - target))
         center_val, center_bp = indexed[center_i]
 
-        # ── determine direction from trend ──
+        # ── determine directional neighbour(s) from trend ──
+        # warming → upper neighbour (+1); cooling → lower neighbour (-1);
+        # stable/sideways/unknown → SYMMETRIC safety: cover BOTH shoulders (±1) so a
+        # flat-day miss in either direction is still covered. Because the basket is
+        # sized in EQUAL SHARES (see allocation below), whichever single leg lands
+        # pays $1/share and covers the whole basket cost + profit after fees.
         trend = (stability.trend or 'unknown').lower()
         if trend == 'warming':
-            direction = +1
+            directions = [+1]
             direction_label = 'warming'
         elif trend == 'cooling':
-            direction = -1
+            directions = [-1]
             direction_label = 'cooling'
         else:
-            # stable/sideways/unknown → no neighbor needed; models agree on the peak
-            direction = 0
-            direction_label = 'peak_only'
+            directions = [+1, -1]
+            direction_label = 'stable_symmetric'
 
-        # ── build candidate legs: peak always, neighbor only if directional ──
+        # ── build candidate legs: peak always, plus a neighbour per direction ──
         candidates: List[Tuple[int, BucketProbability, str]] = []
         # peak
         candidates.append((center_i, center_bp, 'peak'))
 
-        # directional neighbor
-        if direction != 0:
+        # directional neighbour(s)
+        for direction in directions:
             ni = center_i + direction
             if 0 <= ni < len(indexed):
                 neighbor_val, neighbor_bp = indexed[ni]
@@ -217,12 +227,22 @@ class PeakBasketStrategy:
             log.info(f"   SKIP PEAK SKIP {city}: peak bucket failed checks")
             return []
 
-        # ── basket cost & profit-guarantee check ──
+        # ── basket cost & PER-LEG profit guarantee (any-one-wins) ──
+        # `total_market_cost` is the price to buy ONE share of EVERY leg. Because
+        # the basket is sized in EQUAL SHARES (see allocation below), whichever
+        # single leg resolves YES pays $1/share — and that ALWAYS covers the whole
+        # basket cost + a profit margin, but only while the per-share cost leaves
+        # room for fees. Require: 1 - cost >= fee_buffer + min_net_profit.
         total_market_cost = sum(price for _, _, _, price, _ in kept)
-        if total_market_cost >= Config.PEAK_MAX_BASKET_COST:
-            log.info(f"   SKIP PEAK COST {city}: basket ${total_market_cost:.2f} >= ${Config.PEAK_MAX_BASKET_COST:.2f}")
-            return []
         if total_market_cost <= 0:
+            return []
+        fee_buffer = float(getattr(Config, 'PEAK_FEE_BUFFER', 0.02))
+        min_net = float(getattr(Config, 'PEAK_MIN_NET_PROFIT', 0.03))
+        max_basket_cost = min(Config.PEAK_MAX_BASKET_COST, 1.0 - (fee_buffer + min_net))
+        if total_market_cost >= max_basket_cost:
+            log.info(f"   SKIP PEAK COST {city}: basket ${total_market_cost:.2f}/share >= "
+                     f"${max_basket_cost:.2f} (no profit room: any winner must cover the "
+                     f"whole basket + {min_net:.0%} net + {fee_buffer:.0%} fees)")
             return []
 
         # ── edge check: P(any leg wins) must exceed basket cost by min edge ──
@@ -268,19 +288,24 @@ class PeakBasketStrategy:
         basket_usd = max(Config.MIN_ORDER_SIZE * len(kept), basket_usd)
         basket_usd = min(basket_usd, balance * Config.PEAK_MAX_FRACTION)
 
-        # ── allocate across legs: peak gets 65% of basket, neighbors split the rest ──
-        peak_count = sum(1 for _, _, role, _, _ in kept if role == 'peak')
-        neighbor_count = len(kept) - peak_count
-        peak_alloc_pct = 0.65 if neighbor_count > 0 else 1.0
-        neighbor_alloc_pct = (1.0 - peak_alloc_pct) / max(neighbor_count, 1)
+        # ── allocate across legs in EQUAL SHARES (the any-one-wins guarantee) ──
+        # EXACTLY one bucket resolves to $1. If we sized by unequal dollars (the old
+        # peak-65% split), a cheap neighbour winning could pay LESS than the basket
+        # cost — a "win" that still loses money. Buying the SAME share count on every
+        # leg makes the payout identical whichever leg lands ($shares × $1), so any
+        # single winner covers the entire basket + profit. We solve shares from the
+        # basket $ budget and the per-share basket cost, then floor so each leg still
+        # clears the venue minimum.
+        cost_per_share = total_market_cost  # = sum of per-leg prices
+        target_shares = basket_usd / cost_per_share if cost_per_share > 0 else 0.0
+        # Each leg needs >= MIN_ORDER_SIZE notional; the binding leg is the priciest.
+        max_price = max(price for _, _, _, price, _ in kept)
+        min_shares_for_floor = Config.MIN_ORDER_SIZE / max_price if max_price > 0 else 0.0
+        shares = max(min_shares_for_floor, target_shares)
 
         legs = []
         for idx, bp, role, price, tid in kept:
-            if role == 'peak':
-                leg_usd = basket_usd * peak_alloc_pct
-            else:
-                leg_usd = basket_usd * neighbor_alloc_pct
-            leg_usd = max(Config.MIN_ORDER_SIZE, round(leg_usd, 2))
+            leg_usd = max(Config.MIN_ORDER_SIZE, round(shares * price, 2))
 
             offset = 0 if role == 'peak' else (+1 if role == 'neighbor_warm' else -1)
             legs.append(PeakBasketLeg(
@@ -311,13 +336,11 @@ class PeakBasketStrategy:
 
         # ── reason string (one-line log summary) ──
         peak_label = next(l.bucket_label for l in legs if l.role == 'peak')
-        neighbor_str = ''
-        for l in legs:
-            if l.role != 'peak':
-                neighbor_str = f" +{l.bucket_label}" if l.offset > 0 else f" {l.bucket_label}"
-                break
-        if not neighbor_str:
-            neighbor_str = ' (peak-only)'
+        nb_labels = [
+            (f"+{l.bucket_label}" if l.offset > 0 else f"-{l.bucket_label}")
+            for l in legs if l.role != 'peak'
+        ]
+        neighbor_str = (' ' + ' '.join(nb_labels)) if nb_labels else ' (peak-only)'
 
         reason = (
             f"PEAK {city} trend={trend} grade={stability.score:.2f} | "

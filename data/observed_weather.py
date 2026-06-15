@@ -31,9 +31,20 @@ succeeded.
 Network note
 ------------
 The actual HTTP call to Open-Meteo uses ``requests``, imported **lazily inside**
-``_http_get`` so this module (and the pure helpers below) import cleanly where
-``requests`` is missing or the network is disabled. ``split_observed_remaining``
-is fully unit-testable offline.
+the fetch helpers so this module (and the pure helpers below) import cleanly
+where ``requests`` is missing or the network is disabled.
+``split_observed_remaining`` is fully unit-testable offline.
+
+Rate-limit failover
+-------------------
+When an Open-Meteo endpoint returns a rate/IP limit (HTTP status in
+``Config.WEATHER_RATELIMIT_STATUS``, or a JSON error whose reason mentions
+"limit"), that endpoint is put on a ``Config.WEATHER_PROVIDER_COOLDOWN_SECONDS``
+cooldown and requests transparently fail over to the next mirror in
+``Config.OPEN_METEO_ENDPOINTS`` (+ optional
+``Config.OPEN_METEO_FAILOVER_ENDPOINTS``). Cooldowns auto-expire so the primary
+recovers on its own. Config is read lazily so the module stays importable
+offline; defaults match ``WeatherFetcher``.
 
 Diagnostics
 -----------
@@ -44,6 +55,7 @@ non-200, which source(s) failed, and which post-parse guard tripped).
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -57,6 +69,44 @@ except Exception:  # pragma: no cover - fallback only used in bare sandboxes
 # Open-Meteo forecast models we average for a remaining-hours spread estimate.
 _DEFAULT_MODELS = ("ecmwf_ifs04", "gfs_seamless", "icon_seamless", "jma_seamless", "gem_seamless")
 _OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+
+
+def _config():
+    """Lazily import Config; return None offline so the module stays importable."""
+    try:
+        from config import Config  # type: ignore
+        return Config
+    except Exception:  # pragma: no cover - bare sandbox / import-time safety
+        return None
+
+
+def _failover_enabled() -> bool:
+    c = _config()
+    return bool(getattr(c, "WEATHER_FAILOVER_ENABLED", True)) if c is not None else True
+
+
+def _cooldown_seconds() -> int:
+    c = _config()
+    return int(getattr(c, "WEATHER_PROVIDER_COOLDOWN_SECONDS", 600)) if c is not None else 600
+
+
+def _ratelimit_status() -> set:
+    c = _config()
+    vals = getattr(c, "WEATHER_RATELIMIT_STATUS", [429, 403]) if c is not None else [429, 403]
+    return set(vals or [429, 403])
+
+
+def _open_meteo_endpoints() -> List[str]:
+    """Primary Open-Meteo endpoints + optional failover mirrors (appended last)."""
+    c = _config()
+    eps = list(getattr(c, "OPEN_METEO_ENDPOINTS", None) or []) if c is not None else []
+    if not eps:
+        eps = [_OPEN_METEO_URL]
+    fbs = (getattr(c, "OPEN_METEO_FAILOVER_ENDPOINTS", None) or []) if c is not None else []
+    for fb in fbs:
+        if fb not in eps:
+            eps.append(fb)
+    return eps
 
 
 @dataclass
@@ -127,6 +177,9 @@ class ObservedWeather:
     def __init__(self, models: Sequence[str] = _DEFAULT_MODELS, timeout: float = 8.0):
         self.models = list(models)
         self.timeout = timeout
+        self._om_idx = 0  # round-robin index across Open-Meteo endpoints
+        # endpoint URL -> epoch time when it may be retried after a rate/IP limit
+        self._om_cooldowns: Dict[str, float] = {}
 
     # -- networking (lazy import keeps the module importable offline) --------
     def _http_get(self, url: str, params: Dict) -> Optional[Dict]:
@@ -155,6 +208,100 @@ class ObservedWeather:
         except Exception as e:
             log.warning(f"\u26a0\ufe0f  observed-weather fetch failed: {e}")
             return None
+
+    # -- endpoint cooldown / failover (mirrors WeatherFetcher) ---------------
+    def _endpoint_cooling(self, url: str) -> bool:
+        """True if this endpoint is resting after a recent rate/IP limit.
+        Cooldowns auto-expire so the primary recovers on its own."""
+        until = self._om_cooldowns.get(url, 0.0)
+        if until and time.time() < until:
+            return True
+        if until:
+            self._om_cooldowns.pop(url, None)  # cooldown expired -> eligible again
+        return False
+
+    def _mark_endpoint_cooldown(self, url: str, reason: str = "") -> None:
+        """Rest an endpoint after a rate/IP-limit hit so we fail over to others."""
+        if not _failover_enabled():
+            return
+        cd = _cooldown_seconds()
+        self._om_cooldowns[url] = time.time() + cd
+        log.warning(f"\u26a0\ufe0f  observed-weather endpoint cooling {cd}s ({url}) {reason}".rstrip())
+
+    def _next_open_meteo_url(self) -> Optional[str]:
+        """Next AVAILABLE Open-Meteo endpoint (round-robin, skipping cooling ones).
+        Returns None when every endpoint is cooling."""
+        eps = _open_meteo_endpoints()
+        n = len(eps)
+        for _ in range(n):
+            url = eps[self._om_idx % n]
+            self._om_idx += 1
+            if not self._endpoint_cooling(url):
+                return url
+        return None
+
+    def _open_meteo_fetch(self, params: Dict) -> Optional[Dict]:
+        """GET an Open-Meteo forecast with transparent failover across endpoints
+        on a rate/IP limit (status in Config.WEATHER_RATELIMIT_STATUS, or a JSON
+        error reason mentioning 'limit'). The limited endpoint is cooled and the
+        next available mirror is tried. Returns parsed JSON or None."""
+        try:
+            import requests  # lazy: only needed when actually fetching
+        except Exception as e:  # pragma: no cover
+            log.warning(f"requests unavailable, cannot fetch observed weather: {e}")
+            return None
+
+        ratelimit_status = _ratelimit_status()
+        failover = _failover_enabled()
+        max_attempts = len(_open_meteo_endpoints()) if failover else 1
+
+        for _ in range(max_attempts):
+            url = self._next_open_meteo_url()
+            if not url:
+                log.warning("\u26a0\ufe0f  All Open-Meteo endpoints are cooling down — observed weather unavailable")
+                return None
+            try:
+                resp = requests.get(url, params=params, timeout=self.timeout)
+            except Exception as e:
+                log.warning(f"\u26a0\ufe0f  observed-weather fetch failed ({url}): {e}")
+                continue  # transient — try the next mirror without cooling it
+
+            if resp.status_code in ratelimit_status:
+                self._mark_endpoint_cooldown(url, f"HTTP {resp.status_code} (rate/IP limit)")
+                continue
+            if resp.status_code != 200:
+                body = ""
+                try:
+                    body = resp.text[:200].replace("\n", " ")
+                except Exception:
+                    pass
+                log.warning(
+                    f"\u26a0\ufe0f  observed-weather HTTP {resp.status_code} "
+                    f"@ {params.get('latitude')},{params.get('longitude')} "
+                    f"models={params.get('models', '-')} \u2014 {body}"
+                )
+                return None
+            try:
+                data = resp.json()
+            except Exception as e:
+                log.warning(f"\u26a0\ufe0f  observed-weather bad JSON ({url}): {e}")
+                return None
+
+            # Open-Meteo soft error: {"error": true, "reason": "...limit..."}
+            if isinstance(data, dict) and data.get("error"):
+                reason = str(data.get("reason", ""))
+                if "limit" in reason.lower():
+                    self._mark_endpoint_cooldown(url, f"API limit: {reason}")
+                    continue
+                log.warning(
+                    f"\u26a0\ufe0f  observed-weather error @ "
+                    f"{params.get('latitude')},{params.get('longitude')}: {reason}"
+                )
+                return None
+
+            return data
+
+        return None
 
     @staticmethod
     def _parse_day(
@@ -220,11 +367,11 @@ class ObservedWeather:
         #    carries a usable live `current` reading. This is what the observed
         #    extreme must come from — forecast-only models return null for the
         #    past, which is why the observed extreme used to always be None.
-        obs_data = self._http_get(_OPEN_METEO_URL, base_params)
+        obs_data = self._open_meteo_fetch(base_params)
 
         # 2) SPREAD source: multi-model, used ONLY for the remaining-hours
         #    cross-model spread (what the forecast models are good at).
-        model_data = self._http_get(_OPEN_METEO_URL, {**base_params, "models": ",".join(self.models)})
+        model_data = self._open_meteo_fetch({**base_params, "models": ",".join(self.models)})
 
         if not obs_data and not model_data:
             log.warning(

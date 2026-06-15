@@ -11,6 +11,8 @@ Features:
 - Non-blocking (runs in background thread)
 """
 
+import os
+import json
 import html
 import time
 import threading
@@ -521,6 +523,135 @@ class TelegramBot:
         self.send(msg)
 
     # ═══════════════════════════════════════════════════════════════
+    # ANALYSIS (/analysis) — per-strategy performance + downloadable trade log
+    # ═══════════════════════════════════════════════════════════════
+
+    def _trade_log_path(self) -> str:
+        """Resolve the paper-trade JSONL path (PositionManager's, else Config)."""
+        path = getattr(self.pm, '_paper_trades_file', None) if self.pm else None
+        return path or getattr(Config, 'PAPER_TRADE_LOG', 'data/paper_trades.jsonl')
+
+    def _read_trade_log(self) -> List[dict]:
+        """Read every structured record from data/paper_trades.jsonl (one per
+        BUY / SELL / SETTLE / REDEEM / PRECLOSE_LOCK). Returns [] if missing."""
+        path = self._trade_log_path()
+        recs: List[dict] = []
+        try:
+            if not os.path.exists(path):
+                return recs
+            with open(path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        recs.append(json.loads(line))
+                    except Exception:
+                        continue
+        except Exception as e:
+            log.debug(f"trade log read failed: {e}")
+        return recs
+
+    def _send_document(self, file_path: str, caption: str = '') -> bool:
+        """Upload a file to the chat as a downloadable document (sendDocument).
+        Used by /analysis to ship the raw trade log. Fully defensive."""
+        if not self.enabled:
+            return False
+        try:
+            if not os.path.exists(file_path):
+                self.send(f"⚠️ Log file not found: {self._esc(file_path)}")
+                return False
+            with open(file_path, 'rb') as fh:
+                files = {'document': (os.path.basename(file_path), fh)}
+                data = {'chat_id': self.chat_id}
+                if caption:
+                    data['caption'] = caption[:1000]
+                resp = self._session.post(
+                    f"{self.base_url}/sendDocument",
+                    data=data, files=files, timeout=30,
+                )
+            return resp.status_code == 200
+        except Exception as e:
+            log.debug(f"Telegram sendDocument failed: {e}")
+            return False
+
+    def send_analysis(self):
+        """/analysis — full strategy performance breakdown + a downloadable log
+        of every BUY / SELL / SETTLE / REDEEM / exit.
+
+        Live W/L/PnL come from the PositionManager (thesis exits ARE counted as
+        losses — see PositionManager._closed_outcome), and per-strategy BUY
+        counts + action/exit tallies come from data/paper_trades.jsonl.
+        """
+        if not self.pm:
+            self.send("⚠️ Analysis unavailable — position manager not wired.")
+            return
+        stats = self.pm.get_stats()
+        by_strat = self.pm.get_per_strategy_stats()
+        recs = self._read_trade_log()
+
+        # Tally actions + per-strategy BUY counts + exit reasons from the log.
+        action_counts: Dict[str, int] = {}
+        buys_by_strat: Dict[str, int] = {}
+        exit_counts: Dict[str, int] = {}
+        for r in recs:
+            a = r.get('action', '') or '?'
+            action_counts[a] = action_counts.get(a, 0) + 1
+            if a == 'BUY':
+                s = r.get('strategy', '?') or '?'
+                buys_by_strat[s] = buys_by_strat.get(s, 0) + 1
+            if a in ('SELL', 'SETTLE'):
+                xr = r.get('exit_reason', '') or '—'
+                exit_counts[xr] = exit_counts.get(xr, 0) + 1
+
+        text = (
+            f"📈 <b>Strategy Analysis</b> — {stats['mode']}\n"
+            f"Balance ${stats['balance']:.2f} | PnL ${stats['total_pnl']:+.2f} "
+            f"({stats['roi_pct']:+.1f}%)\n"
+            f"WR {stats['win_rate']:.0f}% ({stats['wins']}W/{stats['losses']}L) | "
+            f"Trades {stats['total_trades']} | Open {stats['open_positions']} | "
+            f"Redeemed ${stats['total_redeemed']:.2f}\n"
+            f"{'─'*28}\n"
+            f"<b>By strategy</b> (buys · W/L · WR · PnL)\n"
+        )
+        if not by_strat:
+            text += "  (no trades yet)\n"
+        else:
+            for strat, s in sorted(by_strat.items(),
+                                   key=lambda kv: kv[1]['pnl'], reverse=True):
+                closed = s['wins'] + s['losses']
+                wr = (s['wins'] / closed * 100.0) if closed else 0.0
+                buys = buys_by_strat.get(strat, s['trades'])
+                pe = '🟢' if s['pnl'] >= 0 else '🔴'
+                text += (
+                    f"{pe} <b>{self._esc(strat)}</b>: {buys} buys · "
+                    f"{s['wins']}W/{s['losses']}L · {wr:.0f}% · ${s['pnl']:+.2f}\n"
+                )
+
+        if action_counts:
+            text += f"{'─'*28}\n<b>Log actions</b>: "
+            text += " · ".join(f"{self._esc(k)} {v}"
+                                for k, v in sorted(action_counts.items()))
+            text += "\n"
+        if exit_counts:
+            text += "<b>Exits</b>: "
+            text += " · ".join(f"{self._esc(k)} {v}" for k, v in
+                                sorted(exit_counts.items(), key=lambda kv: -kv[1]))
+            text += "\n"
+
+        self.send(text)
+
+        # Attach the full machine-readable log as a downloadable document.
+        if recs:
+            self._send_document(
+                self._trade_log_path(),
+                caption=(f"📎 Full trade log — {len(recs)} records "
+                         f"(BUY/SELL/SETTLE/REDEEM/exits)"),
+            )
+        else:
+            self.send("ℹ️ No trade-log records yet — the log is empty.")
+
+    # ═══════════════════════════════════════════════════════════════
     # COMMAND HANDLER (polls for incoming commands)
     # ═══════════════════════════════════════════════════════════════
 
@@ -715,6 +846,8 @@ class TelegramBot:
             self.send_positions(page=0, sort='recent', with_summary=False)
         elif cmd == '/markets':
             self.send_markets_summary()
+        elif cmd == '/analysis' or cmd == '/analyze' or cmd == '/report':
+            self.send_analysis()
         elif cmd == '/redeem':
             if self.pm:
                 count = self.pm.redeem_all_winning()
@@ -735,6 +868,7 @@ class TelegramBot:
                 "/pnl — total profit/loss\n"
                 "/positions — open positions (10/page; sort by PnL/Losses/ROI/Recent)\n"
                 "/markets — active weather markets\n"
+                "/analysis — per-strategy performance + downloadable trade log\n"
                 "/redeem — redeem winning positions\n"
                 "/help — this message"
             )
