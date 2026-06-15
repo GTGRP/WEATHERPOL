@@ -375,6 +375,34 @@ class Config:
     PEAK_CLUSTER_TRADE_DECIDED = os.getenv('PEAK_CLUSTER_TRADE_DECIDED', '0') == '1'      # run inside the lock window? off by default
 
     # ===================================================================
+    # SAFETY PEAK — focused HIGH-confidence 1-2 bucket directional peak (Req-25
+    # fix #4). Distinct from peak_cluster (wide 3-7 leg any-one-wins basket) and
+    # peak_basket (looser directional/symmetric basket): this is the TIGHTEST,
+    # most PATIENT peak play. It fires ONLY when the peak estimate is accurate
+    # and high-confidence (tight ensemble std + many agreeing models + strong
+    # grade + high peak-bucket confidence), then buys the peak bucket plus
+    # EXACTLY ONE directional safety neighbour (warming->+1, cooling->-1,
+    # stable->the shoulder the ensemble mean leans toward) in EQUAL SHARES, so
+    # whichever single bucket resolves to $1 covers the other leg's loss PLUS a
+    # net profit AFTER fees. Holds to resolution. OFF by default — enable once
+    # validated. Defaults below mirror the in-code getattr() fallbacks.
+    # ===================================================================
+    SAFETY_PEAK_ENABLED = os.getenv('SAFETY_PEAK_ENABLED', '0') == '1'
+    SAFETY_PEAK_MIN_GRADE = float(os.getenv('SAFETY_PEAK_MIN_GRADE', '0.65'))             # min stability grade (accurate, predictable day)
+    SAFETY_PEAK_MIN_MODELS = int(os.getenv('SAFETY_PEAK_MIN_MODELS', '3'))                # min ensemble models agreeing
+    SAFETY_PEAK_MAX_STD = float(os.getenv('SAFETY_PEAK_MAX_STD', '1.2'))                  # max ensemble spread (C); tight = accurate
+    SAFETY_PEAK_MIN_CONFIDENCE = float(os.getenv('SAFETY_PEAK_MIN_CONFIDENCE', '0.70'))   # min peak-bucket confidence
+    SAFETY_PEAK_MAX_PEAK_PRICE = float(os.getenv('SAFETY_PEAK_MAX_PEAK_PRICE', '0.85'))   # don't chase an already-priced peak
+    SAFETY_PEAK_MAX_NEIGHBOR_PRICE = float(os.getenv('SAFETY_PEAK_MAX_NEIGHBOR_PRICE', '0.60'))  # neighbour price cap
+    SAFETY_PEAK_FEE_BUFFER = float(os.getenv('SAFETY_PEAK_FEE_BUFFER', '0.02'))           # taker-fee headroom on the winning leg
+    SAFETY_PEAK_MIN_NET_PROFIT = float(os.getenv('SAFETY_PEAK_MIN_NET_PROFIT', '0.05'))   # min net profit after fees (any-one-wins)
+    SAFETY_PEAK_MIN_EDGE = float(os.getenv('SAFETY_PEAK_MIN_EDGE', '0.05'))               # combined prob - basket cost minimum
+    SAFETY_PEAK_BASE_FRACTION = float(os.getenv('SAFETY_PEAK_BASE_FRACTION', '0.05'))     # base % of balance per basket
+    SAFETY_PEAK_MAX_FRACTION = float(os.getenv('SAFETY_PEAK_MAX_FRACTION', '0.20'))       # max % of balance per basket
+    SAFETY_PEAK_MAX_USD = float(os.getenv('SAFETY_PEAK_MAX_USD', '15.0'))                 # hard $ cap per basket
+    SAFETY_PEAK_TRADE_DECIDED = os.getenv('SAFETY_PEAK_TRADE_DECIDED', '0') == '1'        # run inside the lock window? off (forecast-based edge)
+
+    # ===================================================================
     # THESIS-INVALIDATION EXIT — STRICT early exit. Most positions HOLD to
     # resolution; only a non-tail position whose ROI has COLLAPSED (very bad)
     # exits early. Cheap tails, stale prices, and near-close positions all KEEP
@@ -580,6 +608,8 @@ class Config:
               f"(edge>={cls.QUICK_FLIP_MIN_EDGE:.0%} or run-change, hold<={cls.QUICK_FLIP_MAX_HOLD_MIN}m, max {cls.QUICK_FLIP_MAX_CONCURRENT})")
         print(f"PeakCluster: {'ON' if cls.PEAK_CLUSTER_ENABLED else 'OFF'} "
               f"(span+/-{cls.PEAK_CLUSTER_SPAN}, {cls.PEAK_CLUSTER_MIN_LEGS}-{cls.PEAK_CLUSTER_MAX_LEGS} legs, cost<{cls.PEAK_CLUSTER_MAX_COST}, HOLD)")
+        print(f"SafetyPeak:  {'ON' if cls.SAFETY_PEAK_ENABLED else 'OFF'} "
+              f"(grade>={cls.SAFETY_PEAK_MIN_GRADE}, conf>={cls.SAFETY_PEAK_MIN_CONFIDENCE:.0%}, std<={cls.SAFETY_PEAK_MAX_STD}C, peak+1nb, HOLD)")
         print(f"ThesisExit:  {'ON' if cls.THESIS_EXIT_ENABLED else 'OFF'} "
               f"(only ROI<={cls.THESIS_EXIT_MAX_ROI_PCT:.0f}% & entry>={cls.THESIS_EXIT_MIN_ENTRY_PRICE})")
         print(f"Trailing:    {cls.TRAILING_STOP_PCT:.0f}% from peak, armed after {cls.TRAILING_MIN_PEAK_MULT}x entry")
