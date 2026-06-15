@@ -243,7 +243,7 @@ class PositionManager:
 
     # ═════════════════════════════════════════════
     # POSITION LIFECYCLE
-    # ═════════════════════════════════════════════
+    # ════════════════════════════════════════════
 
     def add_position(self, token_id: str, condition_id: str, entry_price: float,
                      shares: float, cost_usd: float, market_title: str,
@@ -728,13 +728,23 @@ class PositionManager:
         pos.status = 'sold' if reason in ('take_profit', 'stop_loss', 'trailing_stop', 'manual') else reason
 
         # Calculate PnL
-        if reason in ('take_profit', 'trailing_stop', 'manual'):
+        if reason in ('take_profit', 'trailing_stop', 'manual', 'stop_loss'):
             # Sold at market — PnL = (exit_price - entry_price) * shares
             pos.pnl = (exit_price - pos.entry_price) * pos.shares
             pos.realized_pnl = pos.pnl
-        elif reason == 'stop_loss':
-            pos.pnl = (exit_price - pos.entry_price) * pos.shares
-            pos.realized_pnl = pos.pnl
+            # ── WIN/LOSS ACCOUNTING FOR MARKET EXITS ──
+            # BUGFIX: previously ONLY 'won'/'lost' resolutions touched
+            # self.wins/self.losses. Every market SELL — thesis-exit,
+            # flip book-or-cut, stop-loss, trailing-stop, manual — was booked
+            # with a real PnL but NEVER counted in the W/L record, so a thesis
+            # exit closed at a loss was invisible to win-rate (it silently
+            # dropped the loser and INFLATED WR). A market exit is a real,
+            # realized outcome: a gain is a WIN, a loss is a LOSS. Count it by
+            # realized-PnL sign; a true break-even (|pnl| < 1e-9) is neither.
+            if pos.pnl > 1e-9:
+                self.wins += 1
+            elif pos.pnl < -1e-9:
+                self.losses += 1
         elif reason == 'won':
             pos.pnl = pos.shares - pos.cost_usd
             pos.realized_pnl = pos.pnl
@@ -1191,6 +1201,29 @@ class PositionManager:
     # STATISTICS (per-position + aggregate)
     # ═════════════════════════════════════════════
 
+    @staticmethod
+    def _closed_outcome(p) -> Optional[str]:
+        """Classify a CLOSED position as 'win' or 'loss' for win-rate stats.
+
+        - Resolutions: status 'won'/'redeemed' => win, 'lost' => loss.
+        - Market exits (status 'sold': thesis-exit, flip book-or-cut, stop-loss,
+          trailing-stop, manual) count by REALIZED-PnL sign so a thesis-exit sold
+          at a loss is correctly a LOSS rather than being silently dropped (which
+          used to inflate win-rate).
+        Returns None for still-open / pending positions and exact break-evens.
+        """
+        st = getattr(p, 'status', '')
+        if st in ('won', 'redeemed'):
+            return 'win'
+        if st == 'lost':
+            return 'loss'
+        if st == 'sold':
+            if p.pnl > 1e-9:
+                return 'win'
+            if p.pnl < -1e-9:
+                return 'loss'
+        return None
+
     def get_stats(self) -> Dict:
         """Comprehensive stats."""
         open_pos = self.get_open_positions()
@@ -1239,22 +1272,33 @@ class PositionManager:
         stats: Dict[str, Dict] = {}
         for p in self.positions:
             if p.city not in stats:
-                stats[p.city] = {'trades': 0, 'wins': 0, 'pnl': 0.0}
+                stats[p.city] = {'trades': 0, 'wins': 0, 'losses': 0, 'pnl': 0.0}
             stats[p.city]['trades'] += 1
-            if p.status in ('won', 'redeemed'):
+            oc = self._closed_outcome(p)
+            if oc == 'win':
                 stats[p.city]['wins'] += 1
+            elif oc == 'loss':
+                stats[p.city]['losses'] += 1
             stats[p.city]['pnl'] += p.pnl if p.status != 'open' else p.unrealized_pnl
         return stats
 
     def get_per_strategy_stats(self) -> Dict[str, Dict]:
-        """PnL breakdown by strategy."""
+        """PnL breakdown by strategy.
+
+        Wins/losses count CLOSED positions by outcome (see `_closed_outcome`):
+        resolutions by won/lost, market exits (incl. thesis-exit) by realized-PnL
+        sign. 'trades' counts every position (incl. still-open) for context.
+        """
         stats: Dict[str, Dict] = {}
         for p in self.positions:
             if p.strategy not in stats:
-                stats[p.strategy] = {'trades': 0, 'wins': 0, 'pnl': 0.0}
+                stats[p.strategy] = {'trades': 0, 'wins': 0, 'losses': 0, 'pnl': 0.0}
             stats[p.strategy]['trades'] += 1
-            if p.status in ('won', 'redeemed'):
+            oc = self._closed_outcome(p)
+            if oc == 'win':
                 stats[p.strategy]['wins'] += 1
+            elif oc == 'loss':
+                stats[p.strategy]['losses'] += 1
             stats[p.strategy]['pnl'] += p.pnl if p.status != 'open' else p.unrealized_pnl
         return stats
 
