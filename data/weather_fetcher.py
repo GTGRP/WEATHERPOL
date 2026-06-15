@@ -52,19 +52,97 @@ class WeatherFetcher:
         self._cache: Dict[str, Tuple[float, List[ForecastPoint]]] = {}
         self._cache_ttl = int(getattr(Config, 'WEATHER_FORECAST_CACHE_SECONDS', 300))  # 5 min default
         self._om_idx = 0  # round-robin index across Open-Meteo endpoints
+        # endpoint URL -> epoch time when it may be retried after a rate/IP limit
+        self._om_cooldowns: Dict[str, float] = {}
 
     def _open_meteo_endpoints(self) -> List[str]:
-        eps = getattr(Config, 'OPEN_METEO_ENDPOINTS', None)
-        if eps:
-            return list(eps)
-        return ["https://api.open-meteo.com/v1/forecast"]
+        """Primary Open-Meteo endpoints + optional failover mirrors.
+        Failover mirrors are appended last and only get reached when the primary
+        endpoints are cooling down after a rate/IP limit."""
+        eps = list(getattr(Config, 'OPEN_METEO_ENDPOINTS', None) or [])
+        if not eps:
+            eps = ["https://api.open-meteo.com/v1/forecast"]
+        for fb in (getattr(Config, 'OPEN_METEO_FAILOVER_ENDPOINTS', None) or []):
+            if fb not in eps:
+                eps.append(fb)
+        return eps
 
-    def _next_open_meteo_url(self) -> str:
-        """Pick the next Open-Meteo endpoint (round-robin across configured ones)."""
+    def _endpoint_cooling(self, url: str) -> bool:
+        """True if this endpoint is resting after a recent rate/IP limit.
+        Cooldowns auto-expire so the primary recovers on its own."""
+        until = self._om_cooldowns.get(url, 0.0)
+        if until and time.time() < until:
+            return True
+        if until:
+            self._om_cooldowns.pop(url, None)  # cooldown expired -> eligible again
+        return False
+
+    def _mark_endpoint_cooldown(self, url: str, reason: str = '') -> None:
+        """Rest an endpoint after a rate/IP-limit hit so we fail over to others."""
+        if not getattr(Config, 'WEATHER_FAILOVER_ENABLED', True):
+            return
+        cd = int(getattr(Config, 'WEATHER_PROVIDER_COOLDOWN_SECONDS', 600))
+        self._om_cooldowns[url] = time.time() + cd
+        log.warning(f"⚠️  Open-Meteo endpoint cooling {cd}s ({url}) {reason}".rstrip())
+
+    def _next_open_meteo_url(self) -> Optional[str]:
+        """Pick the next AVAILABLE Open-Meteo endpoint (round-robin, skipping any
+        that are cooling down). Returns None when every endpoint is cooling."""
         eps = self._open_meteo_endpoints()
-        url = eps[self._om_idx % len(eps)]
-        self._om_idx += 1
-        return url
+        n = len(eps)
+        for _ in range(n):
+            url = eps[self._om_idx % n]
+            self._om_idx += 1
+            if not self._endpoint_cooling(url):
+                return url
+        return None
+
+    def _open_meteo_request(self, params: dict) -> Optional[dict]:
+        """GET an Open-Meteo forecast, transparently failing over across endpoints
+        on a rate/IP limit (HTTP status in Config.WEATHER_RATELIMIT_STATUS, or a
+        JSON error whose reason mentions 'limit'). The limited endpoint is put on
+        a cooldown and the next available mirror is tried. Returns parsed JSON, or
+        None if no endpoint produced usable data."""
+        ratelimit_status = set(getattr(Config, 'WEATHER_RATELIMIT_STATUS', [429, 403]) or [429, 403])
+        failover = getattr(Config, 'WEATHER_FAILOVER_ENABLED', True)
+        max_attempts = len(self._open_meteo_endpoints()) if failover else 1
+
+        for _ in range(max_attempts):
+            url = self._next_open_meteo_url()
+            if not url:
+                log.warning("⚠️  All Open-Meteo endpoints are cooling down — using other sources")
+                return None
+            try:
+                resp = self.session.get(url, params=params, timeout=10)
+            except Exception as e:
+                log.debug(f"Open-Meteo request error ({url}): {e}")
+                continue  # transient — try the next mirror without cooling it
+
+            if resp.status_code in ratelimit_status:
+                self._mark_endpoint_cooldown(url, f"HTTP {resp.status_code} (rate/IP limit)")
+                continue
+            if resp.status_code != 200:
+                log.debug(f"Open-Meteo HTTP {resp.status_code} ({url})")
+                return None
+
+            try:
+                data = resp.json()
+            except Exception as e:
+                log.debug(f"Open-Meteo bad JSON ({url}): {e}")
+                return None
+
+            # Open-Meteo soft error: {"error": true, "reason": "...limit..."}
+            if isinstance(data, dict) and data.get('error'):
+                reason = str(data.get('reason', ''))
+                if 'limit' in reason.lower():
+                    self._mark_endpoint_cooldown(url, f"API limit: {reason}")
+                    continue
+                log.debug(f"Open-Meteo error ({url}): {reason}")
+                return None
+
+            return data
+
+        return None
 
     def fetch_all(self, lat: float, lon: float, city: str = '',
                   target_time: datetime = None) -> List[ForecastPoint]:
@@ -113,7 +191,8 @@ class WeatherFetcher:
         """
         Open-Meteo: SINGLE batch request with all models for speed.
         Previously made 5 sequential requests — now 1 batch call.
-        Endpoint is chosen round-robin across Config.OPEN_METEO_ENDPOINTS.
+        Endpoint is chosen round-robin across Config.OPEN_METEO_ENDPOINTS, with
+        automatic failover to the next mirror when one is rate/IP limited.
         """
         results = []
         models = ['ecmwf_ifs04', 'gfs_seamless', 'icon_seamless',
@@ -123,7 +202,6 @@ class WeatherFetcher:
             'icon_seamless': 0.82, 'jma_seamless': 0.78, 'gem_seamless': 0.75,
         }
 
-        url = self._next_open_meteo_url()
         params = {
             'latitude': lat,
             'longitude': lon,
@@ -133,12 +211,11 @@ class WeatherFetcher:
             'forecast_days': 3,
         }
 
-        try:
-            resp = self.session.get(url, params=params, timeout=10)
-            if resp.status_code != 200:
-                return results
+        data = self._open_meteo_request(params)
+        if not data:
+            return results
 
-            data = resp.json()
+        try:
             hourly = data.get('hourly', {})
             times = hourly.get('time', [])
             if not times:
@@ -235,7 +312,7 @@ class WeatherFetcher:
         results = []
 
         # Step 1: Get gridpoint
-        points_url = f"https://api.weather.gov/points/{lat:.4f},{lon:.4f}"
+        points_url = f"{{https://api.weather.gov/points/{lat:.4f}}},{lon:.4f}"
         resp = self.session.get(points_url, timeout=10)
         if resp.status_code != 200:
             return results
@@ -290,9 +367,9 @@ class WeatherFetcher:
         return results
 
 
-# ═══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════
 # KNOWN CITY COORDINATES (for Polymarket weather markets)
-# ═══════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════
 CITY_COORDS = {
     # Asia (popular on Polymarket weather markets)
     'tokyo': (35.6762, 139.6503),
