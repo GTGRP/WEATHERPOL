@@ -203,7 +203,7 @@ class Config:
     STRATEGY_SIZE_MULT = {
         'peak_cluster': float(os.getenv('SIZE_MULT_PEAK_CLUSTER', '1.25')),
         'late_observed_yes': float(os.getenv('SIZE_MULT_LATE_OBSERVED_YES', '0.6')),
-        'late_observed_no': float(os.getenv('SIZE_MULT_LATE_OBSERVED_NO', '1.0')),
+        'late_observed_no': float(os.getenv('SIZE_MULT_LATE_OBSERVED_NO', '1.3')),
         'quick_flip': float(os.getenv('SIZE_MULT_QUICK_FLIP', '1.0')),
     }
 
@@ -274,6 +274,12 @@ class Config:
     LATE_OBSERVED_EDGE_FULL = float(os.getenv('LATE_OBSERVED_EDGE_FULL', '0.25'))            # post-fee edge counted as max strength
     LATE_OBSERVED_W_EDGE = float(os.getenv('LATE_OBSERVED_W_EDGE', '0.6'))                   # weight of edge in the strength score
     LATE_OBSERVED_W_GRADE = float(os.getenv('LATE_OBSERVED_W_GRADE', '0.4'))                 # weight of grade in the strength score
+    # --- Req-27 YES-side tightening: late_observed_yes was a net loser, so the
+    # YES leg now only fires on a STRONGLY-locked, high-edge setup. The NO side
+    # keeps the looser LATE_OBSERVED_MIN_LOCK / MIN_EDGE above. These gate the
+    # YES leg ONLY (wired in strategies/late_observed_temp.py). ---
+    LATE_OBSERVED_YES_MIN_LOCK = float(os.getenv('LATE_OBSERVED_YES_MIN_LOCK', '0.80'))      # YES leg needs this lock-confidence (vs NO)
+    LATE_OBSERVED_YES_MIN_EDGE = float(os.getenv('LATE_OBSERVED_YES_MIN_EDGE', '0.14'))      # YES leg needs this post-fee edge (vs NO)
 
     # ===================================================================
     # CITY FILTER (which cities to trade — empty = all)
@@ -356,21 +362,34 @@ class Config:
     # defaults — editable here now.
     # ===================================================================
     QUICK_FLIP_MIN_DELTA_C = float(os.getenv('QUICK_FLIP_MIN_DELTA_C', '1.0'))            # min ensemble-mean move (C) across runs to signal
-    QUICK_FLIP_MIN_EDGE = float(os.getenv('QUICK_FLIP_MIN_EDGE', '0.08'))                 # early-mispricing entry: model prob - price >= this
-    QUICK_FLIP_MAX_PER_MARKET = int(os.getenv('QUICK_FLIP_MAX_PER_MARKET', '3'))          # cap flip candidates per market per scan
+    QUICK_FLIP_MIN_EDGE = float(os.getenv('QUICK_FLIP_MIN_EDGE', '0.18'))                 # early-mispricing entry: model prob - price >= this (Req-27: stricter -> only real mispricings)
+    QUICK_FLIP_MAX_PER_MARKET = int(os.getenv('QUICK_FLIP_MAX_PER_MARKET', '1'))          # cap flip candidates per market per scan (Req-27: 1 -> no duplicate flips on one market)
     QUICK_FLIP_MIN_CONFIDENCE = float(os.getenv('QUICK_FLIP_MIN_CONFIDENCE', '0.6'))      # min confidence required after boosts
     QUICK_FLIP_MAX_ENTRY = float(os.getenv('QUICK_FLIP_MAX_ENTRY', '0.85'))               # don't chase an already-priced bucket
     QUICK_FLIP_MAX_HOLD_MIN = int(os.getenv('QUICK_FLIP_MAX_HOLD_MIN', '120'))            # book-or-cut after this many minutes
-    QUICK_FLIP_TARGET_ROI = float(os.getenv('QUICK_FLIP_TARGET_ROI', '15.0'))             # take-profit ROI% target
+    QUICK_FLIP_TARGET_ROI = float(os.getenv('QUICK_FLIP_TARGET_ROI', '10.0'))             # take-profit ROI% target (Req-27: first profit rung)
     QUICK_FLIP_SIZE_PCT = float(os.getenv('QUICK_FLIP_SIZE_PCT', '0.05'))                 # base size as % of balance
     QUICK_FLIP_MAX_SIZE_USD = float(os.getenv('QUICK_FLIP_MAX_SIZE_USD', '10.0'))         # hard $ cap per flip
     QUICK_FLIP_SIGNAL_COOLDOWN_MIN = int(os.getenv('QUICK_FLIP_SIGNAL_COOLDOWN_MIN', '30'))  # dedup: don't re-signal same bucket within N min
     QUICK_FLIP_WINDOW_MIN = int(os.getenv('QUICK_FLIP_WINDOW_MIN', '20'))                 # publish-window length (min) for the boost
     QUICK_FLIP_WINDOW_BOOST = float(os.getenv('QUICK_FLIP_WINDOW_BOOST', '0.10'))         # confidence boost inside the publish window
-    QUICK_FLIP_STALE_BOOST = float(os.getenv('QUICK_FLIP_STALE_BOOST', '0.10'))           # confidence boost when the market price is stale
+    QUICK_FLIP_STALE_BOOST = float(os.getenv('QUICK_FLIP_STALE_BOOST', '0.0'))            # confidence boost when the market price is stale (Req-27: 0 -> don't over-fire on stale alone)
     QUICK_FLIP_STALE_EPS = float(os.getenv('QUICK_FLIP_STALE_EPS', '0.01'))               # |price-prev| below this counts as stale
-    QUICK_FLIP_MAX_CONCURRENT = int(os.getenv('QUICK_FLIP_MAX_CONCURRENT', '6'))          # max simultaneous open flips
-    QUICK_FLIP_TIME_EXIT = os.getenv('QUICK_FLIP_TIME_EXIT', '1') == '1'                  # enforce book-or-cut at the hold cap
+    QUICK_FLIP_MAX_CONCURRENT = int(os.getenv('QUICK_FLIP_MAX_CONCURRENT', '3'))          # max simultaneous open flips (Req-27: fewer, higher-quality flips)
+    QUICK_FLIP_TIME_EXIT = os.getenv('QUICK_FLIP_TIME_EXIT', '1') == '1'                  # enforce the (now profit-only) exit at the hold cap
+    # --- Req-27 PROFIT-ONLY LADDERED EXIT (trading/exit_policies.check_flip_exits) ---
+    # A flip must SELL ONLY IN PROFIT. The ML decides book-small-now vs run-more,
+    # laddered at MIN/MID/RUN ROI%; a big runner (>= FORCE_BOOK) is ALWAYS booked
+    # so a winner never round-trips back to breakeven. A flip that is NOT in
+    # profit by its hold cap is NEVER cut at a loss/breakeven — it converts to
+    # hold-to-resolution and rides to settlement instead. Set PROFIT_ONLY_EXIT=0
+    # for the legacy book-or-cut-at-market behaviour.
+    QUICK_FLIP_PROFIT_ONLY_EXIT = os.getenv('QUICK_FLIP_PROFIT_ONLY_EXIT', '1') == '1'    # never book a flip at a loss/breakeven on the timer
+    QUICK_FLIP_USE_ML_EXIT = os.getenv('QUICK_FLIP_USE_ML_EXIT', '1') == '1'              # let the ML (XGBoost/GPT) decide sell-small vs run-more
+    QUICK_FLIP_MIN_BOOK_ROI_PCT = float(os.getenv('QUICK_FLIP_MIN_BOOK_ROI_PCT', '10.0')) # lowest profit rung we will book
+    QUICK_FLIP_LADDER_MID_ROI_PCT = float(os.getenv('QUICK_FLIP_LADDER_MID_ROI_PCT', '20.0'))  # mid profit rung (flip_book_mid)
+    QUICK_FLIP_LADDER_RUN_ROI_PCT = float(os.getenv('QUICK_FLIP_LADDER_RUN_ROI_PCT', '30.0'))  # let strong flips run toward this
+    QUICK_FLIP_FORCE_BOOK_ROI_PCT = float(os.getenv('QUICK_FLIP_FORCE_BOOK_ROI_PCT', '30.0'))  # always book at/above this (don't round-trip a winner)
 
     # ===================================================================
     # PEAK_CLUSTER — NEW parallel any-one-wins basket. Estimate the peak bucket
@@ -384,7 +403,7 @@ class Config:
     PEAK_CLUSTER_ENABLED = os.getenv('PEAK_CLUSTER_ENABLED', '1') == '1'
     PEAK_CLUSTER_SPAN = int(os.getenv('PEAK_CLUSTER_SPAN', '3'))                          # +/- buckets around the estimated peak
     PEAK_CLUSTER_MAX_COST = float(os.getenv('PEAK_CLUSTER_MAX_COST', '0.97'))             # combined per-share cost ceiling (any win still profits after fees)
-    PEAK_CLUSTER_MIN_LEGS = int(os.getenv('PEAK_CLUSTER_MIN_LEGS', '2'))                  # minimum legs for a valid basket
+    PEAK_CLUSTER_MIN_LEGS = int(os.getenv('PEAK_CLUSTER_MIN_LEGS', '3'))                  # minimum legs for a valid basket (Req-27: never a 1-leg "cluster")
     PEAK_CLUSTER_MAX_LEGS = int(os.getenv('PEAK_CLUSTER_MAX_LEGS', '7'))                  # 2-7 neighbouring buckets per the design
     PEAK_CLUSTER_MIN_EDGE = float(os.getenv('PEAK_CLUSTER_MIN_EDGE', '0.03'))             # combined prob - cost minimum
     PEAK_CLUSTER_MIN_CONF = float(os.getenv('PEAK_CLUSTER_MIN_CONF', '0.55'))             # min center-bucket confidence
@@ -421,6 +440,46 @@ class Config:
     SAFETY_PEAK_MAX_FRACTION = float(os.getenv('SAFETY_PEAK_MAX_FRACTION', '0.20'))       # max % of balance per basket
     SAFETY_PEAK_MAX_USD = float(os.getenv('SAFETY_PEAK_MAX_USD', '15.0'))                 # hard $ cap per basket
     SAFETY_PEAK_TRADE_DECIDED = os.getenv('SAFETY_PEAK_TRADE_DECIDED', '0') == '1'        # run inside the lock window? off (forecast-based edge)
+
+    # ===================================================================
+    # PEAKER (Req-27) — UNIFIED peak strategy that REPLACES peak_basket +
+    # safety_peak (they bought the same peak position twice as duplicates). One
+    # strategy, four shapes, all combined cost < PEAKER_MAX_COST so any single
+    # winning leg nets profit after fees, HELD to resolution:
+    #   (1) solo: the peak bucket alone (1 leg) — only when very high confidence;
+    #   (2) basket-warmer: peak + (+1) neighbour;
+    #   (3) basket-cooler: peak + (-1) neighbour;
+    #   (4) both neighbours -> deferred to peak_cluster (don't duplicate here).
+    # CALIBRATED around the winning COOL neighbour (safety_peak_neighbor_cool was
+    # the top performer; safety_peak_peak busted): PREFER_COOL biases to the -1
+    # cooler basket by default, sizes the cool side up (COOL_SIZE_MULT) and relaxes
+    # its edge gate slightly (COOL_EDGE_RELAX), and shrinks the warm side
+    # (WARM_SIZE_MULT). peaker.py reads every knob via getattr with these same
+    # defaults, so it already runs before this commit; this block just makes the
+    # knobs explicit/tunable. SAFETY_PEAK_* / PEAK_BASKET_* above are now dead
+    # config kept only so old envs don't break.
+    # ===================================================================
+    PEAKER_ENABLED = os.getenv('PEAKER_ENABLED', '1') == '1'
+    PEAKER_MIN_GRADE = float(os.getenv('PEAKER_MIN_GRADE', '0.60'))                       # min stability grade to trade
+    PEAKER_MIN_MODELS = int(os.getenv('PEAKER_MIN_MODELS', '3'))                          # min ensemble models agreeing
+    PEAKER_MAX_STD = float(os.getenv('PEAKER_MAX_STD', '1.4'))                            # max ensemble spread (C)
+    PEAKER_MIN_CONFIDENCE = float(os.getenv('PEAKER_MIN_CONFIDENCE', '0.62'))             # min peak-bucket confidence for a basket
+    PEAKER_SOLO_MIN_CONFIDENCE = float(os.getenv('PEAKER_SOLO_MIN_CONFIDENCE', '0.80'))   # higher bar to buy the peak bucket SOLO (1 leg)
+    PEAKER_PEAK_BIAS_BUCKETS = int(os.getenv('PEAKER_PEAK_BIAS_BUCKETS', '1'))            # hot-bias correction: nudge the peak estimate down N buckets
+    PEAKER_MAX_PEAK_PRICE = float(os.getenv('PEAKER_MAX_PEAK_PRICE', '0.85'))             # don't chase an already-priced peak
+    PEAKER_MAX_NEIGHBOR_PRICE = float(os.getenv('PEAKER_MAX_NEIGHBOR_PRICE', '0.60'))     # neighbour price cap
+    PEAKER_MAX_COST = float(os.getenv('PEAKER_MAX_COST', '0.95'))                         # combined per-share cost ceiling (any win profits after fees)
+    PEAKER_FEE_BUFFER = float(os.getenv('PEAKER_FEE_BUFFER', '0.02'))                     # taker-fee headroom on the winning leg
+    PEAKER_MIN_NET_PROFIT = float(os.getenv('PEAKER_MIN_NET_PROFIT', '0.03'))             # min net profit after fees (any-one-wins)
+    PEAKER_MIN_EDGE = float(os.getenv('PEAKER_MIN_EDGE', '0.04'))                         # combined prob - basket cost minimum
+    PEAKER_BASE_FRACTION = float(os.getenv('PEAKER_BASE_FRACTION', '0.05'))               # base % of balance per basket
+    PEAKER_MAX_FRACTION = float(os.getenv('PEAKER_MAX_FRACTION', '0.20'))                 # max % of balance per basket
+    PEAKER_MAX_USD = float(os.getenv('PEAKER_MAX_USD', '15.0'))                           # hard $ cap per basket
+    PEAKER_PREFER_COOL = os.getenv('PEAKER_PREFER_COOL', '1') == '1'                      # bias to the winning COOL (-1) neighbour basket
+    PEAKER_COOL_SIZE_MULT = float(os.getenv('PEAKER_COOL_SIZE_MULT', '1.35'))             # size the cool side up (it wins more)
+    PEAKER_COOL_EDGE_RELAX = float(os.getenv('PEAKER_COOL_EDGE_RELAX', '0.02'))           # relax the cool side's edge gate slightly
+    PEAKER_WARM_SIZE_MULT = float(os.getenv('PEAKER_WARM_SIZE_MULT', '0.7'))              # shrink the warm side (it loses more)
+    PEAKER_TRADE_DECIDED = os.getenv('PEAKER_TRADE_DECIDED', '0') == '1'                  # run inside the lock window? off (forecast-based edge)
 
     # ===================================================================
     # THESIS-INVALIDATION EXIT — STRICT early exit. Most positions HOLD to
@@ -628,8 +687,9 @@ class Config:
               f"(edge>={cls.QUICK_FLIP_MIN_EDGE:.0%} or run-change, hold<={cls.QUICK_FLIP_MAX_HOLD_MIN}m, max {cls.QUICK_FLIP_MAX_CONCURRENT})")
         print(f"PeakCluster: {'ON' if cls.PEAK_CLUSTER_ENABLED else 'OFF'} "
               f"(span+/-{cls.PEAK_CLUSTER_SPAN}, {cls.PEAK_CLUSTER_MIN_LEGS}-{cls.PEAK_CLUSTER_MAX_LEGS} legs, cost<{cls.PEAK_CLUSTER_MAX_COST}, HOLD)")
-        print(f"SafetyPeak:  {'ON' if cls.SAFETY_PEAK_ENABLED else 'OFF'} "
-              f"(grade>={cls.SAFETY_PEAK_MIN_GRADE}, conf>={cls.SAFETY_PEAK_MIN_CONFIDENCE:.0%}, std<={cls.SAFETY_PEAK_MAX_STD}C, peak+1nb, HOLD)")
+        print(f"Peaker:      {'ON' if getattr(cls, 'PEAKER_ENABLED', True) else 'OFF'} "
+              f"(merged peak+safety; prefer-cool={'Y' if getattr(cls, 'PEAKER_PREFER_COOL', True) else 'N'}, "
+              f"grade>={getattr(cls, 'PEAKER_MIN_GRADE', 0.60)}, cost<{getattr(cls, 'PEAKER_MAX_COST', 0.95)}, HOLD)")
         print(f"ThesisExit:  {'ON' if cls.THESIS_EXIT_ENABLED else 'OFF'} "
               f"(only ROI<={cls.THESIS_EXIT_MAX_ROI_PCT:.0f}% & entry>={cls.THESIS_EXIT_MIN_ENTRY_PRICE})")
         print(f"Trailing:    {cls.TRAILING_STOP_PCT:.0f}% from peak, armed after {cls.TRAILING_MIN_PEAK_MULT}x entry")
