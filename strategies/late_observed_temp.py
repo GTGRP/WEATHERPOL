@@ -26,7 +26,7 @@ observed-temperature probability model.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from data import fees
@@ -98,6 +98,13 @@ class DecideParams:
     edge_full: float = 0.25          # post-fee edge that counts as max strength
     w_edge: float = 0.6              # weight of edge in the strength score
     w_grade: float = 0.4             # weight of grade in the strength score
+    # --- Req-27 YES-side gating (late_observed_yes was a net loser) -------
+    # The YES leg needs a HIGHER post-fee edge than the NO side, and is only
+    # CONSIDERED when the strategy says the day is strongly locked (allow_yes,
+    # set per-call from the lock confidence vs LATE_OBSERVED_YES_MIN_LOCK). The
+    # NO side keeps the looser min_edge / lock so the winning NO edge is intact.
+    yes_min_edge: float = 0.14       # YES-only post-fee edge floor (vs min_edge for NO)
+    allow_yes: bool = True           # gate: only emit YES legs on a strongly-locked day
 
 
 def _stake_usd(prob_win: float, price: float, balance: float, grade: float,
@@ -143,10 +150,13 @@ def decide_legs(
 
     for label, p_win in observed_probs.items():
         # --- YES side: bucket observed data expects to win ----------------
+        # Req-27: only when allow_yes (day strongly locked) AND clearing the
+        # higher YES-only edge floor (yes_min_edge). late_observed_yes lost net
+        # at the looser NO-side gate, so the YES leg is now strict.
         yp = yes_prices.get(label)
         ytid = yes_token_ids.get(label)
-        if yp is not None and ytid and params.min_entry_price <= yp <= params.max_entry_price:
-            if fees.passes_fee_gate(p_win, yp, params.min_edge, params.taker):
+        if params.allow_yes and yp is not None and ytid and params.min_entry_price <= yp <= params.max_entry_price:
+            if fees.passes_fee_gate(p_win, yp, params.yes_min_edge, params.taker):
                 edge = p_win - fees.breakeven_prob(yp, params.taker)
                 legs.append(LateObservedLeg(
                     bucket_label=label, side="YES", token_id=ytid, price=yp,
@@ -192,6 +202,8 @@ class LateObservedTempStrategy:
         self.enabled = bool(g("LATE_OBSERVED_ENABLED", 1))
         self.no_side_enabled = bool(g("LATE_OBSERVED_NO_SIDE", 1))
         self.min_lock_conf = float(g("LATE_OBSERVED_MIN_LOCK", 0.70))
+        # Req-27: the YES leg requires a STRONGER lock than the NO side.
+        self.yes_min_lock = float(g("LATE_OBSERVED_YES_MIN_LOCK", 0.80))
         self.params = DecideParams(
             min_edge=float(g("LATE_OBSERVED_MIN_EDGE", 0.10)),
             min_entry_price=float(g("LATE_OBSERVED_MIN_ENTRY_PRICE", 0.02)),
@@ -209,6 +221,7 @@ class LateObservedTempStrategy:
             edge_full=float(g("LATE_OBSERVED_EDGE_FULL", 0.25)),
             w_edge=float(g("LATE_OBSERVED_W_EDGE", 0.6)),
             w_grade=float(g("LATE_OBSERVED_W_GRADE", 0.4)),
+            yes_min_edge=float(g("LATE_OBSERVED_YES_MIN_EDGE", 0.14)),
         )
 
     def evaluate(
@@ -259,7 +272,11 @@ class LateObservedTempStrategy:
             mode=mode,
         )
 
-        params = self.params
+        # Req-27: gate the YES side on a STRONG lock (late_observed_yes lost net
+        # on weakly-locked days). The NO side keeps the looser self.min_lock_conf
+        # above; here we only decide whether YES legs are eligible this scan.
+        allow_yes = lock >= self.yes_min_lock
+        params = replace(self.params, allow_yes=allow_yes)
         if not self.no_side_enabled:
             no_prices = None
             no_token_ids = None
@@ -281,9 +298,9 @@ class LateObservedTempStrategy:
             log.info(
                 f"   🌡️  PRIMARY no-edge {city} {mode} — lock {lock:.0%}, "
                 f"obs {observed_state.observed_extreme_c:.1f}°C but no bucket cleared the "
-                f"fee gate (need edge ≥ {params.min_edge:.0%}, "
-                f"YES {params.min_entry_price:.0%}-{params.max_entry_price:.0%} / "
-                f"NO {params.no_min_price:.0%}-{params.no_max_price:.0%})"
+                f"fee gate (YES {'on' if allow_yes else 'OFF (lock<%.0f%%)' % (self.yes_min_lock*100)} "
+                f"need edge ≥ {params.yes_min_edge:.0%} @ {params.min_entry_price:.0%}-{params.max_entry_price:.0%}; "
+                f"NO need edge ≥ {params.min_edge:.0%} @ {params.no_min_price:.0%}-{params.no_max_price:.0%})"
             )
             return []
 
