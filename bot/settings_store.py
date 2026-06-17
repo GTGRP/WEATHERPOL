@@ -2,45 +2,204 @@
 Runtime settings store — change the bot's behavior live (from Telegram) without
 editing .env or restarting. Overrides are applied as attributes on `Config`
 (read at call-time across the code) and persisted to data/runtime_settings.json
-so they survive restarts.
+so they survive restarts (load_into_config() re-applies them at startup, so they
+also reach strategy objects that cache their gates in __init__).
 
-Two kinds of tunables:
-  BOOL_KEYS — on/off toggles (strategies, strict liquidity, master trading switch)
+Three things are exposed:
+  BOOL_KEYS — on/off toggles (every strategy enable + operational switches)
   NUM_KEYS  — numeric gates with (min, max, step, is_int)
+  GROUPS    — ordered categories the Telegram /settings panel renders as tabs
+
+Req-27: expanded from the original ~10 toggles / ~12 gates to cover EVERY tunable
+knob (all strategies incl. PEAKER + the profit-only flip ladder + YES gates),
+grouped into tabs so the panel is browsable instead of one giant +/- wall.
 """
 
 import json
 import os
-from typing import Tuple, Dict
+from typing import Tuple, Dict, List
 
 from config import Config
 from logger import log
 
 SETTINGS_PATH = 'data/runtime_settings.json'
 
-# On/off toggles exposed to Telegram (tick boxes).
+# ── On/off toggles exposed to Telegram (tick boxes) ─────────────────────────
 BOOL_KEYS = [
+    # master + per-strategy enables
     'TRADING_ENABLED',
-    'SNIPER_ENABLED', 'SPREAD_ENABLED', 'CONFIDENT_ENABLED', 'STABILITY_ENABLED',
-    'LIQUIDITY_GUARD_ENABLED', 'LIQUIDITY_STRICT_BLOCK',
-    'GRADE_SIZING_ENABLED', 'SKIP_DECIDED_MARKETS', 'ML_ENABLED',
+    'LATE_OBSERVED_ENABLED', 'LATE_OBSERVED_NO_SIDE',
+    'QUICK_FLIP_ENABLED', 'PEAK_CLUSTER_ENABLED', 'PEAKER_ENABLED',
+    'CONFIDENT_ENABLED', 'SNIPER_ENABLED', 'SPREAD_ENABLED', 'STABILITY_ENABLED',
+    # ml / ops
+    'ML_ENABLED', 'ML_DECISION_ENABLED', 'AUTO_REDEEM_ENABLED',
+    'PORTFOLIO_GUARD_ENABLED',
+    # quick-flip exit behaviour
+    'QUICK_FLIP_PROFIT_ONLY_EXIT', 'QUICK_FLIP_USE_ML_EXIT',
+    # peaker / cluster behaviour
+    'PEAKER_PREFER_COOL', 'PEAKER_TRADE_DECIDED', 'PEAK_CLUSTER_TRADE_DECIDED',
+    # exits / liquidity / gating
+    'THESIS_EXIT_ENABLED', 'LIQUIDITY_GUARD_ENABLED', 'LIQUIDITY_STRICT_BLOCK',
+    'GRADE_SIZING_ENABLED', 'SKIP_DECIDED_MARKETS',
 ]
 
-# Numeric gates: key -> (min, max, step, is_int)
+# ── Numeric gates: key -> (min, max, step, is_int) ──────────────────────────
 NUM_KEYS: Dict[str, tuple] = {
-    'BASKET_MAX_COST':          (0.50, 0.99, 0.05, False),
-    'GRADE_MIN_TO_TRADE':       (0.00, 1.00, 0.05, False),
-    'SNIPER_MIN_GRADE':         (0.00, 1.00, 0.05, False),
-    'SNIPER_MIN_CONFIDENCE':    (0.00, 1.00, 0.05, False),
-    'SNIPER_MIN_PROBABILITY':   (0.00, 1.00, 0.02, False),
-    'BASKET_TIGHT_GRADE':       (0.00, 1.00, 0.05, False),
-    'BASKET_TIGHT_CONFIDENCE':  (0.00, 1.00, 0.05, False),
-    'MIN_EDGE_TO_ENTER':        (0.00, 0.50, 0.02, False),
-    'LIQUIDITY_THIN_SIZE_MULT': (0.10, 1.00, 0.10, False),
-    'STABILITY_EARLY_EXIT_PRICE': (0.50, 0.99, 0.05, False),
-    'MAX_BET_PCT':              (0.05, 1.00, 0.05, False),
-    'HIGH_TEMP_LOCK_HOUR':      (0, 23, 1, True),
+    # risk & sizing
+    'MAX_BET_PCT':                 (0.05, 1.00, 0.05, False),
+    'MAX_POSITIONS':               (1, 50, 1, True),
+    'MAX_SINGLE_MARKET_PCT':       (0.05, 1.00, 0.05, False),
+    'KELLY_MAX_FRACTION':          (0.05, 0.50, 0.05, False),
+    'KELLY_TIER_BASE_USD':         (1, 20, 1, False),
+    'KELLY_TIER_GOOD_USD':         (1, 30, 1, False),
+    'KELLY_TIER_VGOOD_USD':        (2, 50, 1, False),
+    'KELLY_TIER_PERFECT_USD':      (3, 100, 1, False),
+    'PORTFOLIO_RESERVE_PCT':       (0.00, 0.50, 0.05, False),
+    'MAX_DEPLOY_PER_SCAN_PCT':     (0.05, 1.00, 0.05, False),
+    'MAX_BUYS_PER_SCAN':           (1, 20, 1, True),
+    'MIN_EDGE_TO_ENTER':           (0.00, 0.50, 0.02, False),
+    'GRADE_MIN_TO_TRADE':          (0.00, 1.00, 0.05, False),
+    # late-observed (primary)
+    'LATE_OBSERVED_MIN_LOCK':      (0.50, 0.95, 0.05, False),
+    'LATE_OBSERVED_MIN_EDGE':      (0.00, 0.40, 0.02, False),
+    'LATE_OBSERVED_YES_MIN_LOCK':  (0.50, 0.99, 0.05, False),
+    'LATE_OBSERVED_YES_MIN_EDGE':  (0.00, 0.40, 0.02, False),
+    'LATE_OBSERVED_MAX_LEGS':      (1, 8, 1, True),
+    'LATE_OBSERVED_SIZE_FLOOR_USD': (1, 20, 1, False),
+    'LATE_OBSERVED_SIZE_MAX_USD':  (3, 50, 1, False),
+    'LATE_OBSERVED_EDGE_FULL':     (0.05, 0.50, 0.05, False),
+    'LATE_OBSERVED_NO_MIN_PRICE':  (0.01, 0.20, 0.01, False),
+    'LATE_OBSERVED_NO_MAX_PRICE':  (0.80, 0.99, 0.01, False),
+    # quick-flip
+    'QUICK_FLIP_MIN_EDGE':         (0.00, 0.40, 0.02, False),
+    'QUICK_FLIP_MAX_PER_MARKET':   (1, 5, 1, True),
+    'QUICK_FLIP_MAX_CONCURRENT':   (1, 10, 1, True),
+    'QUICK_FLIP_MAX_HOLD_MIN':     (15, 360, 15, True),
+    'QUICK_FLIP_TARGET_ROI':       (5, 50, 5, False),
+    'QUICK_FLIP_MAX_SIZE_USD':     (1, 30, 1, False),
+    'QUICK_FLIP_MIN_BOOK_ROI_PCT': (5, 50, 5, False),
+    'QUICK_FLIP_LADDER_MID_ROI_PCT': (5, 60, 5, False),
+    'QUICK_FLIP_LADDER_RUN_ROI_PCT': (10, 80, 5, False),
+    'QUICK_FLIP_FORCE_BOOK_ROI_PCT': (10, 100, 5, False),
+    'QUICK_FLIP_STALE_BOOST':      (0.00, 0.50, 0.05, False),
+    # peaker (merged peak + safety)
+    'PEAKER_MIN_GRADE':            (0.00, 1.00, 0.05, False),
+    'PEAKER_MIN_CONFIDENCE':       (0.00, 1.00, 0.02, False),
+    'PEAKER_SOLO_MIN_CONFIDENCE':  (0.50, 1.00, 0.02, False),
+    'PEAKER_MAX_STD':              (0.50, 3.00, 0.10, False),
+    'PEAKER_MIN_MODELS':           (1, 6, 1, True),
+    'PEAKER_MAX_PEAK_PRICE':       (0.50, 0.99, 0.05, False),
+    'PEAKER_MAX_NEIGHBOR_PRICE':   (0.20, 0.90, 0.05, False),
+    'PEAKER_MAX_COST':             (0.70, 0.99, 0.01, False),
+    'PEAKER_MIN_EDGE':             (0.00, 0.30, 0.01, False),
+    'PEAKER_MIN_NET_PROFIT':       (0.00, 0.20, 0.01, False),
+    'PEAKER_MAX_USD':              (3, 50, 1, False),
+    'PEAKER_COOL_SIZE_MULT':       (0.50, 2.50, 0.05, False),
+    'PEAKER_COOL_EDGE_RELAX':      (0.00, 0.10, 0.01, False),
+    'PEAKER_WARM_SIZE_MULT':       (0.30, 1.50, 0.05, False),
+    'PEAKER_PEAK_BIAS_BUCKETS':    (0, 3, 1, True),
+    # peak-cluster
+    'PEAK_CLUSTER_SPAN':           (1, 5, 1, True),
+    'PEAK_CLUSTER_MIN_LEGS':       (1, 7, 1, True),
+    'PEAK_CLUSTER_MAX_LEGS':       (2, 10, 1, True),
+    'PEAK_CLUSTER_MAX_COST':       (0.70, 0.99, 0.01, False),
+    'PEAK_CLUSTER_MIN_EDGE':       (0.00, 0.30, 0.01, False),
+    'PEAK_CLUSTER_MIN_CONF':       (0.00, 1.00, 0.05, False),
+    'PEAK_CLUSTER_MAX_CENTER_PRICE': (0.50, 0.99, 0.05, False),
+    'PEAK_CLUSTER_MAX_USD':        (3, 50, 1, False),
+    # exits & liquidity
+    'THESIS_EXIT_MAX_ROI_PCT':     (-99, -50, 5, False),
+    'TRAILING_STOP_PCT':           (5, 90, 5, False),
+    'TRAILING_MIN_PEAK_MULT':      (1.0, 10.0, 0.5, False),
+    'EARLY_PROFIT_THRESHOLD':      (0.50, 0.99, 0.05, False),
+    'LIQUIDITY_THIN_SIZE_MULT':    (0.10, 1.00, 0.10, False),
+    'HIGH_TEMP_LOCK_HOUR':         (0, 23, 1, True),
+    # sniper / basket / spread / stability
+    'SNIPER_MIN_GRADE':            (0.00, 1.00, 0.05, False),
+    'SNIPER_MIN_CONFIDENCE':       (0.00, 1.00, 0.05, False),
+    'SNIPER_MIN_PROBABILITY':      (0.00, 1.00, 0.02, False),
+    'SNIPER_MAX_ENTRY_PRICE':      (0.05, 0.50, 0.05, False),
+    'BASKET_MAX_COST':             (0.50, 0.99, 0.05, False),
+    'BASKET_TIGHT_GRADE':          (0.00, 1.00, 0.05, False),
+    'BASKET_TIGHT_CONFIDENCE':     (0.00, 1.00, 0.05, False),
+    'SPREAD_MAX_COST':             (0.50, 2.00, 0.10, False),
+    'STABILITY_MIN_SCORE':         (0.00, 1.00, 0.02, False),
+    'STABILITY_EARLY_EXIT_PRICE':  (0.50, 0.99, 0.05, False),
 }
+
+# ── Tabs for the Telegram /settings panel. Each group lists the keys (toggles
+# and/or gates) shown when that tab is active, in display order. ────────────
+GROUPS: List[dict] = [
+    {'id': 'main', 'tab': 'Strat', 'title': 'Master & Strategies', 'keys': [
+        'TRADING_ENABLED',
+        'LATE_OBSERVED_ENABLED', 'LATE_OBSERVED_NO_SIDE',
+        'QUICK_FLIP_ENABLED', 'PEAK_CLUSTER_ENABLED', 'PEAKER_ENABLED',
+        'CONFIDENT_ENABLED', 'SNIPER_ENABLED', 'SPREAD_ENABLED', 'STABILITY_ENABLED',
+        'ML_ENABLED', 'ML_DECISION_ENABLED', 'AUTO_REDEEM_ENABLED',
+    ]},
+    {'id': 'risk', 'tab': 'Risk', 'title': 'Risk & Sizing', 'keys': [
+        'PORTFOLIO_GUARD_ENABLED',
+        'MAX_BET_PCT', 'MAX_POSITIONS', 'MAX_SINGLE_MARKET_PCT',
+        'KELLY_MAX_FRACTION', 'KELLY_TIER_BASE_USD', 'KELLY_TIER_GOOD_USD',
+        'KELLY_TIER_VGOOD_USD', 'KELLY_TIER_PERFECT_USD',
+        'PORTFOLIO_RESERVE_PCT', 'MAX_DEPLOY_PER_SCAN_PCT', 'MAX_BUYS_PER_SCAN',
+        'MIN_EDGE_TO_ENTER', 'GRADE_MIN_TO_TRADE',
+    ]},
+    {'id': 'lateobs', 'tab': 'LateObs', 'title': 'Late-Observed (primary)', 'keys': [
+        'LATE_OBSERVED_NO_SIDE',
+        'LATE_OBSERVED_MIN_LOCK', 'LATE_OBSERVED_MIN_EDGE',
+        'LATE_OBSERVED_YES_MIN_LOCK', 'LATE_OBSERVED_YES_MIN_EDGE',
+        'LATE_OBSERVED_MAX_LEGS', 'LATE_OBSERVED_SIZE_FLOOR_USD',
+        'LATE_OBSERVED_SIZE_MAX_USD', 'LATE_OBSERVED_EDGE_FULL',
+        'LATE_OBSERVED_NO_MIN_PRICE', 'LATE_OBSERVED_NO_MAX_PRICE',
+    ]},
+    {'id': 'quickflip', 'tab': 'Flip', 'title': 'Quick-Flip', 'keys': [
+        'QUICK_FLIP_PROFIT_ONLY_EXIT', 'QUICK_FLIP_USE_ML_EXIT',
+        'QUICK_FLIP_MIN_EDGE', 'QUICK_FLIP_MAX_PER_MARKET',
+        'QUICK_FLIP_MAX_CONCURRENT', 'QUICK_FLIP_MAX_HOLD_MIN',
+        'QUICK_FLIP_TARGET_ROI', 'QUICK_FLIP_MAX_SIZE_USD',
+        'QUICK_FLIP_MIN_BOOK_ROI_PCT', 'QUICK_FLIP_LADDER_MID_ROI_PCT',
+        'QUICK_FLIP_LADDER_RUN_ROI_PCT', 'QUICK_FLIP_FORCE_BOOK_ROI_PCT',
+        'QUICK_FLIP_STALE_BOOST',
+    ]},
+    {'id': 'peaker', 'tab': 'Peaker', 'title': 'Peaker (merged peak+safety)', 'keys': [
+        'PEAKER_PREFER_COOL', 'PEAKER_TRADE_DECIDED',
+        'PEAKER_MIN_GRADE', 'PEAKER_MIN_CONFIDENCE', 'PEAKER_SOLO_MIN_CONFIDENCE',
+        'PEAKER_MAX_STD', 'PEAKER_MIN_MODELS', 'PEAKER_MAX_PEAK_PRICE',
+        'PEAKER_MAX_NEIGHBOR_PRICE', 'PEAKER_MAX_COST', 'PEAKER_MIN_EDGE',
+        'PEAKER_MIN_NET_PROFIT', 'PEAKER_MAX_USD', 'PEAKER_COOL_SIZE_MULT',
+        'PEAKER_COOL_EDGE_RELAX', 'PEAKER_WARM_SIZE_MULT', 'PEAKER_PEAK_BIAS_BUCKETS',
+    ]},
+    {'id': 'cluster', 'tab': 'Cluster', 'title': 'Peak-Cluster', 'keys': [
+        'PEAK_CLUSTER_TRADE_DECIDED',
+        'PEAK_CLUSTER_SPAN', 'PEAK_CLUSTER_MIN_LEGS', 'PEAK_CLUSTER_MAX_LEGS',
+        'PEAK_CLUSTER_MAX_COST', 'PEAK_CLUSTER_MIN_EDGE', 'PEAK_CLUSTER_MIN_CONF',
+        'PEAK_CLUSTER_MAX_CENTER_PRICE', 'PEAK_CLUSTER_MAX_USD',
+    ]},
+    {'id': 'exits', 'tab': 'Exits', 'title': 'Exits & Liquidity', 'keys': [
+        'THESIS_EXIT_ENABLED', 'LIQUIDITY_GUARD_ENABLED', 'LIQUIDITY_STRICT_BLOCK',
+        'GRADE_SIZING_ENABLED', 'SKIP_DECIDED_MARKETS',
+        'THESIS_EXIT_MAX_ROI_PCT', 'TRAILING_STOP_PCT', 'TRAILING_MIN_PEAK_MULT',
+        'EARLY_PROFIT_THRESHOLD', 'LIQUIDITY_THIN_SIZE_MULT', 'HIGH_TEMP_LOCK_HOUR',
+    ]},
+    {'id': 'sniper', 'tab': 'Sniper', 'title': 'Sniper / Basket', 'keys': [
+        'SNIPER_MIN_GRADE', 'SNIPER_MIN_CONFIDENCE', 'SNIPER_MIN_PROBABILITY',
+        'SNIPER_MAX_ENTRY_PRICE', 'BASKET_MAX_COST', 'BASKET_TIGHT_GRADE',
+        'BASKET_TIGHT_CONFIDENCE', 'SPREAD_MAX_COST', 'STABILITY_MIN_SCORE',
+        'STABILITY_EARLY_EXIT_PRICE',
+    ]},
+]
+
+
+def group_keys(group_id: str) -> Tuple[List[str], List[str]]:
+    """Return (bool_keys, num_keys) for a group, preserving display order and
+    silently dropping any key not registered in BOOL_KEYS / NUM_KEYS."""
+    g = next((x for x in GROUPS if x['id'] == group_id), None)
+    if not g:
+        return [], []
+    bkeys = [k for k in g['keys'] if k in BOOL_KEYS]
+    nkeys = [k for k in g['keys'] if k in NUM_KEYS]
+    return bkeys, nkeys
 
 
 def _coerce(key: str, value):
