@@ -63,9 +63,9 @@ class TelegramBot:
         """HTML-escape dynamic text so market names with &/</> don't break parse."""
         return html.escape(str(s if s is not None else ''))
 
-    # ═══════════════════════════════════════════════════════════════
+    # ==============================================================
     # SEND MESSAGES
-    # ═══════════════════════════════════════════════════════════════
+    # ==============================================================
 
     def send(self, text: str, parse_mode: str = 'HTML', reply_markup: dict = None) -> bool:
         """Send a message to the configured chat (optionally with an inline keyboard)."""
@@ -340,9 +340,9 @@ class TelegramBot:
         )
         self.send(msg)
 
-    # ═══════════════════════════════════════════════════════════════
+    # ==============================================================
     # POSITIONS VIEW (paginated + sortable, peak-cluster legs GROUPED)
-    # ═══════════════════════════════════════════════════════════════
+    # ==============================================================
 
     def _open_units(self, sort_key: str) -> List[dict]:
         """Group open positions into display UNITS so a peak-cluster basket shows
@@ -442,11 +442,11 @@ class TelegramBot:
                 f"WR: {s['win_rate']:.0f}% ({s['wins']}W/{s['losses']}L)\n"
                 f"Trades: {s['total_trades']} | Open: {s['open_positions']} | "
                 f"Redeemed: ${s['total_redeemed']:.2f}\n"
-                f"{'─'*28}\n"
+                f"{'-'*28}\n"
             )
         sort_name = self._SORT_NAMES.get(sort, sort)
         shown_to = start + len(chunk)
-        text += (f"<b>Open {start + 1}–{shown_to} of {total_units} "
+        text += (f"<b>Open {start + 1}-{shown_to} of {total_units} "
                  f"({total_pos} positions)</b> · sorted: {sort_name}\n\n")
         if not chunk:
             text += "No open positions.\n"
@@ -512,7 +512,7 @@ class TelegramBot:
         today_pnl = sum(p.pnl for p in today_positions if p.status != 'open')
         msg = (
             f"📅 <b>Daily Summary</b>\n"
-            f"{'─'*30}\n"
+            f"{'-'*30}\n"
             f"New trades today: {len(today_positions)}\n"
             f"Today's PnL: ${today_pnl:+.2f}\n"
             f"Total PnL: ${stats['total_pnl']:+.2f}\n"
@@ -522,9 +522,9 @@ class TelegramBot:
         )
         self.send(msg)
 
-    # ═══════════════════════════════════════════════════════════════
+    # ==============================================================
     # ANALYSIS (/analysis) — per-strategy performance + downloadable trade log
-    # ═══════════════════════════════════════════════════════════════
+    # ==============================================================
 
     def _trade_log_path(self) -> str:
         """Resolve the paper-trade JSONL path (PositionManager's, else Config)."""
@@ -611,7 +611,7 @@ class TelegramBot:
             f"WR {stats['win_rate']:.0f}% ({stats['wins']}W/{stats['losses']}L) | "
             f"Trades {stats['total_trades']} | Open {stats['open_positions']} | "
             f"Redeemed ${stats['total_redeemed']:.2f}\n"
-            f"{'─'*28}\n"
+            f"{'-'*28}\n"
             f"<b>By strategy</b> (buys · W/L · WR · PnL)\n"
         )
         if not by_strat:
@@ -629,7 +629,7 @@ class TelegramBot:
                 )
 
         if action_counts:
-            text += f"{'─'*28}\n<b>Log actions</b>: "
+            text += f"{'-'*28}\n<b>Log actions</b>: "
             text += " · ".join(f"{self._esc(k)} {v}"
                                 for k, v in sorted(action_counts.items()))
             text += "\n"
@@ -651,9 +651,9 @@ class TelegramBot:
         else:
             self.send("ℹ️ No trade-log records yet — the log is empty.")
 
-    # ═══════════════════════════════════════════════════════════════
+    # ==============================================================
     # COMMAND HANDLER (polls for incoming commands)
-    # ═══════════════════════════════════════════════════════════════
+    # ==============================================================
 
     def start_polling(self):
         """Start polling for commands in a background thread."""
@@ -719,51 +719,116 @@ class TelegramBot:
         except Exception:
             pass
 
-    # ═══════════════════════════════════════════════════════════════
+    # ==============================================================
     # SETTINGS PANEL (live tunables + tick-box toggles)
-    # ═══════════════════════════════════════════════════════════════
+    # ==============================================================
 
+    _SETTINGS_DEFAULT_GROUP = 'main'
+
+    # Short button labels for the on/off toggles (fallback = the key name).
     _LABELS = {
-        'TRADING_ENABLED': 'Trading', 'SNIPER_ENABLED': 'Sniper',
-        'SPREAD_ENABLED': 'Spread', 'CONFIDENT_ENABLED': 'Confident',
-        'STABILITY_ENABLED': 'Stability', 'LIQUIDITY_GUARD_ENABLED': 'LiqGuard',
-        'LIQUIDITY_STRICT_BLOCK': 'LiqStrict', 'GRADE_SIZING_ENABLED': 'GradeSize',
-        'SKIP_DECIDED_MARKETS': 'SkipDecided', 'ML_ENABLED': 'ML',
+        'TRADING_ENABLED': 'Trading',
+        'LATE_OBSERVED_ENABLED': 'Late-Obs',
+        'LATE_OBSERVED_NO_SIDE': 'LateObs NO',
+        'QUICK_FLIP_ENABLED': 'Quick-Flip',
+        'PEAK_CLUSTER_ENABLED': 'Cluster',
+        'PEAKER_ENABLED': 'Peaker',
+        'CONFIDENT_ENABLED': 'Confident',
+        'SNIPER_ENABLED': 'Sniper',
+        'SPREAD_ENABLED': 'Spread',
+        'STABILITY_ENABLED': 'Stability',
+        'ML_ENABLED': 'ML',
+        'ML_DECISION_ENABLED': 'ML-Decide',
+        'AUTO_REDEEM_ENABLED': 'Auto-Redeem',
+        'PORTFOLIO_GUARD_ENABLED': 'Port-Guard',
+        'QUICK_FLIP_PROFIT_ONLY_EXIT': 'Flip profit-only',
+        'QUICK_FLIP_USE_ML_EXIT': 'Flip ML-exit',
+        'PEAKER_PREFER_COOL': 'Prefer cool',
+        'PEAKER_TRADE_DECIDED': 'Peaker decided',
+        'PEAK_CLUSTER_TRADE_DECIDED': 'Cluster decided',
+        'THESIS_EXIT_ENABLED': 'Thesis-exit',
+        'LIQUIDITY_GUARD_ENABLED': 'LiqGuard',
+        'LIQUIDITY_STRICT_BLOCK': 'LiqStrict',
+        'GRADE_SIZING_ENABLED': 'GradeSize',
+        'SKIP_DECIDED_MARKETS': 'SkipDecided',
     }
 
-    def _settings_view(self):
-        """Build (text, inline_keyboard) for the settings panel."""
+    @staticmethod
+    def _fmt_num(v):
+        """Compact number formatting for buttons/labels (ints w/o decimals)."""
+        if isinstance(v, bool) or v is None:
+            return str(v)
+        if isinstance(v, int):
+            return str(v)
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return str(v)
+        if f == int(f):
+            return str(int(f))
+        return f"{f:g}"
+
+    def _settings_view(self, group: str = None):
+        """Build (text, inline_keyboard) for ONE settings tab/group, so the
+        panel stays browsable instead of one giant +/- wall."""
         from bot import settings_store
         bools, nums = settings_store.snapshot()
+        groups = settings_store.GROUPS
+        gid = group or self._SETTINGS_DEFAULT_GROUP
+        g = next((x for x in groups if x['id'] == gid), groups[0])
+        gid = g['id']
+        bkeys, nkeys = settings_store.group_keys(gid)
 
-        text = "⚙️ <b>Bot Settings</b> — tap to change\n"
-        text += f"Trading: {'🟢 ON' if bools.get('TRADING_ENABLED') else '🔴 OFF'}\n\n"
-        text += "<b>Strategies / toggles</b> (tap to flip)\n"
-        text += "<b>Gates</b> (tap ➖/➕)\n"
-        for k, v in nums.items():
-            text += f"  {k} = <b>{v}</b>\n"
+        mode = '📋 PAPER' if Config.is_paper() else '🔴 LIVE'
+        master = '🟢 ON' if bools.get('TRADING_ENABLED') else '🔴 OFF'
+        text = (
+            f"⚙️ <b>Bot Settings</b> · {mode}\n"
+            f"Master trading: <b>{master}</b>\n"
+            f"{'-'*30}\n"
+            f"📂 <b>{self._esc(g['title'])}</b>\n"
+        )
+        if bkeys:
+            text += "\n<b>Toggles</b>\n"
+            for k in bkeys:
+                text += f"  {'✅' if bools.get(k) else '❌'} {self._esc(self._LABELS.get(k, k))}\n"
+        if nkeys:
+            text += "\n<b>Gates</b>\n"
+            for k in nkeys:
+                text += f"  • {self._esc(k)} = <b>{self._fmt_num(nums.get(k))}</b>\n"
+        text += "\n<i>Or type /set KEY VALUE · /toggle KEY</i>"
 
         rows = []
-        bkeys = settings_store.BOOL_KEYS
+        # Tab row(s): 3 per row, the active tab marked with a dot.
+        tab_row = []
+        for x in groups:
+            label = ('• ' if x['id'] == gid else '') + x['tab']
+            tab_row.append({'text': label, 'callback_data': f"st:{x['id']}"})
+            if len(tab_row) == 3:
+                rows.append(tab_row)
+                tab_row = []
+        if tab_row:
+            rows.append(tab_row)
+        # Toggle buttons: 2 per row.
         for i in range(0, len(bkeys), 2):
             row = []
             for k in bkeys[i:i + 2]:
                 on = bools.get(k)
-                label = self._LABELS.get(k, k)
-                row.append({'text': f"{'✅' if on else '❌'} {label}",
-                            'callback_data': f"tg:{k}"})
+                row.append({'text': f"{'✅' if on else '❌'} {self._LABELS.get(k, k)}",
+                            'callback_data': f"tg:{k}:{gid}"})
             rows.append(row)
-        for k in settings_store.NUM_KEYS:
+        # Numeric gates: one row each [➖ step][KEY = val][➕ step].
+        for k in nkeys:
+            step = settings_store.NUM_KEYS[k][2]
             v = nums.get(k)
             rows.append([
-                {'text': '➖', 'callback_data': f"dn:{k}"},
-                {'text': f"{k}={v}", 'callback_data': 'noop'},
-                {'text': '➕', 'callback_data': f"up:{k}"},
+                {'text': f"➖{self._fmt_num(step)}", 'callback_data': f"dn:{k}:{gid}"},
+                {'text': f"{k} = {self._fmt_num(v)}", 'callback_data': 'noop'},
+                {'text': f"➕{self._fmt_num(step)}", 'callback_data': f"up:{k}:{gid}"},
             ])
         return text, {'inline_keyboard': rows}
 
-    def send_settings(self, edit_message_id: int = None):
-        text, kb = self._settings_view()
+    def send_settings(self, group: str = None, edit_message_id: int = None):
+        text, kb = self._settings_view(group)
         if edit_message_id is not None:
             self._edit(edit_message_id, text, kb)
         else:
@@ -789,9 +854,19 @@ class TelegramBot:
                                 edit_message_id=message_id)
             return
 
-        try:
-            action, key = data.split(':', 1)
-        except ValueError:
+        # Settings tab switch: "st:<group_id>"
+        if data.startswith('st:'):
+            group = data.split(':', 1)[1]
+            self._answer_callback(callback_id)
+            self.send_settings(group=group, edit_message_id=message_id)
+            return
+
+        # Toggle / bump: "<action>:<KEY>[:<group>]"
+        parts = data.split(':')
+        action = parts[0]
+        key = parts[1] if len(parts) > 1 else ''
+        group = parts[2] if len(parts) > 2 else None
+        if not key:
             self._answer_callback(callback_id)
             return
         ok, msg = False, 'no change'
@@ -803,7 +878,7 @@ class TelegramBot:
             ok, msg = settings_store.bump(key, -1)
         self._answer_callback(callback_id, msg)
         if ok and message_id is not None:
-            self.send_settings(edit_message_id=message_id)
+            self.send_settings(group=group, edit_message_id=message_id)
 
     def _handle_command(self, text: str):
         """Handle incoming bot commands."""
@@ -819,7 +894,8 @@ class TelegramBot:
             settings_store.set_value('TRADING_ENABLED', False)
             self.send("🔴 <b>Trading DISABLED</b> — monitoring & resolving only, no new buys.")
         elif cmd == '/settings' or cmd == '/config':
-            self.send_settings()
+            grp = parts[1].lower() if len(parts) >= 2 else None
+            self.send_settings(group=grp)
         elif cmd == '/set':
             from bot import settings_store
             if len(parts) >= 3:
@@ -860,7 +936,8 @@ class TelegramBot:
                 "🌤️ <b>Weather Sniper Commands</b>\n"
                 "<b>/start</b> — enable trading\n"
                 "<b>/stop</b> — disable trading (monitor only)\n"
-                "<b>/settings</b> — toggle strategies & tune gates (buttons)\n"
+                "<b>/settings</b> — tabbed panel: toggle strategies & tune every gate\n"
+                "   (e.g. <code>/settings peaker</code> opens that tab)\n"
                 "/set KEY VALUE — set a gate, e.g. /set BASKET_MAX_COST 0.80\n"
                 "/toggle KEY — flip a toggle, e.g. /toggle SNIPER_ENABLED\n"
                 "/status — summary + positions (paged, sortable)\n"
