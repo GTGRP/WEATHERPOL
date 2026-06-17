@@ -15,6 +15,15 @@ the exact bucket.
 
 Hold-to-resolution by nature: the payoff is realised at settlement, so legs are
 placed with hold_hint=True (they bypass the early-exit sellability floor).
+
+REQ-27 FIX — "buys only one leg":
+The basket is sized in EQUAL SHARES, but each leg's DOLLAR notional
+(shares x price) must also clear the venue MIN_ORDER_SIZE. Previously the cheap
+legs came out below $1 and were rejected one-by-one downstream (the dashboard's
+`below_min` gate), leaving only the single most-expensive leg on the book. We
+now floor the share count so the CHEAPEST leg meets the minimum, and if the
+resulting basket no longer fits the budget caps we SKIP the whole basket rather
+than place a broken 1-leg partial.
 """
 
 from dataclasses import dataclass
@@ -62,7 +71,7 @@ class PeakClusterStrategy:
         # spread across 3-7 neighbouring buckets so a single winning leg covers
         # the OTHER losing legs AND still nets profit after fees. A 1- or 2-leg
         # "basket" is NOT this strategy (that is the high-confidence single /
-        # +1-degree safety play), so HARD-FLOOR the minimum at 3 regardless of
+        # +1-degree peaker play), so HARD-FLOOR the minimum at 3 regardless of
         # the configured value. The window/greedy fill below keeps the actual
         # leg count DYNAMIC (3..max) based on what the live market offers.
         self.min_legs = max(3, int(g('PEAK_CLUSTER_MIN_LEGS', 3)))
@@ -76,6 +85,9 @@ class PeakClusterStrategy:
         self.max_fraction = float(g('PEAK_CLUSTER_MAX_FRACTION', 0.20))
         self.max_usd = float(g('PEAK_CLUSTER_MAX_USD', 15.0))
         self.abs_floor = float(g('ABS_PRICE_FLOOR', 0.01))
+        # Venue minimum per leg — the cheapest leg must clear this or the basket
+        # is placed partially (the "only buys one leg" bug). See sizing below.
+        self.min_order = float(g('MIN_ORDER_SIZE', 1.0))
 
     def evaluate(self, market_title, bucket_probs, market_prices, token_ids,
                  balance, city="", grade=0.6) -> List[PeakClusterSignal]:
@@ -136,19 +148,45 @@ class PeakClusterStrategy:
         if edge < self.min_edge:
             return []
 
+        # ---- Sizing (REQ-27 fix) ----
         # Equal SHARES across legs => any single win pays $1 > per-share cost.
+        # BUT each leg's dollar notional (shares x price) must also clear the
+        # venue MIN_ORDER_SIZE, or the cheap legs get rejected one-by-one and we
+        # end up holding only the single priciest leg. Floor the share count so
+        # the CHEAPEST leg meets the minimum; if that pushes the basket past the
+        # budget caps, SKIP the whole basket rather than place a broken partial.
         budget = min(balance * self.base_fraction * (0.5 + max(0.0, grade)),
                      balance * self.max_fraction,
                      self.max_usd)
-        if budget < 1.0:
+        min_price = min(it['price'] for it in chosen)
+        if min_price <= 0:
             return []
-        shares = budget / cost
+        target_shares = budget / cost if cost > 0 else 0.0
+        min_shares_for_floor = self.min_order / min_price
+        shares = max(target_shares, min_shares_for_floor)
+        required_usd = shares * cost
+        max_basket_usd = min(balance * self.max_fraction, self.max_usd)
+        if required_usd > max_basket_usd + 1e-9:
+            log.debug(
+                f"peak_cluster {city}: basket needs ${required_usd:.2f} to keep "
+                f"every leg >= ${self.min_order:.2f} (cheapest leg ${min_price:.2f}) "
+                f"but cap is ${max_basket_usd:.2f} — skip rather than place partial"
+            )
+            return []
+        if shares <= 0:
+            return []
 
         legs = []
         for it in sorted(chosen, key=lambda x: x['price']):
             leg_size = round(shares * it['price'], 4)
-            if leg_size <= 0:
-                continue
+            if leg_size < self.min_order:
+                # Guard: a sub-minimum leg would be rejected downstream and break
+                # the any-one-wins basket, so abandon the whole basket.
+                log.debug(
+                    f"peak_cluster {city}: leg {it['label']} ${leg_size:.2f} < min "
+                    f"${self.min_order:.2f} — skip basket"
+                )
+                return []
             legs.append(ClusterLeg(it['label'], it['token'], it['price'],
                                    it['prob'], leg_size))
         if len(legs) < self.min_legs:
