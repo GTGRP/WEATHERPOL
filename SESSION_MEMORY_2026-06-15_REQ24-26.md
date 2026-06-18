@@ -112,4 +112,4 @@ the session (shas above). dev HEAD prior to this companion = `5e0bdcf6`.
 - **Deferred (unchanged):** quiet the `Redeemed:` log spam; extract a testable `decide_placement()`; CI
   (pytest+ruff); cap `data/paper_trades.jsonl` growth; weather.gov stray `{` bug; 3 `no_coords` cities; expose
   new PEAK / SAFETY_PEAK / QUICK_FLIP knobs in `/settings`; backtest leg-sizing; failover for `data/stability.py`;
-  cluster dedup.
+  cluster dedup..
