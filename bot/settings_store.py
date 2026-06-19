@@ -1,18 +1,22 @@
 """
-Runtime settings store — change the bot's behavior live (from Telegram) without
+Runtime settings store -- change the bot's behavior live (from Telegram) without
 editing .env or restarting. Overrides are applied as attributes on `Config`
 (read at call-time across the code) and persisted to data/runtime_settings.json
 so they survive restarts (load_into_config() re-applies them at startup, so they
 also reach strategy objects that cache their gates in __init__).
 
 Three things are exposed:
-  BOOL_KEYS — on/off toggles (every strategy enable + operational switches)
-  NUM_KEYS  — numeric gates with (min, max, step, is_int)
-  GROUPS    — ordered categories the Telegram /settings panel renders as tabs
+  BOOL_KEYS -- on/off toggles (every strategy enable + operational switches)
+  NUM_KEYS  -- numeric gates with (min, max, step, is_int)
+  GROUPS    -- ordered categories the Telegram /settings panel renders as tabs
 
 Req-27: expanded from the original ~10 toggles / ~12 gates to cover EVERY tunable
 knob (all strategies incl. PEAKER + the profit-only flip ladder + YES gates),
 grouped into tabs so the panel is browsable instead of one giant +/- wall.
+
+Req-28: added STARTING_BALANCE (customise the fresh/paper bankroll right next to
+the master bot toggle), the new market-anchored PEAKER knobs, and the quick_flip
+NO-side toggle + its edge gate.
 """
 
 import json
@@ -24,7 +28,7 @@ from logger import log
 
 SETTINGS_PATH = 'data/runtime_settings.json'
 
-# ── On/off toggles exposed to Telegram (tick boxes) ─────────────────────────
+# -- On/off toggles exposed to Telegram (tick boxes) -------------------------
 BOOL_KEYS = [
     # master + per-strategy enables
     'TRADING_ENABLED',
@@ -34,8 +38,8 @@ BOOL_KEYS = [
     # ml / ops
     'ML_ENABLED', 'ML_DECISION_ENABLED', 'AUTO_REDEEM_ENABLED',
     'PORTFOLIO_GUARD_ENABLED',
-    # quick-flip exit behaviour
-    'QUICK_FLIP_PROFIT_ONLY_EXIT', 'QUICK_FLIP_USE_ML_EXIT',
+    # quick-flip exit / side behaviour
+    'QUICK_FLIP_PROFIT_ONLY_EXIT', 'QUICK_FLIP_USE_ML_EXIT', 'QUICK_FLIP_NO_SIDE',
     # peaker / cluster behaviour
     'PEAKER_PREFER_COOL', 'PEAKER_TRADE_DECIDED', 'PEAK_CLUSTER_TRADE_DECIDED',
     # exits / liquidity / gating
@@ -43,8 +47,10 @@ BOOL_KEYS = [
     'GRADE_SIZING_ENABLED', 'SKIP_DECIDED_MARKETS',
 ]
 
-# ── Numeric gates: key -> (min, max, step, is_int) ──────────────────────────
+# -- Numeric gates: key -> (min, max, step, is_int) --------------------------
 NUM_KEYS: Dict[str, tuple] = {
+    # bankroll (next to the master bot toggle)
+    'STARTING_BALANCE':            (10, 1000000, 50, False),
     # risk & sizing
     'MAX_BET_PCT':                 (0.05, 1.00, 0.05, False),
     'MAX_POSITIONS':               (1, 50, 1, True),
@@ -72,6 +78,7 @@ NUM_KEYS: Dict[str, tuple] = {
     'LATE_OBSERVED_NO_MAX_PRICE':  (0.80, 0.99, 0.01, False),
     # quick-flip
     'QUICK_FLIP_MIN_EDGE':         (0.00, 0.40, 0.02, False),
+    'QUICK_FLIP_NO_MIN_EDGE':      (0.00, 0.40, 0.02, False),
     'QUICK_FLIP_MAX_PER_MARKET':   (1, 5, 1, True),
     'QUICK_FLIP_MAX_CONCURRENT':   (1, 10, 1, True),
     'QUICK_FLIP_MAX_HOLD_MIN':     (15, 360, 15, True),
@@ -82,17 +89,24 @@ NUM_KEYS: Dict[str, tuple] = {
     'QUICK_FLIP_LADDER_RUN_ROI_PCT': (10, 80, 5, False),
     'QUICK_FLIP_FORCE_BOOK_ROI_PCT': (10, 100, 5, False),
     'QUICK_FLIP_STALE_BOOST':      (0.00, 0.50, 0.05, False),
-    # peaker (merged peak + safety)
+    # peaker (market-anchored, cross-validated)
     'PEAKER_MIN_GRADE':            (0.00, 1.00, 0.05, False),
     'PEAKER_MIN_CONFIDENCE':       (0.00, 1.00, 0.02, False),
     'PEAKER_SOLO_MIN_CONFIDENCE':  (0.50, 1.00, 0.02, False),
+    'PEAKER_SOLO_MIN_EDGE':        (0.00, 0.30, 0.01, False),
     'PEAKER_MAX_STD':              (0.50, 3.00, 0.10, False),
     'PEAKER_MIN_MODELS':           (1, 6, 1, True),
+    'PEAKER_MARKET_MIN_PRICE':     (0.20, 0.90, 0.05, False),
+    'PEAKER_ALIGN_BUCKETS':        (0, 3, 1, True),
+    'PEAKER_CONFIRM_RATIO':        (0.50, 1.00, 0.05, False),
     'PEAKER_MAX_PEAK_PRICE':       (0.50, 0.99, 0.05, False),
     'PEAKER_MAX_NEIGHBOR_PRICE':   (0.20, 0.90, 0.05, False),
     'PEAKER_MAX_COST':             (0.70, 0.99, 0.01, False),
     'PEAKER_MIN_EDGE':             (0.00, 0.30, 0.01, False),
     'PEAKER_MIN_NET_PROFIT':       (0.00, 0.20, 0.01, False),
+    'PEAKER_FEE_BUFFER':           (0.00, 0.10, 0.01, False),
+    'PEAKER_BASE_FRACTION':        (0.02, 0.30, 0.01, False),
+    'PEAKER_MAX_FRACTION':         (0.05, 0.50, 0.05, False),
     'PEAKER_MAX_USD':              (3, 50, 1, False),
     'PEAKER_COOL_SIZE_MULT':       (0.50, 2.50, 0.05, False),
     'PEAKER_COOL_EDGE_RELAX':      (0.00, 0.10, 0.01, False),
@@ -127,11 +141,11 @@ NUM_KEYS: Dict[str, tuple] = {
     'STABILITY_EARLY_EXIT_PRICE':  (0.50, 0.99, 0.05, False),
 }
 
-# ── Tabs for the Telegram /settings panel. Each group lists the keys (toggles
-# and/or gates) shown when that tab is active, in display order. ────────────
+# -- Tabs for the Telegram /settings panel. Each group lists the keys (toggles
+# and/or gates) shown when that tab is active, in display order. ------------
 GROUPS: List[dict] = [
     {'id': 'main', 'tab': 'Strat', 'title': 'Master & Strategies', 'keys': [
-        'TRADING_ENABLED',
+        'TRADING_ENABLED', 'STARTING_BALANCE',
         'LATE_OBSERVED_ENABLED', 'LATE_OBSERVED_NO_SIDE',
         'QUICK_FLIP_ENABLED', 'PEAK_CLUSTER_ENABLED', 'PEAKER_ENABLED',
         'CONFIDENT_ENABLED', 'SNIPER_ENABLED', 'SPREAD_ENABLED', 'STABILITY_ENABLED',
@@ -154,21 +168,23 @@ GROUPS: List[dict] = [
         'LATE_OBSERVED_NO_MIN_PRICE', 'LATE_OBSERVED_NO_MAX_PRICE',
     ]},
     {'id': 'quickflip', 'tab': 'Flip', 'title': 'Quick-Flip', 'keys': [
-        'QUICK_FLIP_PROFIT_ONLY_EXIT', 'QUICK_FLIP_USE_ML_EXIT',
-        'QUICK_FLIP_MIN_EDGE', 'QUICK_FLIP_MAX_PER_MARKET',
+        'QUICK_FLIP_PROFIT_ONLY_EXIT', 'QUICK_FLIP_USE_ML_EXIT', 'QUICK_FLIP_NO_SIDE',
+        'QUICK_FLIP_MIN_EDGE', 'QUICK_FLIP_NO_MIN_EDGE', 'QUICK_FLIP_MAX_PER_MARKET',
         'QUICK_FLIP_MAX_CONCURRENT', 'QUICK_FLIP_MAX_HOLD_MIN',
         'QUICK_FLIP_TARGET_ROI', 'QUICK_FLIP_MAX_SIZE_USD',
         'QUICK_FLIP_MIN_BOOK_ROI_PCT', 'QUICK_FLIP_LADDER_MID_ROI_PCT',
         'QUICK_FLIP_LADDER_RUN_ROI_PCT', 'QUICK_FLIP_FORCE_BOOK_ROI_PCT',
         'QUICK_FLIP_STALE_BOOST',
     ]},
-    {'id': 'peaker', 'tab': 'Peaker', 'title': 'Peaker (merged peak+safety)', 'keys': [
+    {'id': 'peaker', 'tab': 'Peaker', 'title': 'Peaker (market-anchored)', 'keys': [
         'PEAKER_PREFER_COOL', 'PEAKER_TRADE_DECIDED',
         'PEAKER_MIN_GRADE', 'PEAKER_MIN_CONFIDENCE', 'PEAKER_SOLO_MIN_CONFIDENCE',
-        'PEAKER_MAX_STD', 'PEAKER_MIN_MODELS', 'PEAKER_MAX_PEAK_PRICE',
-        'PEAKER_MAX_NEIGHBOR_PRICE', 'PEAKER_MAX_COST', 'PEAKER_MIN_EDGE',
-        'PEAKER_MIN_NET_PROFIT', 'PEAKER_MAX_USD', 'PEAKER_COOL_SIZE_MULT',
-        'PEAKER_COOL_EDGE_RELAX', 'PEAKER_WARM_SIZE_MULT', 'PEAKER_PEAK_BIAS_BUCKETS',
+        'PEAKER_SOLO_MIN_EDGE', 'PEAKER_MAX_STD', 'PEAKER_MIN_MODELS',
+        'PEAKER_MARKET_MIN_PRICE', 'PEAKER_ALIGN_BUCKETS', 'PEAKER_CONFIRM_RATIO',
+        'PEAKER_MAX_PEAK_PRICE', 'PEAKER_MAX_NEIGHBOR_PRICE', 'PEAKER_MAX_COST',
+        'PEAKER_MIN_EDGE', 'PEAKER_MIN_NET_PROFIT', 'PEAKER_FEE_BUFFER',
+        'PEAKER_BASE_FRACTION', 'PEAKER_MAX_FRACTION', 'PEAKER_MAX_USD',
+        'PEAKER_COOL_SIZE_MULT', 'PEAKER_COOL_EDGE_RELAX', 'PEAKER_WARM_SIZE_MULT',
     ]},
     {'id': 'cluster', 'tab': 'Cluster', 'title': 'Peak-Cluster', 'keys': [
         'PEAK_CLUSTER_TRADE_DECIDED',
