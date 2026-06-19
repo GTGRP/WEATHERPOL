@@ -1,10 +1,10 @@
 """
-Weather Trading Bot — Configuration
+Weather Trading Bot - Configuration
 
 Polymarket weather market sniper with multi-source forecasts.
 Supports paper (dry-run) and live trading modes.
 
-OVERHAUL NOTE: defaults now favor the observation-driven edge — the
+OVERHAUL NOTE: defaults now favor the observation-driven edge - the
 Late Observed-Temperature strategy is the PRIMARY strategy, fee-aware EV gating
 is on, liquidity awareness adapts to thin books (no hard blocking by default),
 and the old forecast-only strategies (PeakBasket / Confident) are demoted to
@@ -21,16 +21,21 @@ class Config:
     """Central configuration for weather trading bot."""
 
     VERSION = "2.1.0"
-    VERSION_NAME = "Weather Sniper Pro — Observed Edge"
+    VERSION_NAME = "Weather Sniper Pro - Observed Edge"
 
     # ===================================================================
-    # TRADING MODE — paper = dry-run (no real orders), live = real money
+    # TRADING MODE - paper = dry-run (no real orders), live = real money
     # ===================================================================
     TRADING_MODE = os.getenv('TRADING_MODE', 'paper')  # 'paper' or 'live'
     STARTING_BALANCE = float(os.getenv('STARTING_BALANCE', '3.0'))
-    # Master trading switch — toggled live via Telegram /start /stop. When False
-    # the bot keeps scanning/monitoring but places NO new trades.
-    TRADING_ENABLED = os.getenv('TRADING_ENABLED', '1') == '1'
+    # Master trading switch - toggled live via Telegram Start/Stop buttons. When
+    # False the bot keeps scanning/monitoring but places NO new trades.
+    # Req-28: default OFF so a fresh Railway deploy does NOT auto-trade. The bot
+    # boots, posts "initialized successfully" + [Start Trading][Settings][Restart]
+    # buttons, and only begins trading when the user presses Start / types 'start'.
+    # (dashboard startup ALSO force-resets this to False on every boot so a
+    # previously-persisted True never silently auto-resumes a deploy.)
+    TRADING_ENABLED = os.getenv('TRADING_ENABLED', '0') == '1'
 
     # ===================================================================
     # POLYMARKET WALLET (reused from polymarket-bot-v2)
@@ -61,7 +66,7 @@ class Config:
     NEG_RISK_CTF_EXCHANGE = '0xe2222d279d744050d28e00520010520000310F59'
 
     # ===================================================================
-    # API ENDPOINTS (V2 — same as polymarket-bot-v2)
+    # API ENDPOINTS (V2 - same as polymarket-bot-v2)
     # ===================================================================
     GAMMA_API_URL = 'https://gamma-api.polymarket.com'
     CLOB_API_URL = 'https://clob.polymarket.com'
@@ -97,9 +102,9 @@ class Config:
     WEATHER_FORECAST_CACHE_SECONDS = int(os.getenv('WEATHER_FORECAST_CACHE_SECONDS', '300'))
 
     # ===================================================================
-    # WEATHER-API FAILOVER (Req-25 fix #5) — survive Open-Meteo rate / IP limits.
+    # WEATHER-API FAILOVER (Req-25 fix #5) - survive Open-Meteo rate / IP limits.
     # When the primary forecast provider returns a rate/IP-limit response
-    # (HTTP status in WEATHER_RATELIMIT_STATUS — e.g. 429/403 — or an Open-Meteo
+    # (HTTP status in WEATHER_RATELIMIT_STATUS - e.g. 429/403 - or an Open-Meteo
     # JSON error whose reason mentions "limit"), that endpoint is put on a
     # COOLDOWN and the fetchers transparently fail over to the next available
     # source: another OPEN_METEO_ENDPOINTS mirror (plus any
@@ -124,11 +129,11 @@ class Config:
     # SELLABILITY FLOOR (early-exit strategies): a leg that plans to SELL before
     # resolution needs a real bid to exit into. Below ~5c the book often has no
     # bid, so we only require this floor for strategies that intend to flip.
-    # Hold-to-resolution legs (e.g. late-observed) bypass it — their EV is
+    # Hold-to-resolution legs (e.g. late-observed) bypass it - their EV is
     # already fee-cleared and they never need to sell.
     MIN_ENTRY_PRICE = float(os.getenv('MIN_ENTRY_PRICE', '0.05'))
     # HARD DUST FLOOR (all strategies): below this a leg can't even rest on the
-    # 1c-tick venue. This is the only absolute price block now — cheap EV+ tails
+    # 1c-tick venue. This is the only absolute price block now - cheap EV+ tails
     # above it are allowed when held to resolution (the 90%-WR wallet's edge).
     ABS_PRICE_FLOOR = float(os.getenv('ABS_PRICE_FLOOR', '0.01'))
     # Trade BOTH daily-high and daily-low markets. The observation-driven
@@ -162,7 +167,7 @@ class Config:
     CONFIDENT_NEVER_SELL = os.getenv('CONFIDENT_NEVER_SELL', '1') == '1'
 
     # ===================================================================
-    # BEST-KELLY FACTOR SIZING (trading/sizing.py) — multi-factor allocation.
+    # BEST-KELLY FACTOR SIZING (trading/sizing.py) - multi-factor allocation.
     # Replaces the flat %-Kelly that dumped ~25% of balance on the first signal
     # and starved later (better) markets. Stake now scales with a composite
     # signal-strength score (edge + win-probability + grade + realized win-rate)
@@ -187,7 +192,7 @@ class Config:
     KELLY_WINRATE_FULL_TRUST_N = int(os.getenv('KELLY_WINRATE_FULL_TRUST_N', '20'))  # trades to fully trust observed WR
     KELLY_MAX_FRACTION = float(os.getenv('KELLY_MAX_FRACTION', '0.25'))        # per-trade safety cap vs live balance
 
-    # PORTFOLIO GUARD — stop the "allocates all funds immediately" drain. Keep a
+    # PORTFOLIO GUARD - stop the "allocates all funds immediately" drain. Keep a
     # cash reserve, cap how much of the portfolio is deployed, and cap how much
     # NEW money + how many NEW buys a single scan may place, so capital is left
     # for the good markets that appear later in the same scan.
@@ -197,7 +202,7 @@ class Config:
     MAX_DEPLOY_PER_SCAN_PCT = float(os.getenv('MAX_DEPLOY_PER_SCAN_PCT', '0.30'))  # new $ per scan <= this % of portfolio
     MAX_BUYS_PER_SCAN = int(os.getenv('MAX_BUYS_PER_SCAN', '6'))               # max NEW buys placed in one scan
 
-    # PER-STRATEGY SIZE MULTIPLIER — lean toward what wins, away from what loses.
+    # PER-STRATEGY SIZE MULTIPLIER - lean toward what wins, away from what loses.
     # peak_cluster is the only net-positive strategy in the logs -> boost it;
     # late_observed_yes was 0% WR over 21 trades -> shrink it. 1.0 = neutral.
     STRATEGY_SIZE_MULT = {
@@ -207,7 +212,7 @@ class Config:
         'quick_flip': float(os.getenv('SIZE_MULT_QUICK_FLIP', '1.0')),
     }
 
-    # ML SIZING/VETO INFLUENCE — the ML engine (ml/decision_engine.py) is now
+    # ML SIZING/VETO INFLUENCE - the ML engine (ml/decision_engine.py) is now
     # actually consulted on the trade path (it was wired but never called).
     # A SKIP with high confidence vetoes the buy; otherwise its confidence
     # scales size between MIN and MAX mult. Safe no-op when ML_API_KEY is unset
@@ -228,7 +233,7 @@ class Config:
     # Enabled by default now that it is wired into the scan loop.
     QUICK_FLIP_ENABLED = os.getenv('QUICK_FLIP_ENABLED', '1') == '1'
     CORRELATION_ARB_ENABLED = os.getenv('CORRELATION_ARB_ENABLED', '0') == '1'
-    # Demoted: forecast-only single-bucket bet. Off by default — the observed
+    # Demoted: forecast-only single-bucket bet. Off by default - the observed
     # strategy supersedes it. Flip to 1 to run it as a second opinion.
     CONFIDENT_ENABLED = os.getenv('CONFIDENT_ENABLED', '0') == '1'
     # Enabled by default: stability is a GRADE applied across strategies.
@@ -242,11 +247,13 @@ class Config:
     DRAWDOWN_GATE_ENABLED = os.getenv('DRAWDOWN_GATE_ENABLED', '1') == '1'
 
     # ===================================================================
-    # LATE OBSERVED-TEMPERATURE STRATEGY (PRIMARY) — trade the locked extreme
+    # LATE OBSERVED-TEMPERATURE STRATEGY (PRIMARY) - trade the locked extreme
     # Once the local day's peak/trough has passed, the observed max/min is a
     # hard floor/ceiling on the settled value while the book still prices stale
     # forecast uncertainty. YES the bucket that's locked in; NO the buckets that
     # observed data has made impossible. All gating is fee-aware.
+    # NOTE (Req-28): late_observed (esp. the NO side) is the GOOD strategy - do
+    # NOT retune it. Knobs below are left exactly as-is on purpose.
     # ===================================================================
     LATE_OBSERVED_ENABLED = os.getenv('LATE_OBSERVED_ENABLED', '1') == '1'
     LATE_OBSERVED_NO_SIDE = os.getenv('LATE_OBSERVED_NO_SIDE', '1') == '1'      # also buy NO on dead buckets
@@ -254,7 +261,7 @@ class Config:
     LATE_OBSERVED_MIN_EDGE = float(os.getenv('LATE_OBSERVED_MIN_EDGE', '0.10'))  # post-fee probability cushion
     LATE_OBSERVED_MAX_YES_PRICE = float(os.getenv('LATE_OBSERVED_MAX_YES_PRICE', '0.95'))
     # Cheap-tail allowance for the HOLD-to-resolution primary strategy. Lower
-    # than the global sellability floor because these legs never need to sell —
+    # than the global sellability floor because these legs never need to sell -
     # this is exactly the sub-5c tail the reference 90%-WR wallet lives in.
     LATE_OBSERVED_MIN_ENTRY_PRICE = float(os.getenv('LATE_OBSERVED_MIN_ENTRY_PRICE', '0.02'))
     LATE_OBSERVED_NO_MIN_PRICE = float(os.getenv('LATE_OBSERVED_NO_MIN_PRICE', '0.04'))
@@ -263,33 +270,21 @@ class Config:
     LATE_OBSERVED_MAX_FRACTION = float(os.getenv('LATE_OBSERVED_MAX_FRACTION', '0.25'))
     LATE_OBSERVED_MAX_LEGS = int(os.getenv('LATE_OBSERVED_MAX_LEGS', '4'))
     # --- Signal-strength -> absolute-USD allocation ladder (replaces flat %-Kelly) ---
-    # The late-observed stake now scales with a composite signal-strength score
-    # (post-fee edge + weather grade): a VERY good signal deploys up to
-    # SIZE_MAX_USD, a mid one lands mid-ladder, a barely-passing one stays near
-    # SIZE_FLOOR_USD. This fixes the "every buy suddenly uses ~25% of balance /
-    # ~$25" drain — MAX_FRACTION above is now only a per-trade SAFETY cap vs the
-    # live balance, not the sizing target. Tune the ladder here.
     LATE_OBSERVED_SIZE_FLOOR_USD = float(os.getenv('LATE_OBSERVED_SIZE_FLOOR_USD', '3.0'))   # weakest valid signal (~$3-4)
     LATE_OBSERVED_SIZE_MAX_USD = float(os.getenv('LATE_OBSERVED_SIZE_MAX_USD', '15.0'))      # strongest signal (HARD MAX $15)
     LATE_OBSERVED_EDGE_FULL = float(os.getenv('LATE_OBSERVED_EDGE_FULL', '0.25'))            # post-fee edge counted as max strength
     LATE_OBSERVED_W_EDGE = float(os.getenv('LATE_OBSERVED_W_EDGE', '0.6'))                   # weight of edge in the strength score
     LATE_OBSERVED_W_GRADE = float(os.getenv('LATE_OBSERVED_W_GRADE', '0.4'))                 # weight of grade in the strength score
-    # --- Req-27 YES-side tightening: late_observed_yes was a net loser, so the
-    # YES leg now only fires on a STRONGLY-locked, high-edge setup. The NO side
-    # keeps the looser LATE_OBSERVED_MIN_LOCK / MIN_EDGE above. These gate the
-    # YES leg ONLY (wired in strategies/late_observed_temp.py). ---
     LATE_OBSERVED_YES_MIN_LOCK = float(os.getenv('LATE_OBSERVED_YES_MIN_LOCK', '0.80'))      # YES leg needs this lock-confidence (vs NO)
     LATE_OBSERVED_YES_MIN_EDGE = float(os.getenv('LATE_OBSERVED_YES_MIN_EDGE', '0.14'))      # YES leg needs this post-fee edge (vs NO)
 
     # ===================================================================
-    # CITY FILTER (which cities to trade — empty = all)
+    # CITY FILTER (which cities to trade - empty = all)
     # ===================================================================
     ENABLED_CITIES = [c.strip() for c in os.getenv('ENABLED_CITIES', '').split(',') if c.strip()]
-    # If empty -> trade all cities. If set -> only trade these.
-    # Example: ENABLED_CITIES=tokyo,seoul,ankara,london
 
     # ===================================================================
-    # DRAWDOWN GATE — pause trading if drawdown exceeds threshold
+    # DRAWDOWN GATE - pause trading if drawdown exceeds threshold
     # ===================================================================
     MAX_DAILY_DRAWDOWN_PCT = float(os.getenv('MAX_DAILY_DRAWDOWN_PCT', '30'))
     MAX_WEEKLY_DRAWDOWN_PCT = float(os.getenv('MAX_WEEKLY_DRAWDOWN_PCT', '50'))
@@ -303,7 +298,7 @@ class Config:
     LOCKIN_MAX_BET_PCT = float(os.getenv('LOCKIN_MAX_BET_PCT', '0.40'))
 
     # ===================================================================
-    # STABILITY STRATEGY — trade only predictable city-days, adjacent buckets
+    # STABILITY STRATEGY - trade only predictable city-days, adjacent buckets
     # ===================================================================
     STABILITY_MIN_SCORE = float(os.getenv('STABILITY_MIN_SCORE', '0.62'))        # predictable threshold
     STABILITY_NEIGHBOR_SPAN = int(os.getenv('STABILITY_NEIGHBOR_SPAN', '1'))     # +/-1 -> buy 3 buckets
@@ -314,29 +309,23 @@ class Config:
     STABILITY_EXIT_HOURS_BEFORE = float(os.getenv('STABILITY_EXIT_HOURS_BEFORE', '1.0'))
 
     # ===================================================================
-    # PEAK BASKET — forecast-only directional-peak strategy (DEMOTED).
-    # Superseded by the observed-temperature strategy; off by default. Flip to 1
-    # to run it (e.g. early in the day before the extreme is locked).
+    # PEAK BASKET - forecast-only directional-peak strategy (DEMOTED/DEAD).
+    # Superseded by PEAKER. Off by default; knobs kept so old envs don't break.
     # ===================================================================
     PEAK_BASKET_ENABLED = os.getenv('PEAK_BASKET_ENABLED', '0') == '1'
-    PEAK_MIN_STABILITY = float(os.getenv('PEAK_MIN_STABILITY', '0.45'))        # minimum grade to trade
-    PEAK_MAX_PEAK_PRICE = float(os.getenv('PEAK_MAX_PEAK_PRICE', '0.85'))     # don't buy peak if market already knows
-    PEAK_MAX_NEIGHBOR_PRICE = float(os.getenv('PEAK_MAX_NEIGHBOR_PRICE', '0.60'))  # neighbor cap
-    PEAK_MAX_BASKET_COST = float(os.getenv('PEAK_MAX_BASKET_COST', '0.95'))   # sum(leg prices) < this -> >=5% profit on any win
-    PEAK_MIN_EDGE = float(os.getenv('PEAK_MIN_EDGE', '0.03'))                 # P(win) - basket_cost minimum
-    PEAK_BASE_FRACTION = float(os.getenv('PEAK_BASE_FRACTION', '0.05'))       # base % of balance per basket
-    PEAK_MAX_FRACTION = float(os.getenv('PEAK_MAX_FRACTION', '0.25'))         # max % of balance per basket (when everything aligns)
-    PEAK_MIN_MODELS = int(os.getenv('PEAK_MIN_MODELS', '2'))                  # minimum ensemble models required
-    # Fee-aware profit floor (Req-25 equal-shares correction): the per-share
-    # basket cost must satisfy  cost <= 1 - PEAK_FEE_BUFFER - PEAK_MIN_NET_PROFIT,
-    # so whichever single leg wins ($1/share under equal-shares allocation)
-    # covers the WHOLE basket cost PLUS a net profit margin AFTER fees. These two
-    # knobs cap the effective max basket cost alongside PEAK_MAX_BASKET_COST.
-    PEAK_FEE_BUFFER = float(os.getenv('PEAK_FEE_BUFFER', '0.02'))             # taker-fee headroom reserved on the winning leg
-    PEAK_MIN_NET_PROFIT = float(os.getenv('PEAK_MIN_NET_PROFIT', '0.03'))     # minimum net profit margin required after fees
+    PEAK_MIN_STABILITY = float(os.getenv('PEAK_MIN_STABILITY', '0.45'))
+    PEAK_MAX_PEAK_PRICE = float(os.getenv('PEAK_MAX_PEAK_PRICE', '0.85'))
+    PEAK_MAX_NEIGHBOR_PRICE = float(os.getenv('PEAK_MAX_NEIGHBOR_PRICE', '0.60'))
+    PEAK_MAX_BASKET_COST = float(os.getenv('PEAK_MAX_BASKET_COST', '0.95'))
+    PEAK_MIN_EDGE = float(os.getenv('PEAK_MIN_EDGE', '0.03'))
+    PEAK_BASE_FRACTION = float(os.getenv('PEAK_BASE_FRACTION', '0.05'))
+    PEAK_MAX_FRACTION = float(os.getenv('PEAK_MAX_FRACTION', '0.25'))
+    PEAK_MIN_MODELS = int(os.getenv('PEAK_MIN_MODELS', '2'))
+    PEAK_FEE_BUFFER = float(os.getenv('PEAK_FEE_BUFFER', '0.02'))
+    PEAK_MIN_NET_PROFIT = float(os.getenv('PEAK_MIN_NET_PROFIT', '0.03'))
 
     # ===================================================================
-    # BASKET QUALITY — predict the max temp, then buy an adjacent basket whose
+    # BASKET QUALITY - predict the max temp, then buy an adjacent basket whose
     # COMBINED cost < BASKET_MAX_COST so ANY single winning leg nets profit.
     # ===================================================================
     BASKET_MAX_COST = float(os.getenv('BASKET_MAX_COST', '0.85'))            # sum(leg prices) must be below this
@@ -344,7 +333,7 @@ class Config:
     BASKET_TIGHT_CONFIDENCE = float(os.getenv('BASKET_TIGHT_CONFIDENCE', '0.70'))  # center-bucket confidence >= this for tight basket
 
     # ===================================================================
-    # SNIPER GATE — the lone cheap-tail sniper only fires on high-conviction,
+    # SNIPER GATE - the lone cheap-tail sniper only fires on high-conviction,
     # stable city-days. Require a strong grade AND high model confidence.
     # ===================================================================
     SNIPER_MIN_GRADE = float(os.getenv('SNIPER_MIN_GRADE', '0.70'))         # stability grade required for a lone sniper buy
@@ -352,59 +341,53 @@ class Config:
     SNIPER_MIN_PROBABILITY = float(os.getenv('SNIPER_MIN_PROBABILITY', '0.12'))
 
     # ===================================================================
-    # QUICK_FLIP v2 — run-boundary forecast-change flip + EARLY-MISPRICING entry.
-    # KEEPS BOTH entry paths: (a) an early/opening mispricing where a bucket's
-    # model probability sits well above its market price (edge >= MIN_EDGE), and
-    # (b) a NEW forecast RUN that moved the ensemble mean (run-change = BOOST,
-    # not a hard gate). Stale book + publish window add confidence BOOSTS. Dedups
-    # re-signals, sizes small, caps candidates per market, and TRULY exits via
-    # book-or-cut at the hold cap. All values below equal the in-code getattr
-    # defaults — editable here now.
+    # QUICK_FLIP v3 (Req-28) - HIGH-confidence mispricing flip with a 10% profit
+    # target and a PROFIT-ONLY exit (never cut at a loss/breakeven on the timer).
+    # Now ALSO hunts mispriced NO tokens (QUICK_FLIP_NO_SIDE). Defaults tightened
+    # so it triggers LESS and only on real, high-conviction mispricings: higher
+    # confidence floor, smaller size, fewer per market. quick_flip.py reads each
+    # knob via getattr with these same values.
     # ===================================================================
     QUICK_FLIP_MIN_DELTA_C = float(os.getenv('QUICK_FLIP_MIN_DELTA_C', '1.0'))            # min ensemble-mean move (C) across runs to signal
-    QUICK_FLIP_MIN_EDGE = float(os.getenv('QUICK_FLIP_MIN_EDGE', '0.18'))                 # early-mispricing entry: model prob - price >= this (Req-27: stricter -> only real mispricings)
-    QUICK_FLIP_MAX_PER_MARKET = int(os.getenv('QUICK_FLIP_MAX_PER_MARKET', '1'))          # cap flip candidates per market per scan (Req-27: 1 -> no duplicate flips on one market)
-    QUICK_FLIP_MIN_CONFIDENCE = float(os.getenv('QUICK_FLIP_MIN_CONFIDENCE', '0.6'))      # min confidence required after boosts
+    QUICK_FLIP_MIN_EDGE = float(os.getenv('QUICK_FLIP_MIN_EDGE', '0.18'))                 # early-mispricing entry: model prob - price >= this (strict -> only real mispricings)
+    QUICK_FLIP_MAX_PER_MARKET = int(os.getenv('QUICK_FLIP_MAX_PER_MARKET', '2'))          # cap flip candidates per market per scan
+    QUICK_FLIP_MIN_CONFIDENCE = float(os.getenv('QUICK_FLIP_MIN_CONFIDENCE', '0.72'))     # Req-28: high-confidence only after boosts
     QUICK_FLIP_MAX_ENTRY = float(os.getenv('QUICK_FLIP_MAX_ENTRY', '0.85'))               # don't chase an already-priced bucket
-    QUICK_FLIP_MAX_HOLD_MIN = int(os.getenv('QUICK_FLIP_MAX_HOLD_MIN', '120'))            # book-or-cut after this many minutes
-    QUICK_FLIP_TARGET_ROI = float(os.getenv('QUICK_FLIP_TARGET_ROI', '10.0'))             # take-profit ROI% target (Req-27: first profit rung)
-    QUICK_FLIP_SIZE_PCT = float(os.getenv('QUICK_FLIP_SIZE_PCT', '0.05'))                 # base size as % of balance
-    QUICK_FLIP_MAX_SIZE_USD = float(os.getenv('QUICK_FLIP_MAX_SIZE_USD', '10.0'))         # hard $ cap per flip
+    QUICK_FLIP_MIN_ENTRY = float(os.getenv('QUICK_FLIP_MIN_ENTRY', '0.03'))               # Req-28: skip sub-3c dust that can't be flipped
+    QUICK_FLIP_MAX_HOLD_MIN = int(os.getenv('QUICK_FLIP_MAX_HOLD_MIN', '120'))            # convert to hold-to-resolution after this many minutes (never loss-cut)
+    QUICK_FLIP_TARGET_ROI = float(os.getenv('QUICK_FLIP_TARGET_ROI', '10.0'))             # initial take-profit ROI% target (first profit rung)
+    QUICK_FLIP_SIZE_PCT = float(os.getenv('QUICK_FLIP_SIZE_PCT', '0.03'))                 # Req-28: smaller base size (it was eating capital)
+    QUICK_FLIP_MAX_SIZE_USD = float(os.getenv('QUICK_FLIP_MAX_SIZE_USD', '6.0'))          # Req-28: hard $ cap per flip lowered
     QUICK_FLIP_SIGNAL_COOLDOWN_MIN = int(os.getenv('QUICK_FLIP_SIGNAL_COOLDOWN_MIN', '30'))  # dedup: don't re-signal same bucket within N min
     QUICK_FLIP_WINDOW_MIN = int(os.getenv('QUICK_FLIP_WINDOW_MIN', '20'))                 # publish-window length (min) for the boost
     QUICK_FLIP_WINDOW_BOOST = float(os.getenv('QUICK_FLIP_WINDOW_BOOST', '0.10'))         # confidence boost inside the publish window
-    QUICK_FLIP_STALE_BOOST = float(os.getenv('QUICK_FLIP_STALE_BOOST', '0.0'))            # confidence boost when the market price is stale (Req-27: 0 -> don't over-fire on stale alone)
+    QUICK_FLIP_STALE_BOOST = float(os.getenv('QUICK_FLIP_STALE_BOOST', '0.0'))            # confidence boost when the market price is stale
     QUICK_FLIP_STALE_EPS = float(os.getenv('QUICK_FLIP_STALE_EPS', '0.01'))               # |price-prev| below this counts as stale
-    QUICK_FLIP_MAX_CONCURRENT = int(os.getenv('QUICK_FLIP_MAX_CONCURRENT', '3'))          # max simultaneous open flips (Req-27: fewer, higher-quality flips)
-    QUICK_FLIP_TIME_EXIT = os.getenv('QUICK_FLIP_TIME_EXIT', '1') == '1'                  # enforce the (now profit-only) exit at the hold cap
+    QUICK_FLIP_MAX_CONCURRENT = int(os.getenv('QUICK_FLIP_MAX_CONCURRENT', '3'))          # max simultaneous open flips (fewer, higher-quality)
+    QUICK_FLIP_TIME_EXIT = os.getenv('QUICK_FLIP_TIME_EXIT', '1') == '1'                  # enforce the (profit-only) exit at the hold cap
+    # --- Req-28 NO-side flips ---
+    QUICK_FLIP_NO_SIDE = os.getenv('QUICK_FLIP_NO_SIDE', '1') == '1'                      # also hunt mispriced NO tokens for the 10% flip
+    QUICK_FLIP_NO_MIN_EDGE = float(os.getenv('QUICK_FLIP_NO_MIN_EDGE', '0.10'))           # min edge for a NO-side flip candidate
     # --- Req-27 PROFIT-ONLY LADDERED EXIT (trading/exit_policies.check_flip_exits) ---
-    # A flip must SELL ONLY IN PROFIT. The ML decides book-small-now vs run-more,
-    # laddered at MIN/MID/RUN ROI%; a big runner (>= FORCE_BOOK) is ALWAYS booked
-    # so a winner never round-trips back to breakeven. A flip that is NOT in
-    # profit by its hold cap is NEVER cut at a loss/breakeven — it converts to
-    # hold-to-resolution and rides to settlement instead. Set PROFIT_ONLY_EXIT=0
-    # for the legacy book-or-cut-at-market behaviour.
     QUICK_FLIP_PROFIT_ONLY_EXIT = os.getenv('QUICK_FLIP_PROFIT_ONLY_EXIT', '1') == '1'    # never book a flip at a loss/breakeven on the timer
-    QUICK_FLIP_USE_ML_EXIT = os.getenv('QUICK_FLIP_USE_ML_EXIT', '1') == '1'              # let the ML (XGBoost/GPT) decide sell-small vs run-more
+    QUICK_FLIP_USE_ML_EXIT = os.getenv('QUICK_FLIP_USE_ML_EXIT', '1') == '1'              # let the ML decide sell-small vs run-more
     QUICK_FLIP_MIN_BOOK_ROI_PCT = float(os.getenv('QUICK_FLIP_MIN_BOOK_ROI_PCT', '10.0')) # lowest profit rung we will book
     QUICK_FLIP_LADDER_MID_ROI_PCT = float(os.getenv('QUICK_FLIP_LADDER_MID_ROI_PCT', '20.0'))  # mid profit rung (flip_book_mid)
     QUICK_FLIP_LADDER_RUN_ROI_PCT = float(os.getenv('QUICK_FLIP_LADDER_RUN_ROI_PCT', '30.0'))  # let strong flips run toward this
     QUICK_FLIP_FORCE_BOOK_ROI_PCT = float(os.getenv('QUICK_FLIP_FORCE_BOOK_ROI_PCT', '30.0'))  # always book at/above this (don't round-trip a winner)
 
     # ===================================================================
-    # PEAK_CLUSTER — NEW parallel any-one-wins basket. Estimate the peak bucket
+    # PEAK_CLUSTER - parallel any-one-wins basket. Estimate the peak bucket
     # (argmax model probability), buy a window of adjacent buckets whose
     # COMBINED per-share cost stays below PEAK_CLUSTER_MAX_COST, so ANY single
-    # winning leg pays $1 > cost = net profit after fees. HOLDS TO RESOLUTION
-    # (never stop-lossed/trailed — the whole basket only works if every leg rides
-    # to settlement). Widened per Req-23: span +/-3, up to 7 legs, combined cost
-    # up to 0.97 ("under 95-97¢ after fees is OK"). Runs ALONGSIDE the others.
+    # winning leg pays $1 > cost = net profit after fees. HOLDS TO RESOLUTION.
+    # MIN_LEGS is hard-floored to 3 in code so it is NEVER a 1-leg "cluster".
     # ===================================================================
     PEAK_CLUSTER_ENABLED = os.getenv('PEAK_CLUSTER_ENABLED', '1') == '1'
     PEAK_CLUSTER_SPAN = int(os.getenv('PEAK_CLUSTER_SPAN', '3'))                          # +/- buckets around the estimated peak
-    PEAK_CLUSTER_MAX_COST = float(os.getenv('PEAK_CLUSTER_MAX_COST', '0.97'))             # combined per-share cost ceiling (any win still profits after fees)
-    PEAK_CLUSTER_MIN_LEGS = int(os.getenv('PEAK_CLUSTER_MIN_LEGS', '3'))                  # minimum legs for a valid basket (Req-27: never a 1-leg "cluster")
-    PEAK_CLUSTER_MAX_LEGS = int(os.getenv('PEAK_CLUSTER_MAX_LEGS', '7'))                  # 2-7 neighbouring buckets per the design
+    PEAK_CLUSTER_MAX_COST = float(os.getenv('PEAK_CLUSTER_MAX_COST', '0.97'))             # combined per-share cost ceiling
+    PEAK_CLUSTER_MIN_LEGS = int(os.getenv('PEAK_CLUSTER_MIN_LEGS', '3'))                  # minimum legs for a valid basket (never a 1-leg cluster)
+    PEAK_CLUSTER_MAX_LEGS = int(os.getenv('PEAK_CLUSTER_MAX_LEGS', '7'))                  # 3-7 neighbouring buckets per the design
     PEAK_CLUSTER_MIN_EDGE = float(os.getenv('PEAK_CLUSTER_MIN_EDGE', '0.03'))             # combined prob - cost minimum
     PEAK_CLUSTER_MIN_CONF = float(os.getenv('PEAK_CLUSTER_MIN_CONF', '0.55'))             # min center-bucket confidence
     PEAK_CLUSTER_MAX_CENTER_PRICE = float(os.getenv('PEAK_CLUSTER_MAX_CENTER_PRICE', '0.85'))  # skip if the peak is already fully priced
@@ -414,61 +397,52 @@ class Config:
     PEAK_CLUSTER_TRADE_DECIDED = os.getenv('PEAK_CLUSTER_TRADE_DECIDED', '0') == '1'      # run inside the lock window? off by default
 
     # ===================================================================
-    # SAFETY PEAK — focused HIGH-confidence 1-2 bucket directional peak (Req-25
-    # fix #4). Distinct from peak_cluster (wide 3-7 leg any-one-wins basket) and
-    # peak_basket (looser directional/symmetric basket): this is the TIGHTEST,
-    # most PATIENT peak play. It fires ONLY when the peak estimate is accurate
-    # and high-confidence (tight ensemble std + many agreeing models + strong
-    # grade + high peak-bucket confidence), then buys the peak bucket plus
-    # EXACTLY ONE directional safety neighbour (warming->+1, cooling->-1,
-    # stable->the shoulder the ensemble mean leans toward) in EQUAL SHARES, so
-    # whichever single bucket resolves to $1 covers the other leg's loss PLUS a
-    # net profit AFTER fees. Holds to resolution. OFF by default — enable once
-    # validated. Defaults below mirror the in-code getattr() fallbacks.
+    # SAFETY PEAK - DEAD (merged into PEAKER). Knobs kept so old envs don't break.
     # ===================================================================
     SAFETY_PEAK_ENABLED = os.getenv('SAFETY_PEAK_ENABLED', '0') == '1'
-    SAFETY_PEAK_MIN_GRADE = float(os.getenv('SAFETY_PEAK_MIN_GRADE', '0.65'))             # min stability grade (accurate, predictable day)
-    SAFETY_PEAK_MIN_MODELS = int(os.getenv('SAFETY_PEAK_MIN_MODELS', '3'))                # min ensemble models agreeing
-    SAFETY_PEAK_MAX_STD = float(os.getenv('SAFETY_PEAK_MAX_STD', '1.2'))                  # max ensemble spread (C); tight = accurate
-    SAFETY_PEAK_MIN_CONFIDENCE = float(os.getenv('SAFETY_PEAK_MIN_CONFIDENCE', '0.70'))   # min peak-bucket confidence
-    SAFETY_PEAK_MAX_PEAK_PRICE = float(os.getenv('SAFETY_PEAK_MAX_PEAK_PRICE', '0.85'))   # don't chase an already-priced peak
-    SAFETY_PEAK_MAX_NEIGHBOR_PRICE = float(os.getenv('SAFETY_PEAK_MAX_NEIGHBOR_PRICE', '0.60'))  # neighbour price cap
-    SAFETY_PEAK_FEE_BUFFER = float(os.getenv('SAFETY_PEAK_FEE_BUFFER', '0.02'))           # taker-fee headroom on the winning leg
-    SAFETY_PEAK_MIN_NET_PROFIT = float(os.getenv('SAFETY_PEAK_MIN_NET_PROFIT', '0.05'))   # min net profit after fees (any-one-wins)
-    SAFETY_PEAK_MIN_EDGE = float(os.getenv('SAFETY_PEAK_MIN_EDGE', '0.05'))               # combined prob - basket cost minimum
-    SAFETY_PEAK_BASE_FRACTION = float(os.getenv('SAFETY_PEAK_BASE_FRACTION', '0.05'))     # base % of balance per basket
-    SAFETY_PEAK_MAX_FRACTION = float(os.getenv('SAFETY_PEAK_MAX_FRACTION', '0.20'))       # max % of balance per basket
-    SAFETY_PEAK_MAX_USD = float(os.getenv('SAFETY_PEAK_MAX_USD', '15.0'))                 # hard $ cap per basket
-    SAFETY_PEAK_TRADE_DECIDED = os.getenv('SAFETY_PEAK_TRADE_DECIDED', '0') == '1'        # run inside the lock window? off (forecast-based edge)
+    SAFETY_PEAK_MIN_GRADE = float(os.getenv('SAFETY_PEAK_MIN_GRADE', '0.65'))
+    SAFETY_PEAK_MIN_MODELS = int(os.getenv('SAFETY_PEAK_MIN_MODELS', '3'))
+    SAFETY_PEAK_MAX_STD = float(os.getenv('SAFETY_PEAK_MAX_STD', '1.2'))
+    SAFETY_PEAK_MIN_CONFIDENCE = float(os.getenv('SAFETY_PEAK_MIN_CONFIDENCE', '0.70'))
+    SAFETY_PEAK_MAX_PEAK_PRICE = float(os.getenv('SAFETY_PEAK_MAX_PEAK_PRICE', '0.85'))
+    SAFETY_PEAK_MAX_NEIGHBOR_PRICE = float(os.getenv('SAFETY_PEAK_MAX_NEIGHBOR_PRICE', '0.60'))
+    SAFETY_PEAK_FEE_BUFFER = float(os.getenv('SAFETY_PEAK_FEE_BUFFER', '0.02'))
+    SAFETY_PEAK_MIN_NET_PROFIT = float(os.getenv('SAFETY_PEAK_MIN_NET_PROFIT', '0.05'))
+    SAFETY_PEAK_MIN_EDGE = float(os.getenv('SAFETY_PEAK_MIN_EDGE', '0.05'))
+    SAFETY_PEAK_BASE_FRACTION = float(os.getenv('SAFETY_PEAK_BASE_FRACTION', '0.05'))
+    SAFETY_PEAK_MAX_FRACTION = float(os.getenv('SAFETY_PEAK_MAX_FRACTION', '0.20'))
+    SAFETY_PEAK_MAX_USD = float(os.getenv('SAFETY_PEAK_MAX_USD', '15.0'))
+    SAFETY_PEAK_TRADE_DECIDED = os.getenv('SAFETY_PEAK_TRADE_DECIDED', '0') == '1'
 
     # ===================================================================
-    # PEAKER (Req-27) — UNIFIED peak strategy that REPLACES peak_basket +
-    # safety_peak (they bought the same peak position twice as duplicates). One
-    # strategy, four shapes, all combined cost < PEAKER_MAX_COST so any single
-    # winning leg nets profit after fees, HELD to resolution:
-    #   (1) solo: the peak bucket alone (1 leg) — only when very high confidence;
-    #   (2) basket-warmer: peak + (+1) neighbour;
-    #   (3) basket-cooler: peak + (-1) neighbour;
-    #   (4) both neighbours -> deferred to peak_cluster (don't duplicate here).
-    # CALIBRATED around the winning COOL neighbour (safety_peak_neighbor_cool was
-    # the top performer; safety_peak_peak busted): PREFER_COOL biases to the -1
-    # cooler basket by default, sizes the cool side up (COOL_SIZE_MULT) and relaxes
-    # its edge gate slightly (COOL_EDGE_RELAX), and shrinks the warm side
-    # (WARM_SIZE_MULT). peaker.py reads every knob via getattr with these same
-    # defaults, so it already runs before this commit; this block just makes the
-    # knobs explicit/tunable. SAFETY_PEAK_* / PEAK_BASKET_* above are now dead
-    # config kept only so old envs don't break.
+    # PEAKER (Req-28 REDESIGN) - MARKET-ANCHORED peak strategy. The market itself
+    # prices the winning bucket (~>=60c implies ~60% win, ~40% upside). PEAKER
+    # ANCHORS on the market's high-probability (favourite) bucket, then
+    # CROSS-VALIDATES it with our model and only buys on CONFIRMATION. The edge
+    # is the cool/warm BASKET: when our model peak == the market favourite AND
+    # the trend is cooling, check the -1C neighbour; if peak + (-1C) combined
+    # cost < PEAKER_MAX_COST (under 95c) buy BOTH as a grouped "peaker cool
+    # basket". Same warming -> +1C "peaker warm basket". A bare-favourite SOLO buy
+    # is ~breakeven (why peaker was "always losing"), so solo only fires on a
+    # genuine model edge (PEAKER_SOLO_MIN_EDGE). All combined cost < PEAKER_MAX_COST
+    # so any single winning leg nets profit after fees; HELD to resolution.
+    # peaker.py reads every knob via getattr with these same defaults.
     # ===================================================================
     PEAKER_ENABLED = os.getenv('PEAKER_ENABLED', '1') == '1'
     PEAKER_MIN_GRADE = float(os.getenv('PEAKER_MIN_GRADE', '0.60'))                       # min stability grade to trade
     PEAKER_MIN_MODELS = int(os.getenv('PEAKER_MIN_MODELS', '3'))                          # min ensemble models agreeing
     PEAKER_MAX_STD = float(os.getenv('PEAKER_MAX_STD', '1.4'))                            # max ensemble spread (C)
     PEAKER_MIN_CONFIDENCE = float(os.getenv('PEAKER_MIN_CONFIDENCE', '0.62'))             # min peak-bucket confidence for a basket
-    PEAKER_SOLO_MIN_CONFIDENCE = float(os.getenv('PEAKER_SOLO_MIN_CONFIDENCE', '0.80'))   # higher bar to buy the peak bucket SOLO (1 leg)
+    PEAKER_SOLO_MIN_CONFIDENCE = float(os.getenv('PEAKER_SOLO_MIN_CONFIDENCE', '0.80'))   # higher bar to buy the favourite SOLO (1 leg)
+    # --- Req-28 market-anchoring + cross-validation ---
+    PEAKER_MARKET_MIN_PRICE = float(os.getenv('PEAKER_MARKET_MIN_PRICE', '0.40'))         # market's favourite must be priced >= this to anchor on
+    PEAKER_ALIGN_BUCKETS = int(os.getenv('PEAKER_ALIGN_BUCKETS', '1'))                    # our model peak must be within N buckets of the market favourite
+    PEAKER_CONFIRM_RATIO = float(os.getenv('PEAKER_CONFIRM_RATIO', '0.85'))               # our model prob must be >= this x market price to CONFIRM
+    PEAKER_SOLO_MIN_EDGE = float(os.getenv('PEAKER_SOLO_MIN_EDGE', '0.08'))               # solo (bare-favourite) buy needs a genuine model edge
     PEAKER_PEAK_BIAS_BUCKETS = int(os.getenv('PEAKER_PEAK_BIAS_BUCKETS', '1'))            # hot-bias correction: nudge the peak estimate down N buckets
-    PEAKER_MAX_PEAK_PRICE = float(os.getenv('PEAKER_MAX_PEAK_PRICE', '0.85'))             # don't chase an already-priced peak
+    PEAKER_MAX_PEAK_PRICE = float(os.getenv('PEAKER_MAX_PEAK_PRICE', '0.85'))             # don't chase an already-fully-priced peak
     PEAKER_MAX_NEIGHBOR_PRICE = float(os.getenv('PEAKER_MAX_NEIGHBOR_PRICE', '0.60'))     # neighbour price cap
-    PEAKER_MAX_COST = float(os.getenv('PEAKER_MAX_COST', '0.95'))                         # combined per-share cost ceiling (any win profits after fees)
+    PEAKER_MAX_COST = float(os.getenv('PEAKER_MAX_COST', '0.95'))                         # combined per-share cost ceiling (under 95c)
     PEAKER_FEE_BUFFER = float(os.getenv('PEAKER_FEE_BUFFER', '0.02'))                     # taker-fee headroom on the winning leg
     PEAKER_MIN_NET_PROFIT = float(os.getenv('PEAKER_MIN_NET_PROFIT', '0.03'))             # min net profit after fees (any-one-wins)
     PEAKER_MIN_EDGE = float(os.getenv('PEAKER_MIN_EDGE', '0.04'))                         # combined prob - basket cost minimum
@@ -482,10 +456,8 @@ class Config:
     PEAKER_TRADE_DECIDED = os.getenv('PEAKER_TRADE_DECIDED', '0') == '1'                  # run inside the lock window? off (forecast-based edge)
 
     # ===================================================================
-    # THESIS-INVALIDATION EXIT — STRICT early exit. Most positions HOLD to
-    # resolution; only a non-tail position whose ROI has COLLAPSED (very bad)
-    # exits early. Cheap tails, stale prices, and near-close positions all KEEP
-    # HOLDING. Values = code defaults; set THESIS_EXIT_ENABLED=0 to disable.
+    # THESIS-INVALIDATION EXIT - STRICT early exit. Most positions HOLD to
+    # resolution; only a non-tail position whose ROI has COLLAPSED exits early.
     # ===================================================================
     THESIS_EXIT_ENABLED = os.getenv('THESIS_EXIT_ENABLED', '1') == '1'
     THESIS_EXIT_MAX_ROI_PCT = float(os.getenv('THESIS_EXIT_MAX_ROI_PCT', '-85.0'))        # exit ONLY if ROI <= this (very bad)
@@ -494,27 +466,18 @@ class Config:
     THESIS_EXIT_MIN_MINUTES_TO_CLOSE = float(os.getenv('THESIS_EXIT_MIN_MINUTES_TO_CLOSE', '60.0'))  # near-close positions are HELD
 
     # ===================================================================
-    # OUTCOME-DECIDED GATE — only HARD-skip a market once its measurement day is
+    # OUTCOME-DECIDED GATE - only HARD-skip a market once its measurement day is
     # FULLY OVER in the city's local time (value recorded, just awaiting UMA).
-    # The intraday lock-hour window (same local day, after the peak) is exactly
-    # where the late-observed strategy has its edge, so it is NOT skipped — the
-    # bot trades the locked-but-unresolved extreme.
     # ===================================================================
     SKIP_DECIDED_MARKETS = os.getenv('SKIP_DECIDED_MARKETS', '1') == '1'
     HIGH_TEMP_LOCK_HOUR = int(os.getenv('HIGH_TEMP_LOCK_HOUR', '18'))       # local hour after which the day's HIGH is considered set
-    # PER-STRATEGY lock-window opt-in. When a market is decided/locked but the
-    # local day is NOT yet fully over, these decide which strategies still run.
-    # Observation strategies (LateObserved, QuickFlip) HAVE their edge in this
-    # window, so they default ON (1). Forecast-only strategies (PeakBasket,
-    # Confident) have no edge once the extreme is locked, so they default OFF (0).
-    # This replaces the old blanket skip that was blocking EVERY strategy.
     LATE_OBSERVED_TRADE_DECIDED = os.getenv('LATE_OBSERVED_TRADE_DECIDED', '1') == '1'
     QUICK_FLIP_TRADE_DECIDED = os.getenv('QUICK_FLIP_TRADE_DECIDED', '1') == '1'
     PEAK_BASKET_TRADE_DECIDED = os.getenv('PEAK_BASKET_TRADE_DECIDED', '0') == '1'
     CONFIDENT_TRADE_DECIDED = os.getenv('CONFIDENT_TRADE_DECIDED', '0') == '1'
 
     # ===================================================================
-    # STABILITY GRADE — stability is a GRADE (not a strategy): it scales
+    # STABILITY GRADE - stability is a GRADE (not a strategy): it scales
     # size and sets the exit for EVERY strategy.
     # ===================================================================
     GRADE_SIZING_ENABLED = os.getenv('GRADE_SIZING_ENABLED', '1') == '1'
@@ -524,12 +487,7 @@ class Config:
     GRADE_SIZE_MAX_MULT = float(os.getenv('GRADE_SIZE_MAX_MULT', '1.25'))  # size multiplier at grade 1
 
     # ===================================================================
-    # LIQUIDITY AWARENESS — weather books are thin & asymmetric BY DESIGN. The
-    # bot READS the order book and ADAPTS: maker entry at best_bid, trims size
-    # on thin/wide books, holds to resolution when too thin to exit. ADAPTIVE by
-    # default (STRICT_BLOCK off): we utilise wide-spread weather books instead of
-    # skipping them, and only the truly untradeable (no bid / no book) get
-    # down-sized + held. Set LIQUIDITY_STRICT_BLOCK=1 to hard-skip instead.
+    # LIQUIDITY AWARENESS - weather books are thin & asymmetric BY DESIGN.
     # ===================================================================
     LIQUIDITY_GUARD_ENABLED = os.getenv('LIQUIDITY_GUARD_ENABLED', '1') == '1'   # read & adapt to the book
     LIQUIDITY_STRICT_BLOCK = os.getenv('LIQUIDITY_STRICT_BLOCK', '0') == '1'     # 0 = adapt (default), 1 = hard-skip failing books
@@ -537,7 +495,7 @@ class Config:
     LIQUIDITY_BOOK_CACHE_SECONDS = int(os.getenv('LIQUIDITY_BOOK_CACHE_SECONDS', '30'))
 
     # ===================================================================
-    # ADAPTIVE EXIT — analyze unfavorable markets and exit properly
+    # ADAPTIVE EXIT - analyze unfavorable markets and exit properly
     # ===================================================================
     ADAPTIVE_CHECK_INTERVAL = int(os.getenv('ADAPTIVE_CHECK_INTERVAL', '120'))
     ADAPTIVE_SELL_IF_EDGE_LOST = os.getenv('ADAPTIVE_SELL_IF_EDGE_LOST', '1') == '1'
@@ -563,11 +521,7 @@ class Config:
     SCAN_DAYS_AHEAD = int(os.getenv('SCAN_DAYS_AHEAD', '3'))
 
     # ===================================================================
-    # PAPER-REALISM — make the dry run behave like real trading
-    # The paper engine fills against the live ask ladder, settles from
-    # Polymarket's ACTUAL resolved outcome (so it works after a market closes),
-    # freezes stale prices instead of showing 0/random, flags near-certain wins
-    # in the final minutes, and asserts a conserved-PnL ledger after every change.
+    # PAPER-REALISM - make the dry run behave like real trading
     # ===================================================================
     PAPER_REALISTIC_FILL = os.getenv('PAPER_REALISTIC_FILL', '1') == '1'         # walk the real ask ladder for paper buys
     PAPER_SETTLE_BY_WEATHER = os.getenv('PAPER_SETTLE_BY_WEATHER', '0') == '1'   # weather is CONFIRMATION-only, never the source of truth
@@ -577,9 +531,7 @@ class Config:
     PAPER_FREEZE_ON_BAD_PRICE = os.getenv('PAPER_FREEZE_ON_BAD_PRICE', '1') == '1'  # keep last good price instead of writing 0
 
     # ===================================================================
-    # RESOLUTION-STATION VERIFICATION — forecast/observe the EXACT airport the
-    # market settles on. Deterministic match first (0 tokens); only calls the
-    # cheap verifier LLM when the station is ambiguous or looks different.
+    # RESOLUTION-STATION VERIFICATION
     # ===================================================================
     RESOLUTION_VERIFY_ENABLED = os.getenv('RESOLUTION_VERIFY_ENABLED', '1') == '1'
     RESOLUTION_VERIFY_MIN_CONF = float(os.getenv('RESOLUTION_VERIFY_MIN_CONF', '0.6'))
@@ -668,41 +620,29 @@ class Config:
     def print_status(cls):
         mode = 'PAPER (DRY-RUN)' if cls.is_paper() else 'LIVE'
         print(f"\n{'='*60}")
-        print(f"WEATHER SNIPER v{cls.VERSION} — {cls.VERSION_NAME}")
+        print(f"WEATHER SNIPER v{cls.VERSION} - {cls.VERSION_NAME}")
         print(f"{'='*60}")
         print(f"Mode:        {mode}")
         print(f"Balance:     ${cls.STARTING_BALANCE:.2f} pUSD")
+        print(f"Trading:     {'ENABLED' if cls.TRADING_ENABLED else 'DISABLED (press Start)'}")
         print(f"Primary:     LateObserved {'ON' if cls.LATE_OBSERVED_ENABLED else 'OFF'} "
               f"(NO-side {'ON' if cls.LATE_OBSERVED_NO_SIDE else 'OFF'}, "
               f"size ${cls.LATE_OBSERVED_SIZE_FLOOR_USD:.0f}-${cls.LATE_OBSERVED_SIZE_MAX_USD:.0f})")
         print(f"Kelly:       factor-sizing {'ON' if cls.KELLY_FACTOR_SIZING_ENABLED else 'OFF'} "
               f"(tiers ${cls.KELLY_TIER_BASE_USD:.0f}/${cls.KELLY_TIER_GOOD_USD:.0f}/"
               f"${cls.KELLY_TIER_VGOOD_USD:.0f}/${cls.KELLY_TIER_PERFECT_USD:.0f})")
-        print(f"Portfolio:   guard {'ON' if cls.PORTFOLIO_GUARD_ENABLED else 'OFF'} "
-              f"(reserve {cls.PORTFOLIO_RESERVE_PCT:.0%}, per-scan {cls.MAX_DEPLOY_PER_SCAN_PCT:.0%}, "
-              f"max {cls.MAX_BUYS_PER_SCAN} buys)")
-        print(f"ML:          decision {'ON' if cls.ML_DECISION_ENABLED else 'OFF'} "
-              f"(veto>={cls.ML_VETO_CONF:.0%}, size x{cls.ML_SIZE_MIN_MULT}-{cls.ML_SIZE_MAX_MULT})")
         print(f"QuickFlip:   {'ON' if cls.QUICK_FLIP_ENABLED else 'OFF'} "
-              f"(edge>={cls.QUICK_FLIP_MIN_EDGE:.0%} or run-change, hold<={cls.QUICK_FLIP_MAX_HOLD_MIN}m, max {cls.QUICK_FLIP_MAX_CONCURRENT})")
+              f"(edge>={cls.QUICK_FLIP_MIN_EDGE:.0%} conf>={cls.QUICK_FLIP_MIN_CONFIDENCE:.0%} "
+              f"target {cls.QUICK_FLIP_TARGET_ROI:.0f}% NO-side={'Y' if cls.QUICK_FLIP_NO_SIDE else 'N'} "
+              f"max {cls.QUICK_FLIP_MAX_CONCURRENT}@${cls.QUICK_FLIP_MAX_SIZE_USD:.0f})")
         print(f"PeakCluster: {'ON' if cls.PEAK_CLUSTER_ENABLED else 'OFF'} "
               f"(span+/-{cls.PEAK_CLUSTER_SPAN}, {cls.PEAK_CLUSTER_MIN_LEGS}-{cls.PEAK_CLUSTER_MAX_LEGS} legs, cost<{cls.PEAK_CLUSTER_MAX_COST}, HOLD)")
         print(f"Peaker:      {'ON' if getattr(cls, 'PEAKER_ENABLED', True) else 'OFF'} "
-              f"(merged peak+safety; prefer-cool={'Y' if getattr(cls, 'PEAKER_PREFER_COOL', True) else 'N'}, "
-              f"grade>={getattr(cls, 'PEAKER_MIN_GRADE', 0.60)}, cost<{getattr(cls, 'PEAKER_MAX_COST', 0.95)}, HOLD)")
+              f"(market-anchored>={getattr(cls, 'PEAKER_MARKET_MIN_PRICE', 0.40):.0%}, confirm x{getattr(cls, 'PEAKER_CONFIRM_RATIO', 0.85)}, "
+              f"cool/warm basket<{getattr(cls, 'PEAKER_MAX_COST', 0.95)}, HOLD)")
         print(f"ThesisExit:  {'ON' if cls.THESIS_EXIT_ENABLED else 'OFF'} "
               f"(only ROI<={cls.THESIS_EXIT_MAX_ROI_PCT:.0f}% & entry>={cls.THESIS_EXIT_MIN_ENTRY_PRICE})")
-        print(f"Trailing:    {cls.TRAILING_STOP_PCT:.0f}% from peak, armed after {cls.TRAILING_MIN_PEAK_MULT}x entry")
-        print(f"Lock-window: LateObs={'Y' if cls.LATE_OBSERVED_TRADE_DECIDED else 'N'} "
-              f"Flip={'Y' if cls.QUICK_FLIP_TRADE_DECIDED else 'N'} "
-              f"Peak={'Y' if cls.PEAK_BASKET_TRADE_DECIDED else 'N'} "
-              f"Cluster={'Y' if cls.PEAK_CLUSTER_TRADE_DECIDED else 'N'} "
-              f"Confident={'Y' if cls.CONFIDENT_TRADE_DECIDED else 'N'}")
         print(f"Min Edge:    {cls.MIN_EDGE_TO_ENTER*100:.0f}% | fee-aware taker={cls.ASSUME_TAKER_FILLS}")
         print(f"Liquidity:   {'STRICT' if cls.LIQUIDITY_STRICT_BLOCK else 'adaptive'} (thin x{cls.LIQUIDITY_THIN_SIZE_MULT})")
-        print(f"Paper:       realistic-fill={cls.PAPER_REALISTIC_FILL} preclose>={cls.PAPER_PRECLOSE_LOCK_PCT:.0%} freeze={cls.PAPER_FREEZE_ON_BAD_PRICE}")
-        print(f"Resolve:     station-verify={'ON' if cls.RESOLUTION_VERIFY_ENABLED else 'OFF'} (min_conf={cls.RESOLUTION_VERIFY_MIN_CONF})")
-        print(f"Failover:    weather {'ON' if cls.WEATHER_FAILOVER_ENABLED else 'OFF'} "
-              f"(cooldown {cls.WEATHER_PROVIDER_COOLDOWN_SECONDS}s, limit-status {cls.WEATHER_RATELIMIT_STATUS})")
         print(f"Scan:        every {cls.SCAN_INTERVAL_SECONDS}s")
         print(f"{'='*60}\n")
