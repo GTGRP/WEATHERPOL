@@ -12,11 +12,14 @@ Features:
 """
 
 import os
+import csv
 import json
 import html
 import time
+import logging
 import threading
 import requests
+from collections import deque
 from typing import Optional, Dict, List
 from datetime import datetime, timezone
 
@@ -52,6 +55,13 @@ class TelegramBot:
         # and log human-readable changes so the OK button can summarise them.
         self._awaiting = None          # None | 'balance'
         self._session_changes = []     # ["STARTING_BALANCE = 300", ...]
+        # Req-29 mlanalysis: optional ML engine handle (set by the dashboard via
+        # attach_ml); None keeps mlanalysis on its heuristic fallback.
+        self.ml = None
+        # Req-29 ai-summary: capture WARNING+ log lines into a ring buffer so
+        # /aisummary can surface recent runtime errors for sharing.
+        self._error_log = deque(maxlen=300)
+        self._install_error_capture()
         # Seed with already-redeemed ids so a restart doesn't re-announce the
         # whole backlog — only NEW redemptions after startup are sent.
         self._announced_redeemed = set(
@@ -129,6 +139,39 @@ class TelegramBot:
                                timeout=10)
         except Exception:
             pass
+
+    def _install_error_capture(self):
+        """Attach a handler to the root logger that records WARNING+ lines into
+        an in-memory ring buffer (for /aisummary). Idempotent + defensive."""
+        try:
+            buf = self._error_log
+
+            class _RingHandler(logging.Handler):
+                def emit(self, record):
+                    try:
+                        if record.levelno >= logging.WARNING:
+                            ts = datetime.now(timezone.utc).strftime('%m-%d %H:%M:%S')
+                            buf.append(
+                                f"{ts} {record.levelname} "
+                                f"{record.name}: {record.getMessage()}"
+                            )
+                    except Exception:
+                        pass
+
+            root = logging.getLogger()
+            if not any(getattr(h, '_wp_ring', False) for h in root.handlers):
+                h = _RingHandler()
+                h._wp_ring = True
+                h.setLevel(logging.WARNING)
+                root.addHandler(h)
+                if root.level == 0 or root.level > logging.WARNING:
+                    root.setLevel(logging.WARNING)
+        except Exception:
+            pass
+
+    def attach_ml(self, ml):
+        """Wire the ML decision engine so /mlanalysis can use it for a narrative."""
+        self.ml = ml
 
     # ==============================================================
     # LIFECYCLE (startup ready / start / restart fresh)
@@ -446,6 +489,7 @@ class TelegramBot:
                     'kind': 'single', 'box': '', 'positions': [p],
                     'pnl': p.unrealized_pnl, 'roi': p.roi_pct,
                     'recent': p.entry_time,
+                    'strategy': getattr(p, 'strategy', '') or '',
                 })
         for box, legs in clusters.items():
             pnl = sum(l.unrealized_pnl for l in legs)
@@ -463,6 +507,8 @@ class TelegramBot:
             units.sort(key=lambda u: u['pnl'])
         elif sort_key == 'roi':
             units.sort(key=lambda u: u['roi'], reverse=True)
+        elif sort_key == 'strategy':
+            units.sort(key=lambda u: (u.get('strategy', '') or '', -u['pnl']))
         else:  # 'recent'
             units.sort(key=lambda u: u['recent'], reverse=True)
         return units
@@ -540,7 +586,13 @@ class TelegramBot:
         if not chunk:
             text += "No open positions.\n"
         else:
+            last_strat = None
             for i, u in enumerate(chunk, start=start + 1):
+                if sort == 'strategy':
+                    su = u.get('strategy', '') or '—'
+                    if su != last_strat:
+                        text += f"\n📂 <b>{self._esc(su)}</b>\n"
+                        last_strat = su
                 if u['kind'] == 'cluster':
                     text += self._fmt_cluster_unit(u, i)
                 else:
@@ -560,7 +612,11 @@ class TelegramBot:
             {'text': dot('roi') + '📈 ROI', 'callback_data': f"pos:0:roi:{sm}"},
             {'text': dot('recent') + '🕒 Recent', 'callback_data': f"pos:0:recent:{sm}"},
         ]
-        return text, {'inline_keyboard': [nav, sort_row]}
+        strat_row = [
+            {'text': dot('strategy') + '🗂 By strategy',
+             'callback_data': f"pos:0:strategy:{sm}"},
+        ]
+        return text, {'inline_keyboard': [nav, sort_row, strat_row]}
 
     def send_positions(self, page: int = 0, sort: str = 'recent',
                        with_summary: bool = False, edit_message_id: int = None):
@@ -664,6 +720,37 @@ class TelegramBot:
             log.debug(f"Telegram sendDocument failed: {e}")
             return False
 
+    _CSV_COLUMNS = [
+        'ts', 'action', 'city', 'bucket', 'market', 'strategy', 'signal',
+        'entry_price', 'exit_price', 'shares', 'cost_usd', 'edge', 'grade',
+        'status', 'exit_reason', 'settle_source', 'pnl', 'roi_pct',
+        'minutes_to_close', 'balance_after',
+    ]
+
+    def _csv_path(self) -> str:
+        base = self._trade_log_path()
+        if base.endswith('.jsonl'):
+            return base[:-6] + '.csv'
+        return base + '.csv'
+
+    def _write_trades_csv(self, recs: List[dict]) -> Optional[str]:
+        """Flatten the trade-log records into a tidy CSV for download."""
+        if not recs:
+            return None
+        path = self._csv_path()
+        try:
+            os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+            with open(path, 'w', newline='') as f:
+                w = csv.DictWriter(f, fieldnames=self._CSV_COLUMNS,
+                                   extrasaction='ignore')
+                w.writeheader()
+                for r in recs:
+                    w.writerow({k: r.get(k, '') for k in self._CSV_COLUMNS})
+            return path
+        except Exception as e:
+            log.debug(f"csv write failed: {e}")
+            return None
+
     def send_analysis(self):
         """/analysis — full strategy performance breakdown + a downloadable log
         of every BUY / SELL / SETTLE / REDEEM / exit.
@@ -730,15 +817,286 @@ class TelegramBot:
 
         self.send(text)
 
-        # Attach the full machine-readable log as a downloadable document.
+        # Attach a tidy CSV (buys/sells/exits/profits) as the downloadable; fall
+        # back to the raw JSONL if the CSV can't be written.
         if recs:
-            self._send_document(
-                self._trade_log_path(),
-                caption=(f"📎 Full trade log — {len(recs)} records "
-                         f"(BUY/SELL/SETTLE/REDEEM/exits)"),
-            )
+            csv_path = self._write_trades_csv(recs)
+            if csv_path:
+                self._send_document(
+                    csv_path,
+                    caption=(f"📎 Trades CSV — {len(recs)} rows "
+                             f"(buys / sells / exits / profits)"),
+                )
+            else:
+                self._send_document(
+                    self._trade_log_path(),
+                    caption=(f"📎 Full trade log — {len(recs)} records "
+                             f"(BUY/SELL/SETTLE/REDEEM/exits)"),
+                )
         else:
             self.send("ℹ️ No trade-log records yet — the log is empty.")
+
+    # ==============================================================
+    # MANUAL CLOSE (/close) — list open positions with a Sell button
+    # ==============================================================
+
+    def send_close_menu(self, edit_message_id: int = None):
+        """List open positions, each with a Sell button that closes it at the
+        current price (manual exit)."""
+        if not self.pm:
+            self.send("⚠️ Position manager not wired.")
+            return
+        open_pos = self.pm.get_open_positions()
+        if not open_pos:
+            text = "✅ No open positions to close."
+            kb = {'inline_keyboard': []}
+        else:
+            text = ("🧮 <b>Manual close</b> — tap a Sell button to close that "
+                    "position at its current price:\n\n")
+            rows = []
+            for i, p in enumerate(open_pos[:30], start=1):
+                pe = '🟢' if p.unrealized_pnl >= 0 else '🔴'
+                name = self._esc(p.bucket_label or p.market_title)
+                text += (
+                    f"{i}. {pe} <b>{self._esc(p.city)}</b> {name} · "
+                    f"{self._esc(p.strategy)}\n"
+                    f"   ${p.entry_price:.3f}→${p.current_price:.3f} | "
+                    f"{p.shares:.0f}sh | ${p.unrealized_pnl:+.2f} "
+                    f"({p.roi_pct:+.0f}%)\n"
+                )
+                rows.append([{
+                    'text': f"🔴 Sell #{i} · {p.city} ${p.unrealized_pnl:+.2f}",
+                    'callback_data': f"close:{p.id}",
+                }])
+            kb = {'inline_keyboard': rows}
+        if edit_message_id is not None:
+            self._edit(edit_message_id, text, kb)
+        else:
+            self.send(text, reply_markup=kb)
+
+    def _do_manual_close(self, pos_id: str, callback_id: str, message_id):
+        """Sell ONE open position at its current price via the PositionManager."""
+        pos = (next((p for p in self.pm.positions if p.id == pos_id), None)
+               if self.pm else None)
+        if not pos or pos.status != 'open':
+            self._answer_callback(callback_id, 'Not open')
+            self.send("⚠️ That position is no longer open.")
+            return
+        try:
+            px = pos.current_price or pos.entry_price
+            self.pm._close_position(pos, px, 'manual')
+            try:
+                self.pm._save_state()
+            except Exception:
+                pass
+            self._answer_callback(callback_id, 'Sold')
+            self.send(
+                f"🔴 <b>SOLD (manual)</b> — {self._esc(pos.strategy)}\n"
+                f"📍 {self._esc(pos.city)} | "
+                f"{self._esc(pos.bucket_label or pos.market_title)}\n"
+                f"💵 entry ${pos.entry_price:.4f} → exit ${px:.4f} | "
+                f"{pos.shares:.0f}sh\n"
+                f"📊 PnL ${pos.pnl:+.2f} ({pos.roi_pct:+.0f}%)"
+            )
+            self.send_close_menu(edit_message_id=message_id)
+        except Exception as e:
+            log.debug(f"manual close failed: {e}")
+            self._answer_callback(callback_id, 'Failed')
+            self.send("⚠️ Manual close failed — see logs.")
+
+    # ==============================================================
+    # /done — Closed history + Open positions
+    # ==============================================================
+
+    _DONE_PAGE = 8
+
+    def send_done_menu(self, edit_message_id: int = None):
+        kb = {'inline_keyboard': [[
+            {'text': '📕 Closed', 'callback_data': 'done:closed:0'},
+            {'text': '📗 Open', 'callback_data': 'done:open:0'},
+        ]]}
+        text = (
+            "🗂 <b>Positions</b>\n"
+            "📕 <b>Closed</b> — all exits / loss / settle / redeem (history)\n"
+            "📗 <b>Open</b> — current positions (🟢 profit / 🔴 losing)"
+        )
+        if edit_message_id is not None:
+            self._edit(edit_message_id, text, kb)
+        else:
+            self.send(text, reply_markup=kb)
+
+    @staticmethod
+    def _close_label(p) -> str:
+        """Human-readable description of HOW a closed position ended."""
+        st = getattr(p, 'status', '')
+        reason = getattr(p, 'exit_reason', '') or ''
+        if st == 'redeemed':
+            return '💰 redeemed'
+        if st == 'won':
+            return '✅ won (settled)'
+        if st == 'lost':
+            return '❌ lost (settled)'
+        return {
+            'take_profit': '🎯 take-profit',
+            'stop_loss': '🛑 stop-loss',
+            'trailing_stop': '📉 trailing-stop',
+            'flip_timeout': '⏲️ flip book/cut',
+            'thesis_invalidated': '🚫 thesis-exit',
+            'manual': '🔴 manual sell',
+        }.get(reason, '🔴 sold')
+
+    def _done_closed_view(self, page: int = 0):
+        """Build (text, keyboard) for a page of CLOSED positions — when bought,
+        when/how closed, and the per-symbol profit/loss."""
+        closed = ([p for p in self.pm.positions if p.status != 'open']
+                  if self.pm else [])
+        closed.sort(key=lambda p: getattr(p, 'exit_time', None) or p.entry_time,
+                    reverse=True)
+        total = len(closed)
+        pages = max(1, (total + self._DONE_PAGE - 1) // self._DONE_PAGE)
+        page = max(0, min(page, pages - 1))
+        chunk = closed[page * self._DONE_PAGE:(page + 1) * self._DONE_PAGE]
+
+        wins = sum(1 for p in closed if self.pm._closed_outcome(p) == 'win')
+        losses = sum(1 for p in closed if self.pm._closed_outcome(p) == 'loss')
+        realized = sum((p.pnl or 0.0) for p in closed)
+        text = (f"📕 <b>Closed positions</b> ({total}) — "
+                f"{wins}W/{losses}L | realized ${realized:+.2f}\n\n")
+        if not chunk:
+            text += "No closed positions yet.\n"
+        for p in chunk:
+            val = p.pnl or 0.0
+            pe = '✅' if val > 0 else ('❌' if val < 0 else '➖')
+            bought = p.entry_time.strftime('%m-%d %H:%M') if p.entry_time else '?'
+            closed_at = (p.exit_time.strftime('%m-%d %H:%M')
+                         if getattr(p, 'exit_time', None) else '?')
+            exit_px = p.exit_price if p.exit_price is not None else p.current_price
+            name = self._esc(p.bucket_label or p.market_title)
+            text += (
+                f"{pe} <b>{self._esc(p.city)}</b> {name} · {self._esc(p.strategy)}\n"
+                f"   {self._close_label(p)} | ${val:+.2f} ({p.roi_pct:+.0f}%)\n"
+                f"   bought {bought} @ ${p.entry_price:.3f} → "
+                f"closed {closed_at} @ ${exit_px:.3f} | {p.shares:.0f}sh\n"
+            )
+        nav = []
+        if page > 0:
+            nav.append({'text': '⬅️ Prev',
+                        'callback_data': f"done:closed:{page-1}"})
+        nav.append({'text': f"{page+1}/{pages}", 'callback_data': 'noop'})
+        if page < pages - 1:
+            nav.append({'text': 'Next ➡️',
+                        'callback_data': f"done:closed:{page+1}"})
+        rows = [nav, [{'text': '📗 Open positions',
+                       'callback_data': 'done:open:0'}]]
+        return text, {'inline_keyboard': rows}
+
+    # ==============================================================
+    # /aisummary — captured runtime warnings/errors
+    # ==============================================================
+
+    def send_ai_summary(self):
+        """Dump recent WARNING+ runtime log lines captured since startup so you
+        can copy them to share. Healthy = nothing captured."""
+        lines = list(self._error_log)
+        if not lines:
+            self.send("✅ <b>AI summary</b> — no warnings or errors captured "
+                      "since startup. Bot looks healthy. 🟢")
+            return
+        errs = sum(1 for l in lines if ' ERROR' in l or ' CRITICAL' in l)
+        warns = sum(1 for l in lines if ' WARNING' in l)
+        tail = lines[-40:]
+        head = (f"🩺 <b>AI summary — runtime issues</b>\n"
+                f"Captured {errs} error(s), {warns} warning(s); showing last "
+                f"{len(tail)}.\n{'-'*28}\n")
+        body = "\n".join(self._esc(l) for l in tail)
+        msg = head + f"<code>{body}</code>"
+        while len(msg) > 3900 and len(tail) > 5:
+            tail = tail[len(tail) // 2:]
+            body = "\n".join(self._esc(l) for l in tail)
+            msg = head + f"<code>{body}</code>"
+        self.send(msg)
+
+    # ==============================================================
+    # /mlanalysis — ML (or heuristic) report on all trades
+    # ==============================================================
+
+    def send_ml_analysis(self):
+        """A report of how trading is going, what's failing, what's observed and
+        what to improve. Uses the ML engine for the narrative when it's enabled
+        (ML_API_KEY set); otherwise falls back to a heuristic summary."""
+        if not self.pm:
+            self.send("⚠️ ML analysis unavailable — position manager not wired.")
+            return
+        stats = self.pm.get_stats()
+        by_strat = self.pm.get_per_strategy_stats()
+        by_city = (self.pm.get_per_city_stats()
+                   if hasattr(self.pm, 'get_per_city_stats') else {})
+        ranked = sorted(by_strat.items(), key=lambda kv: kv[1]['pnl'],
+                        reverse=True)
+        winners = [(k, v) for k, v in ranked if v['pnl'] > 0]
+        losers = [(k, v) for k, v in ranked if v['pnl'] < 0]
+
+        text = (f"🧠 <b>ML Analysis</b> — {stats['mode']}\n"
+                f"WR {stats['win_rate']:.0f}% "
+                f"({stats['wins']}W/{stats['losses']}L) | "
+                f"PnL ${stats['total_pnl']:+.2f} | "
+                f"Trades {stats['total_trades']}\n{'-'*28}\n")
+        narrative = self._ml_narrative(stats, by_strat, by_city)
+        if narrative:
+            text += narrative + f"\n{'-'*28}\n"
+        text += "<b>What's working</b>\n"
+        if winners:
+            for k, v in winners[:4]:
+                c = v['wins'] + v['losses']
+                wr = (v['wins'] / c * 100) if c else 0
+                text += f"  🟢 {self._esc(k)}: ${v['pnl']:+.2f} ({wr:.0f}% WR)\n"
+        else:
+            text += "  (no net-positive strategy yet)\n"
+        text += "<b>What's failing</b>\n"
+        if losers:
+            for k, v in losers[:4]:
+                c = v['wins'] + v['losses']
+                wr = (v['wins'] / c * 100) if c else 0
+                text += f"  🔴 {self._esc(k)}: ${v['pnl']:+.2f} ({wr:.0f}% WR)\n"
+        else:
+            text += "  (no net-losing strategy)\n"
+        tips = self._ml_heuristic_tips(stats, ranked)
+        if tips:
+            text += "<b>Suggested improvements</b>\n"
+            for t in tips:
+                text += f"  • {self._esc(t)}\n"
+        self.send(text)
+
+    def _ml_narrative(self, stats, by_strat, by_city) -> str:
+        """Ask the ML engine for a short narrative if it's wired + enabled."""
+        ml = getattr(self, 'ml', None)
+        if not ml or not getattr(ml, 'enabled', False):
+            return ("<i>ML narrative inactive — set ML_API_KEY to let the model "
+                    "write the report. Heuristic analysis below.</i>")
+        try:
+            if hasattr(ml, 'write_trade_report'):
+                return self._esc(ml.write_trade_report(stats, by_strat, by_city))
+        except Exception as e:
+            log.debug(f"ml narrative failed: {e}")
+        return ""
+
+    @staticmethod
+    def _ml_heuristic_tips(stats, ranked) -> List[str]:
+        tips = []
+        closed = stats['wins'] + stats['losses']
+        if closed < 20:
+            tips.append("Sample still small (<20 closed) — let it run to judge "
+                        "edge.")
+        if stats['win_rate'] < 50 and closed >= 10:
+            tips.append("Win-rate <50% — tighten entry gates on the losing "
+                        "strategies.")
+        worst = ranked[-1] if ranked else None
+        if worst and worst[1]['pnl'] < 0:
+            tips.append(f"Consider disabling or tuning '{worst[0]}' — biggest "
+                        f"PnL drag.")
+        if not tips:
+            tips.append("No red flags from the heuristic pass.")
+        return tips
 
     # ==============================================================
     # COMMAND HANDLER (polls for incoming commands)
@@ -953,6 +1311,28 @@ class TelegramBot:
                                 edit_message_id=message_id)
             return
 
+        # Manual close: "close:<position_id>"
+        if data.startswith('close:'):
+            self._do_manual_close(data.split(':', 1)[1], callback_id, message_id)
+            return
+
+        # /done sub-views: "done:closed:<page>" | "done:open:<page>"
+        if data.startswith('done:'):
+            try:
+                _, which, pg_s = data.split(':')
+                pg = int(pg_s)
+            except (ValueError, IndexError):
+                self._answer_callback(callback_id)
+                return
+            self._answer_callback(callback_id)
+            if which == 'closed':
+                d_text, d_kb = self._done_closed_view(pg)
+                self._edit(message_id, d_text, d_kb)
+            else:
+                self.send_positions(page=pg, sort='pnl', with_summary=True,
+                                    edit_message_id=message_id)
+            return
+
         # Settings tab switch: "st:<group_id>"
         if data.startswith('st:'):
             group = data.split(':', 1)[1]
@@ -1161,6 +1541,14 @@ class TelegramBot:
             self.send_markets_summary()
         elif cmd == '/analysis' or cmd == '/analyze' or cmd == '/report':
             self.send_analysis()
+        elif cmd in ('/close', '/sell'):
+            self.send_close_menu()
+        elif cmd in ('/done', '/history'):
+            self.send_done_menu()
+        elif cmd in ('/aisummary', '/errors', '/ai'):
+            self.send_ai_summary()
+        elif cmd in ('/mlanalysis', '/ml', '/mlreport'):
+            self.send_ml_analysis()
         elif cmd == '/redeem':
             if self.pm:
                 count = self.pm.redeem_all_winning()
@@ -1183,7 +1571,11 @@ class TelegramBot:
                 "/pnl — total profit/loss\n"
                 "/positions — open positions (10/page; sort by PnL/Losses/ROI/Recent)\n"
                 "/markets — active weather markets\n"
-                "/analysis — per-strategy performance + downloadable trade log\n"
+                "/analysis — per-strategy performance + downloadable CSV\n"
+                "/close — manually sell an open position (tap Sell)\n"
+                "/done — closed history + open positions (🟢/🔴)\n"
+                "/aisummary — recent runtime warnings/errors to share\n"
+                "/mlanalysis — ML report: how it's going, what's failing\n"
                 "/redeem — redeem winning positions\n"
                 "/help — this message"
             )
