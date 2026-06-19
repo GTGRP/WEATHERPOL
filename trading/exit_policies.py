@@ -85,18 +85,22 @@ def _ml_says_book(pos) -> bool:
 
 
 def check_flip_exits(pm):
-    """Profit-only laddered exit for quick_flip positions.
+    """Quick-flip exit: book at >= target ROI (+10%), cut at <= stop ROI (-5%).
 
-    Books small/mid profits (ML-gated), ALWAYS books big runners, and NEVER cuts
-    a flip at a loss/breakeven on the timer -- a flip that isn't profitable by
-    its hold cap converts to hold-to-resolution instead.
+    Per the user's Req-29 instruction a flip is a quick +10% / -5% trade. The ML
+    gates whether to BOOK NOW or let a winner RUN toward a higher rung; big
+    runners (>= force-book) are always booked; if neither target nor stop is hit
+    by the hold window it books at market. This REPLACES the earlier
+    profit-only-hold behaviour (flips no longer convert to hold-to-resolution).
     """
     if not _cfg('QUICK_FLIP_TIME_EXIT', True):
         return []
     default_max = float(_cfg('QUICK_FLIP_MAX_HOLD_MIN', 120))
     profit_only = bool(_cfg('QUICK_FLIP_PROFIT_ONLY_EXIT', True))
     use_ml = bool(_cfg('QUICK_FLIP_USE_ML_EXIT', True))
-    min_book = float(_cfg('QUICK_FLIP_MIN_BOOK_ROI_PCT', 10.0))
+    target = float(_cfg('QUICK_FLIP_TARGET_ROI', 10.0))   # book at >= +10%
+    min_book = target
+    stop = float(_cfg('QUICK_FLIP_STOP_LOSS_PCT', -5.0))   # cut at <= -5%
     mid_book = float(_cfg('QUICK_FLIP_LADDER_MID_ROI_PCT', 20.0))
     force_book = float(_cfg('QUICK_FLIP_FORCE_BOOK_ROI_PCT', 30.0))
     triggered = []
@@ -116,6 +120,15 @@ def check_flip_exits(pm):
         max_hold = float(getattr(pos, 'flip_max_hold_minutes', 0) or default_max)
         held_min = pos.hold_hours * 60.0
         window_over = held_min >= max_hold
+
+        # 0) STOP-LOSS: cut a flip that has dropped to the stop (-5%). A flip is
+        # a quick +10% / -5% trade, so we no longer convert losers to hold.
+        if roi <= stop:
+            pm._close_position(pos, price, 'flip_stop')
+            triggered.append(pos)
+            log.info(f"🛑 FLIP STOP: {pos.city} {pos.bucket_label[:28]} "
+                     f"ROI={roi:+.1f}% @ ${price:.4f} PnL=${pos.pnl:+.2f}")
+            continue
 
         # 1) Always book a big runner (don't round-trip a winner).
         if roi >= force_book:
@@ -140,25 +153,16 @@ def check_flip_exits(pm):
                          f"PnL=${pos.pnl:+.2f}")
             continue
 
-        # 3) Not in profit yet.
+        # 3) Between stop and target: keep waiting until the hold window expires,
+        # then book at market (a small profit <+10%, or a small loss still above
+        # the -5% stop). Flips no longer convert to hold-to-resolution.
         if not window_over:
-            continue  # still inside the window -- keep waiting for profit
-        if profit_only:
-            # NEVER book at a loss/breakeven on the timer. Convert to
-            # hold-to-resolution so the flip rides to settlement instead.
-            pos.hold_to_resolution = True
-            pos.take_profit_price = 0.99
-            pos.exit_reason = 'flip_to_hold'
-            converted = True
-            log.info(f"⏳ FLIP→HOLD: {pos.city} {pos.bucket_label[:28]} "
-                     f"ROI={roi:+.0f}% not profitable by {held_min:.0f}m — "
-                     f"holding to resolution (profit-only exit)")
-        else:
-            # Legacy book-or-cut at market.
-            pm._close_position(pos, price, 'flip_timeout')
-            triggered.append(pos)
-            log.info(f"⏲️  FLIP CUT: {pos.city} {pos.bucket_label[:28]} "
-                     f"held {held_min:.0f}m @ ${price:.4f} PnL=${pos.pnl:+.2f}")
+            continue
+        pm._close_position(pos, price, 'flip_timeout')
+        triggered.append(pos)
+        log.info(f"⏲️  FLIP TIMEOUT: {pos.city} {pos.bucket_label[:28]} "
+                 f"held {held_min:.0f}m ROI={roi:+.1f}% @ ${price:.4f} "
+                 f"PnL=${pos.pnl:+.2f}")
     if triggered:
         pm._save_state()
         pm._assert_ledger()
