@@ -375,6 +375,7 @@ class Config:
     QUICK_FLIP_LADDER_MID_ROI_PCT = float(os.getenv('QUICK_FLIP_LADDER_MID_ROI_PCT', '20.0'))  # mid profit rung (flip_book_mid)
     QUICK_FLIP_LADDER_RUN_ROI_PCT = float(os.getenv('QUICK_FLIP_LADDER_RUN_ROI_PCT', '30.0'))  # let strong flips run toward this
     QUICK_FLIP_FORCE_BOOK_ROI_PCT = float(os.getenv('QUICK_FLIP_FORCE_BOOK_ROI_PCT', '30.0'))  # always book at/above this (don't round-trip a winner)
+    QUICK_FLIP_STOP_LOSS_PCT = float(os.getenv('QUICK_FLIP_STOP_LOSS_PCT', '-5.0'))      # Req-29: book a quick-flip LOSS at this ROI% (quick +10% up / -5% down)
 
     # ===================================================================
     # PEAK_CLUSTER - parallel any-one-wins basket. Estimate the peak bucket
