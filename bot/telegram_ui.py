@@ -48,6 +48,10 @@ class TelegramBot:
         # the dashboard; the inline Restart button / /restart invoke it.
         self._on_restart = None
         self._restart_pending = False
+        # Req-29 settings UX: capture typed input (e.g. a new starting balance),
+        # and log human-readable changes so the OK button can summarise them.
+        self._awaiting = None          # None | 'balance'
+        self._session_changes = []     # ["STARTING_BALANCE = 300", ...]
         # Seed with already-redeemed ids so a restart doesn't re-announce the
         # whole backlog — only NEW redemptions after startup are sent.
         self._announced_redeemed = set(
@@ -910,6 +914,16 @@ class TelegramBot:
                 {'text': f"{k} = {self._fmt_num(v)}", 'callback_data': 'noop'},
                 {'text': f"➕{self._fmt_num(step)}", 'callback_data': f"up:{k}:{gid}"},
             ])
+        # Req-29: type-to-change starting balance + an OK/Apply button that
+        # summarises changes and offers Start. Shown on every tab.
+        bal_now = self.pm.get_balance() if self.pm else 0.0
+        rows.append([
+            {'text': f"💰 Set Starting Balance (now ${self._fmt_num(bal_now)})",
+             'callback_data': 'act:setbal'},
+        ])
+        rows.append([
+            {'text': '✅ OK / Apply changes', 'callback_data': 'act:settings_ok'},
+        ])
         return text, {'inline_keyboard': rows}
 
     def send_settings(self, group: str = None, edit_message_id: int = None):
@@ -954,11 +968,23 @@ class TelegramBot:
                 settings_store.set_value('TRADING_ENABLED', True)
                 self._restart_pending = False
                 self._answer_callback(callback_id, 'Trading enabled')
-                self.send("🟢 <b>Trading ENABLED</b> — the bot will place new trades.")
+                self.send(self._start_message())
             elif action == 'settings':
                 self._restart_pending = False
                 self._answer_callback(callback_id)
                 self.send_settings(edit_message_id=message_id)
+            elif action == 'setbal':
+                self._awaiting = 'balance'
+                self._answer_callback(callback_id, 'Type the new balance')
+                bal_now = self.pm.get_balance() if self.pm else 0.0
+                self.send(
+                    f"💰 <b>Set starting balance</b>\n"
+                    f"Current: <b>${bal_now:.2f}</b>\n\n"
+                    f"Type the new amount as a number (e.g. <code>500</code>)."
+                )
+            elif action == 'settings_ok':
+                self._answer_callback(callback_id, 'Applying')
+                self._finish_settings()
             elif action == 'restart':
                 self._answer_callback(callback_id)
                 self._prompt_restart()
@@ -988,19 +1014,114 @@ class TelegramBot:
             ok, msg = settings_store.bump(key, +1)
         elif action == 'dn':
             ok, msg = settings_store.bump(key, -1)
+        if ok:
+            self._note_change(msg or key)
         self._answer_callback(callback_id, msg)
         if ok and message_id is not None:
             self.send_settings(group=group, edit_message_id=message_id)
 
+    # ----- Req-29 settings / balance UX helpers -----------------------------
+    def _note_change(self, msg: str):
+        """Record a human-readable settings change for the OK summary."""
+        try:
+            if msg and msg not in self._session_changes:
+                self._session_changes.append(msg)
+                self._session_changes = self._session_changes[-40:]
+        except Exception:
+            pass
+
+    def _consume_awaited_input(self, text: str):
+        """Handle a typed value we were waiting for (currently: balance)."""
+        from bot import settings_store
+        what = self._awaiting
+        self._awaiting = None
+        if what == 'balance':
+            raw = text.strip().lstrip('$').replace(',', '')
+            try:
+                val = float(raw)
+            except ValueError:
+                self._awaiting = 'balance'
+                self.send("⚠️ That doesn't look like a number. Type e.g. <code>500</code>.")
+                return
+            ok, msg = settings_store.set_value('STARTING_BALANCE', val)
+            if ok:
+                self._note_change(msg or f"STARTING_BALANCE = {val:g}")
+            self.send(
+                ("✅ " if ok else "⚠️ ") + msg + "\n\n"
+                "Tap <b>OK / Apply changes</b> when you're done, or change more first.",
+                reply_markup={'inline_keyboard': [[
+                    {'text': '✅ OK / Apply changes', 'callback_data': 'act:settings_ok'},
+                    {'text': '⚙️ Settings', 'callback_data': 'act:settings'},
+                ]]},
+            )
+
+    def _start_message(self) -> str:
+        """Enable-trading confirmation. Applies the configured starting balance
+        to the live paper ledger when the book is empty (fixes 'set 300 -> only
+        traded 100')."""
+        note = ""
+        if self.pm is not None:
+            try:
+                res = self.pm.apply_starting_balance()
+                if res.get('applied'):
+                    note = f"\nStarting balance: <b>${res['balance']:.2f}</b>"
+                elif res.get('reason') == 'positions_open':
+                    note = (f"\n⚠️ Balance NOT changed — {res.get('open', 0)} position(s) "
+                            f"still open. Tap ♻️ Restart to apply ${res['target']:.2f}.")
+                elif res.get('reason') == 'has_history':
+                    note = (f"\n⚠️ Balance kept at ${res['balance']:.2f} (closed-trade "
+                            f"history present). Tap ♻️ Restart to start fresh at "
+                            f"${res['target']:.2f}.")
+            except Exception:
+                pass
+        return "🟢 <b>Trading ENABLED</b> — the bot will place new trades." + note
+
+    def _finish_settings(self):
+        """OK button: summarise changes, apply the balance if flat, offer Start."""
+        changes = list(self._session_changes)
+        self._session_changes = []
+        if changes:
+            body = "\n".join(f"  • {self._esc(c)}" for c in changes)
+            summary = f"✅ <b>Settings changed</b>\n{body}"
+        else:
+            summary = "✅ <b>Settings saved</b> — no changes this session."
+        bal_note = ""
+        if self.pm is not None:
+            try:
+                res = self.pm.apply_starting_balance()
+                if res.get('applied'):
+                    bal_note = f"\n💰 Starting balance is now <b>${res['balance']:.2f}</b>."
+                elif res.get('reason') == 'positions_open':
+                    bal_note = (f"\n⚠️ {res.get('open', 0)} position(s) open — new balance "
+                                f"(${res['target']:.2f}) applies after ♻️ Restart.")
+                elif res.get('reason') == 'has_history':
+                    bal_note = (f"\n💰 Balance ${res['balance']:.2f}. Tap ♻️ Restart to "
+                                f"start fresh at ${res['target']:.2f}.")
+            except Exception:
+                pass
+        kb = {'inline_keyboard': [[
+            {'text': '▶️ Start bot now', 'callback_data': 'act:start'},
+            {'text': '♻️ Restart fresh', 'callback_data': 'act:restart'},
+        ]]}
+        self.send(summary + bal_note + "\n\nReady — <b>settings changed, start bot now.</b>",
+                  reply_markup=kb)
+
     def _handle_command(self, text: str):
         """Handle incoming bot commands."""
+        # Req-29: capture a typed value when we're awaiting one (e.g. a new
+        # starting balance). A slash-command cancels the awaiting state.
+        if self._awaiting and text and not text.startswith('/'):
+            self._consume_awaited_input(text)
+            return
+        if self._awaiting and text.startswith('/'):
+            self._awaiting = None
         cmd = text.lower().split()[0] if text else ''
         parts = text.split()
 
         if cmd in ('/start', '/resume', 'start'):
             from bot import settings_store
             settings_store.set_value('TRADING_ENABLED', True)
-            self.send("🟢 <b>Trading ENABLED</b> — the bot will place new trades.")
+            self.send(self._start_message())
         elif cmd in ('/restart', 'restart'):
             self._prompt_restart()
         elif cmd == '/stop' or cmd == '/pause':
@@ -1014,6 +1135,8 @@ class TelegramBot:
             from bot import settings_store
             if len(parts) >= 3:
                 ok, msg = settings_store.set_value(parts[1], parts[2])
+                if ok:
+                    self._note_change(msg or f"{parts[1]} = {parts[2]}")
                 self.send(("✅ " if ok else "⚠️ ") + msg)
             else:
                 self.send("Usage: <code>/set KEY VALUE</code>  e.g. <code>/set BASKET_MAX_COST 0.80</code>")
