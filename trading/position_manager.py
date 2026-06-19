@@ -217,7 +217,7 @@ class PositionManager:
 
     # ════════════════════════
     # BALANCE
-    # ════════════════════════
+    # ═════════════════════════
 
     def get_balance(self) -> float:
         if Config.is_paper():
@@ -248,9 +248,9 @@ class PositionManager:
             return None
 
 
-    # ════════════════════════
+    # ═════════════════════════
     # POSITION LIFECYCLE
-    # ═══════════════════════
+    # ═════════════════════════
 
     def add_position(self, token_id: str, condition_id: str, entry_price: float,
                      shares: float, cost_usd: float, market_title: str,
@@ -695,9 +695,9 @@ class PositionManager:
         return bal
 
 
-    # ════════════════════════
+    # ═════════════════════════
     # STOP-LOSS & TAKE-PROFIT
-    # ════════════════════════
+    # ═════════════════════════
 
     def check_risk_triggers(self) -> List[TrackedPosition]:
         """Check all open positions for stop-loss / take-profit triggers."""
@@ -716,6 +716,16 @@ class PositionManager:
             # STRICT thesis-exit, which itself exempts baskets.) This fixes the bug
             # where the stop-loss kept closing peak-cluster legs on a dip.
             if getattr(pos, 'hold_to_resolution', False):
+                continue
+
+            # QUICK-FLIP EXEMPTION: flips have their OWN +10% book / -5% stop
+            # policy in exit_policies.check_flip_exits. The generic take-profit
+            # ladder below was mislabeling flip LOSSES as 'take_profit' — it fires
+            # on current_price >= take_profit_price, which for NO-side / higher
+            # entries can sit BELOW entry, so a green "TAKE PROFIT" got booked at a
+            # negative PnL (the -27% bug). Skip flips here; only their dedicated
+            # policy closes them.
+            if pos.strategy == 'quick_flip':
                 continue
 
             # TAKE-PROFIT: price rose above target
@@ -823,9 +833,9 @@ class PositionManager:
                     log.debug(f"close notify failed: {e}")
 
 
-    # ════════════════════════
+    # ═════════════════════════
     # RESOLUTION & REDEMPTION
-    # ════════════════════════
+    # ═════════════════════════
 
     def _maybe_notify_cluster_close(self, box: str):
         """Once ALL legs of a basket ("Box N") have resolved, emit ONE grouped
@@ -1029,9 +1039,9 @@ class PositionManager:
                 count += 1
         return count
 
-    # ════════════════════════
+    # ═════════════════════════
     # PRICE UPDATES
-    # ════════════════════════
+    # ═════════════════════════
 
     def update_prices(self):
         """Batch update prices for open positions.
@@ -1076,9 +1086,9 @@ class PositionManager:
         self._save_state()
 
 
-    # ════════════════════════
+    # ═════════════════════════
     # CONTEXT MANAGEMENT (free memory for closed markets)
-    # ════════════════════════
+    # ═════════════════════════
 
     def _maybe_free_context(self, slug: str):
         """Free market context if no open positions remain for it."""
@@ -1102,9 +1112,9 @@ class PositionManager:
         """How many active market contexts we're tracking."""
         return sum(1 for v in self.market_contexts.values() if v.active)
 
-    # ════════════════════════
+    # ═════════════════════════
     # PAPER TRADE LOG + LEDGER INVARIANT
-    # ════════════════════════
+    # ═════════════════════════
 
     def _log_paper_trade(self, action: str, pos: TrackedPosition, extra: Optional[Dict] = None):
         """Append one structured record per BUY / SELL / SETTLE / REDEEM /
@@ -1174,9 +1184,9 @@ class PositionManager:
                         f"deposited=${self.total_deposited:.2f}")
         return ok
 
-    # ════════════════════════
+    # ═════════════════════════
     # WEEKLY MEMORY
-    # ════════════════════════
+    # ═════════════════════════
 
     def record_weekly_stats(self):
         """Snapshot current week's performance for ML memory."""
@@ -1236,9 +1246,9 @@ class PositionManager:
         return " | ".join(lines)
 
 
-    # ════════════════════════
+    # ═════════════════════════
     # STATISTICS (per-position + aggregate)
-    # ════════════════════════
+    # ═════════════════════════
 
     @staticmethod
     def _closed_outcome(p) -> Optional[str]:
@@ -1395,9 +1405,9 @@ class PositionManager:
         return summary
 
 
-    # ════════════════════════
+    # ═════════════════════════
     # PERSISTENCE
-    # ════════════════════════
+    # ═════════════════════════
 
     def _save_state(self):
         """Save positions to disk."""
