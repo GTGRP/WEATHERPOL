@@ -5,7 +5,7 @@ Flow:
 1. Scan Polymarket for active weather markets (slug-based, confirmed pattern)
 2. For each market: fetch multi-source forecasts
 3. Run probability engine → find mispriced buckets
-4. Run strategies (LateObserved primary + QuickFlip + optional Peaker/Confident) → signals
+4. Run strategies (LateObserved primary + QuickFlip + optional PeakBasket/Confident) → signals
 5. Execute trades (paper or live)
 6. Monitor positions, check resolutions, redeem winners
 7. Send Telegram notifications
@@ -57,6 +57,11 @@ class WeatherBot:
 
     def __init__(self):
         settings_store.load_into_config()   # apply persisted runtime overrides (Telegram /settings)
+        # Req-28: NEVER auto-trade on boot. A fresh Railway deploy (or any
+        # restart) must come up with trading OFF and wait for the user to press
+        # [Start Trading] / type 'start'. Force the master switch False here even
+        # if a previously-persisted runtime setting had it True.
+        Config.TRADING_ENABLED = False
         self.fetcher = WeatherFetcher()
         self.engine = ProbabilityEngine()
         self.scanner = MarketScanner()
@@ -96,6 +101,9 @@ class WeatherBot:
         # Peak-cluster baskets resolve as ONE grouped summary (winner + payout,
         # losing buckets + loss, net) instead of one won/lost alert per leg.
         self.pm._notify_cluster_close = self.telegram.notify_cluster_resolution
+        # Req-28: let the Telegram Restart button / 'restart' command drive a
+        # full fresh restart (clear ALL positions + reset balance, trading OFF).
+        self.telegram._on_restart = self.restart_fresh
         self.scan_count = 0
         self.signals_generated = 0
         self.trades_placed = 0
@@ -108,6 +116,27 @@ class WeatherBot:
         self._last_resolution_check = 0
         self._last_daily_summary = ''
         self._last_weekly_record = ''
+
+    def restart_fresh(self, starting_balance=None):
+        """Restart the bot like new: clear ALL positions and reset the ledger to
+        a fresh starting balance, trading left OFF (the user presses Start again
+        afterwards). Wired to the Telegram Restart button / 'restart' command.
+        """
+        bal = starting_balance if starting_balance is not None else Config.STARTING_BALANCE
+        try:
+            self.pm.reset_fresh(starting_balance=bal)
+        except Exception as e:
+            log.error(f"restart_fresh failed: {e}")
+            return False
+        Config.TRADING_ENABLED = False  # a fresh restart must not auto-resume trading
+        self.scan_count = 0
+        self.signals_generated = 0
+        self.trades_placed = 0
+        self._scan_buys = 0
+        self._scan_deployed_usd = 0.0
+        self._book_cache = {}
+        log.info(f"♻️  RESTART FRESH — positions cleared, balance reset to ${bal:.2f}, trading OFF")
+        return True
 
     def run_once(self):
         """Run a single scan cycle."""
@@ -366,7 +395,7 @@ class WeatherBot:
                early_exit_price=None, apply_grade_size=True,
                reason='', lock_confidence=0.0, signal='',
                our_prob=0.0, use_factor_kelly=False, use_ml=False,
-               cluster_box='', count_as_buy=True):
+               cluster_box='', count_as_buy=True, basket_leg=False):
         """Single placement path for ALL strategies.
 
         Applies the stability GRADE (gate + size multiplier), the best-Kelly
@@ -387,6 +416,13 @@ class WeatherBot:
 
         `cluster_box` tags a peak-cluster leg with its "Box N" group label so
         the UI can render the basket as one unit and exempt it from stops.
+
+        `basket_leg=True` marks one leg of an ATOMIC all-or-none basket
+        (peak_cluster / peaker cool|warm basket). The caller already ran the
+        portfolio guard ONCE on the whole basket, so a basket leg SKIPS the
+        per-leg portfolio guard, is NOT size-trimmed on a thin book, and is
+        bumped to the venue minimum instead of being dropped below it — so a
+        basket is never picked apart leg-by-leg to a single surviving leg.
 
         `reason` / `lock_confidence` / `signal` are observability metadata
         carried into the position so paper logs record WHY each buy fired.
@@ -461,26 +497,31 @@ class WeatherBot:
                 # MAKER entry: post at the bid (cheaper, 0% fee, earn the spread).
                 fill_price = book['best_bid']
                 if not chk.passed:
-                    if Config.LIQUIDITY_STRICT_BLOCK:
+                    if Config.LIQUIDITY_STRICT_BLOCK and not basket_leg:
                         self._funnel['liq_skip'] += 1
                         log.info(f"   ⏭️  LIQ SKIP {strategy}:{bucket_label[:18]} — {chk.reason}")
                         return None
-                    # Aware mode: trade smaller + hold to resolution (can't rely on an exit).
-                    size_usd *= Config.LIQUIDITY_THIN_SIZE_MULT
+                    # Aware mode: hold to resolution (can't rely on an exit). An
+                    # ATOMIC basket leg keeps FULL size (trimming cheap legs is
+                    # exactly what collapsed baskets to a single leg).
+                    if not basket_leg:
+                        size_usd *= Config.LIQUIDITY_THIN_SIZE_MULT
                     hold_hint = True
                     self._funnel['liq_thin'] += 1
                     log.info(f"   💧 LIQ THIN {strategy}:{bucket_label[:18]} — {chk.reason} "
-                             f"→ size x{Config.LIQUIDITY_THIN_SIZE_MULT} + hold, maker@{fill_price:.3f}")
+                             f"→ {'basket keep-size' if basket_leg else f'size x{Config.LIQUIDITY_THIN_SIZE_MULT}'} + hold, maker@{fill_price:.3f}")
             else:
-                # No book / no bid: stay at scan price, trim size, and hold.
-                if Config.LIQUIDITY_STRICT_BLOCK:
+                # No book / no bid: stay at scan price, hold. Basket legs keep
+                # full size (atomic all-or-none); solo legs trim.
+                if Config.LIQUIDITY_STRICT_BLOCK and not basket_leg:
                     self._funnel['liq_skip'] += 1
                     log.info(f"   ⏭️  LIQ SKIP {strategy}:{bucket_label[:18]} — no order book")
                     return None
-                size_usd *= Config.LIQUIDITY_THIN_SIZE_MULT
+                if not basket_leg:
+                    size_usd *= Config.LIQUIDITY_THIN_SIZE_MULT
                 hold_hint = True
                 self._funnel['liq_nobook'] += 1
-                log.info(f"   💧 LIQ NOBOOK {strategy}:{bucket_label[:18]} — no bid → size x{Config.LIQUIDITY_THIN_SIZE_MULT} + hold")
+                log.info(f"   💧 LIQ NOBOOK {strategy}:{bucket_label[:18]} — no bid → {'basket keep-size' if basket_leg else f'size x{Config.LIQUIDITY_THIN_SIZE_MULT}'} + hold")
 
         if fill_price <= 0:
             return None
@@ -509,15 +550,25 @@ class WeatherBot:
             log.debug(f"   🤖 {ml_reason} {strategy}:{bucket_label[:18]} → ${size_usd:.2f}")
 
         # -- PORTFOLIO GUARD (keep dry powder for later/better markets) --
-        ok, why = self._can_deploy(size_usd, count_as_buy=count_as_buy)
-        if not ok:
-            self._funnel['portfolio_guard'] += 1
-            log.info(f"   🏦 GUARD {strategy}:{bucket_label[:18]} — {why}")
-            return None
+        # Basket legs SKIP the per-leg guard: the caller already ran the guard
+        # ONCE on the whole basket cost (atomic all-or-none), so we never reject
+        # individual legs here and end up with a partial 1-leg basket.
+        if not basket_leg:
+            ok, why = self._can_deploy(size_usd, count_as_buy=count_as_buy)
+            if not ok:
+                self._funnel['portfolio_guard'] += 1
+                log.info(f"   🏦 GUARD {strategy}:{bucket_label[:18]} — {why}")
+                return None
 
         if size_usd < Config.MIN_ORDER_SIZE:
-            self._funnel['below_min'] += 1
-            return None
+            if basket_leg:
+                # Don't DROP a cheap basket leg — bump it to the venue minimum so
+                # the basket stays intact (dropping cheap legs one by one is what
+                # collapsed baskets to a single surviving leg).
+                size_usd = Config.MIN_ORDER_SIZE
+            else:
+                self._funnel['below_min'] += 1
+                return None
         shares = size_usd / fill_price
 
         pos = self.pm.add_position(
@@ -771,10 +822,14 @@ class WeatherBot:
                             )
 
         # ------------------------------------------------------
-        # QUICK FLIP — forecast-change arbitrage. When fresh model data shifts a
-        # bucket's probability, enter BEFORE the book adjusts and flip on the
-        # correction (or hold if the move is structural). High win-rate, fast
-        # exit. Also runs in the lock window (the forecast-change edge holds).
+        # QUICK FLIP (Req-28 v3) — HIGH-confidence mispricing flip with a 10%
+        # profit target and a PROFIT-ONLY exit (the timer NEVER books a flip at
+        # a loss/breakeven — see trading/exit_policies.check_flip_exits). Enters
+        # a mispriced bucket before the book corrects and books the first ~10%
+        # rung; also hunts mispriced NO tokens (QUICK_FLIP_NO_SIDE) for the same
+        # flip. Tighter defaults (higher confidence, smaller size, fewer per
+        # market) so it triggers less and stops eating capital. Runs in the lock
+        # window too (the forecast-change edge holds).
         # ------------------------------------------------------
         if getattr(Config, 'QUICK_FLIP_ENABLED', False) and (
             not in_lock_window or getattr(Config, 'QUICK_FLIP_TRADE_DECIDED', True)
@@ -784,6 +839,7 @@ class WeatherBot:
                 flip_signals = self.quick_flip.evaluate(
                     market.title, bucket_probs, market_prices, market_prices,
                     token_ids, balance, city=city, market_type=qf_mode,
+                    no_prices=no_prices, no_token_ids=no_token_ids,
                 )
             except Exception as e:
                 flip_signals = []
@@ -796,8 +852,11 @@ class WeatherBot:
                 flip_signals = []
             for fsig in flip_signals:
                 self.signals_generated += 1
+                qf_side = str(getattr(fsig, 'side', 'YES') or 'YES').upper()
+                side_tag = '' if qf_side == 'YES' else 'NO '
+                disp_label = f"{side_tag}{fsig.bucket_label}"
                 log.info(
-                    f"   ⚡ FLIP {city} | {fsig.bucket_label[:25]} @ ${fsig.entry_price:.3f} "
+                    f"   ⚡ FLIP {city} {qf_side} | {disp_label[:28]} @ ${fsig.entry_price:.3f} "
                     f"→ ${fsig.target_price:.3f} ({fsig.expected_roi_pct:.0f}% ROI, "
                     f"{fsig.expected_hold_minutes}m) | {fsig.entry_reason}"
                 )
@@ -809,14 +868,14 @@ class WeatherBot:
                     entry_price=fsig.entry_price,
                     base_size_usd=fsig.size_usd,
                     market_title=market.title,
-                    bucket_label=fsig.bucket_label,
+                    bucket_label=disp_label,
                     strategy='quick_flip',
                     city=city,
                     slug=market.slug,
                     resolution_time=market.resolution_time,
                     edge=qf_edge,
                     grade=grade,
-                    hold_hint=False,            # quick-flip EXITS into the correction
+                    hold_hint=False,            # quick-flip EXITS into the correction (profit-only ladder)
                     early_exit_price=fsig.target_price,
                     apply_grade_size=False,     # quick-flip sizes itself
                     reason=fsig.entry_reason,
@@ -827,11 +886,13 @@ class WeatherBot:
                     use_ml=True,                # ML veto + size scale
                 )
                 if pos:
-                    # Carry the flip's hold window so the loop can book-or-cut it.
+                    # Carry the flip's hold window so the loop can book-or-cut it
+                    # (PROFIT-ONLY — the timer never loss-cuts a flip).
                     pos.flip_max_hold_minutes = fsig.expected_hold_minutes
+                    pos.flip_side = qf_side
                     self.trades_placed += 1
                     self.telegram.notify_trade(
-                        'BUY', fsig.bucket_label, pos.entry_price,
+                        'BUY', disp_label, pos.entry_price,
                         pos.cost_usd, pos.shares, 'quick_flip',
                         edge=qf_edge, city=city,
                     )
@@ -859,14 +920,30 @@ class WeatherBot:
                 log.debug(f"peak_cluster eval failed {city}: {e}")
             for sig in cluster_signals:
                 self.signals_generated += 1
+                # ATOMIC basket (Req-28): a cluster is all-or-none. Filter to
+                # placeable legs, enforce the min-leg floor up front (NEVER a
+                # 1-leg "cluster"), check the portfolio guard ONCE for the whole
+                # basket, then place every leg with basket_leg=True so the per-leg
+                # liquidity-thin trim / portfolio guard / below-min checks can't
+                # pick the basket apart one leg at a time.
+                cl_legs = [lg for lg in sig.legs if lg.token_id]
+                min_legs = int(getattr(Config, 'PEAK_CLUSTER_MIN_LEGS', 3))
+                if len(cl_legs) < min_legs:
+                    log.info(f"   🧺 CLUSTER {city} — only {len(cl_legs)} placeable legs "
+                             f"(< {min_legs}) — skip (never a 1-leg cluster)")
+                    continue
+                cl_total_usd = sum(lg.size_usd for lg in cl_legs)
+                ok, why = self._can_deploy(cl_total_usd, count_as_buy=True)
+                if not ok:
+                    self._funnel['portfolio_guard'] += 1
+                    log.info(f"   🏦 GUARD cluster {city} — {why} (basket ${cl_total_usd:.2f})")
+                    continue
                 # Reserve the next box label for this basket (peek; commit only
                 # if at least one leg actually fills).
                 box_label = self.pm.peek_cluster_box()
-                log.info(f"   🧺 CLUSTER {city} [{box_label}] | {sig.reason}")
+                log.info(f"   🧺 CLUSTER {city} [{box_label}] | {len(cl_legs)} legs | {sig.reason}")
                 placed_legs = []
-                for leg in sig.legs:
-                    if not leg.token_id:
-                        continue
+                for leg in cl_legs:
                     pos = self._place(
                         token_id=leg.token_id,
                         condition_id=condition_ids.get(leg.bucket_label, ''),
@@ -890,6 +967,7 @@ class WeatherBot:
                         use_ml=False,            # the basket is ONE unit; don't veto single legs
                         cluster_box=box_label,
                         count_as_buy=False,      # whole basket counts as ONE buy (below)
+                        basket_leg=True,         # ATOMIC: no per-leg trim/guard/below-min drop
                     )
                     if pos:
                         self.trades_placed += 1
@@ -915,17 +993,21 @@ class WeatherBot:
                         log.debug(f"cluster notify failed: {e}")
 
         # ------------------------------------------------------
-        # PEAKER — unified HIGH-confidence daily-peak play (Req-27 merge of the
-        # old safety_peak + peak_basket). Accurately estimates the peak bucket
-        # (with a downward hot-bias correction) and takes ONE focused shape:
-        #   • peaker               — 1 leg (peak only), stable + very high conf
-        #   • peaker_basket_warmer — peak + upper (+1) neighbour, warming
-        #   • peaker_basket_cooler — peak + lower (−1) neighbour, cooling/default
-        # Equal SHARES so any single winner covers the basket + profit after
-        # fees; combined cost < 95¢; HOLDS TO RESOLUTION. Calibrated to the
-        # proven COOL-neighbour edge. The wide both-shoulders (4-leg) shape is
-        # delegated to peak_cluster above. Forecast-based → skipped once the
-        # extreme is locked (unless PEAKER_TRADE_DECIDED).
+        # PEAKER (Req-28 MARKET-ANCHORED) — the market itself prices the winning
+        # bucket (a ~>=60c favourite implies ~60% win / ~40% upside). PEAKER
+        # anchors on that high-probability favourite, CROSS-VALIDATES it with our
+        # model, and only buys on CONFIRMATION. A bare-favourite SOLO buy is
+        # ~breakeven (why peaker kept losing), so the EDGE is the cool/warm
+        # BASKET:
+        #   • peaker             — 1-leg solo, only on a genuine confirmed edge
+        #   • peaker_cool_basket — model peak == market favourite AND cooling →
+        #                          add the -1°C neighbour; if peak + (-1°C)
+        #                          combined cost < 95¢ buy BOTH, grouped as ONE
+        #   • peaker_warm_basket — same but warming → +1°C neighbour
+        # A basket is HELD to resolution and grouped (shared cluster box) so the
+        # UI/PM render + resolve it as ONE "peaker cool/warm basket" — ONE
+        # Telegram alert, one status group, in status + analysis. Placed
+        # ATOMICALLY (all-or-none). Forecast-based → skipped once locked.
         # ------------------------------------------------------
         if getattr(Config, 'PEAKER_ENABLED', True) and (
             not in_lock_window or getattr(Config, 'PEAKER_TRADE_DECIDED', False)
@@ -940,15 +1022,31 @@ class WeatherBot:
                 log.debug(f"peaker eval failed {city}: {e}")
             for sig in peaker_signals:
                 self.signals_generated += 1
+                is_basket = bool(getattr(sig, 'is_basket', sig.sub_strategy != 'peaker'))
+                disp_label = getattr(sig, 'display_label', None) or sig.sub_strategy.replace('_', ' ')
                 log.info(
-                    f"   🛡️  PEAKER {city} | {sig.sub_strategy} | {sig.direction} | "
+                    f"   🛡️  PEAKER {city} | {disp_label} | {sig.direction} | "
                     f"peak={sig.forecast_max_c:.1f}°C conf={sig.confidence:.0%} | "
                     f"{len(sig.legs)} legs | {sig.reason}"
                 )
+                pk_legs = [lg for lg in sig.legs if lg.token_id]
+                if not pk_legs:
+                    continue
+                # ATOMIC basket: a peaker basket is all-or-none — guard ONCE on
+                # the whole basket cost and place legs with basket_leg=True so the
+                # per-leg thin/guard/below-min checks can't trim it to one leg.
+                pk_total_usd = sum(lg.size_usd for lg in pk_legs)
+                ok, why = self._can_deploy(pk_total_usd, count_as_buy=True)
+                if not ok:
+                    self._funnel['portfolio_guard'] += 1
+                    log.info(f"   🏦 GUARD peaker {city} — {why} (basket ${pk_total_usd:.2f})")
+                    continue
+                # A multi-leg basket groups under a shared cluster box so the UI
+                # and PM render/resolve it as ONE unit (same as peak_cluster).
+                box_label = self.pm.peek_cluster_box() if is_basket else ''
+                pk_edge = sig.combined_prob - sig.total_cost
                 placed_peaker = []
-                for leg in sig.legs:
-                    if not leg.token_id:
-                        continue
+                for leg in pk_legs:
                     pos = self._place(
                         token_id=leg.token_id,
                         condition_id=condition_ids.get(leg.bucket_label, ''),
@@ -956,11 +1054,11 @@ class WeatherBot:
                         base_size_usd=leg.size_usd,
                         market_title=market.title,
                         bucket_label=leg.bucket_label,
-                        strategy=sig.sub_strategy,   # peaker / peaker_basket_warmer / peaker_basket_cooler
+                        strategy=sig.sub_strategy,   # peaker / peaker_cool_basket / peaker_warm_basket
                         city=city,
                         slug=market.slug,
                         resolution_time=market.resolution_time,
-                        edge=sig.combined_prob - sig.total_cost,
+                        edge=pk_edge,
                         grade=grade,
                         hold_hint=True,          # any-one-wins basket pays off at resolution (NEVER stop/trail)
                         early_exit_price=early_exit_price,
@@ -970,19 +1068,46 @@ class WeatherBot:
                         our_prob=getattr(leg, 'our_probability', 0.0),
                         use_factor_kelly=False,  # keep the equal-share basket legs intact
                         use_ml=False,            # the basket is ONE unit; don't veto single legs
+                        cluster_box=box_label,
                         count_as_buy=False,      # whole basket counts as ONE buy (below)
+                        basket_leg=True,         # ATOMIC: no per-leg trim/guard/below-min drop
                     )
                     if pos:
                         self.trades_placed += 1
                         placed_peaker.append(pos)
-                        self.telegram.notify_trade(
-                            'BUY', leg.bucket_label, pos.entry_price,
-                            pos.cost_usd, pos.shares, sig.sub_strategy,
-                            edge=sig.combined_prob - sig.total_cost, city=city,
-                        )
                 if placed_peaker:
-                    # The peaker basket = ONE buy toward the per-scan budget.
+                    # The peaker signal = ONE buy toward the per-scan budget.
                     self._scan_buys += 1
+                    pk_roi = getattr(sig, 'expected_roi_pct', None)
+                    if pk_roi is None:
+                        pk_roi = ((sig.combined_prob / sig.total_cost - 1.0) * 100.0) if sig.total_cost else 0.0
+                    if is_basket:
+                        # Group as ONE unit: tag every leg with the box, persist,
+                        # and send ONE grouped Telegram alert labelled e.g.
+                        # "peaker cool basket".
+                        committed = self.pm.commit_cluster_box()
+                        for lp in placed_peaker:
+                            lp.cluster_box = committed
+                        try:
+                            self.pm._save_state()
+                        except Exception:
+                            pass
+                        try:
+                            self.telegram.notify_cluster(
+                                committed, city, market.title, placed_peaker,
+                                sig.total_cost, sig.combined_prob, pk_roi,
+                                group_label=disp_label,
+                            )
+                        except Exception as e:
+                            log.debug(f"peaker basket notify failed: {e}")
+                    else:
+                        # Solo peaker leg — single trade alert.
+                        for lp in placed_peaker:
+                            self.telegram.notify_trade(
+                                'BUY', lp.bucket_label, lp.entry_price,
+                                lp.cost_usd, lp.shares, sig.sub_strategy,
+                                edge=pk_edge, city=city,
+                            )
 
         # ------------------------------------------------------
         # CONFIDENT — simple peak-only fallback (DEMOTED, opt-in). Only fires
@@ -1138,7 +1263,14 @@ class WeatherBot:
         log.info("")
 
         self.telegram.start_polling()
-        self.telegram.send("Weather Sniper Bot started! Use /help for commands.")
+        # Req-28: do NOT auto-start trading on deploy. Announce readiness + the
+        # three controls; trading begins only when the user presses Start / types
+        # 'start'. The startup card + [Start Trading][Settings][Restart] keyboard
+        # is sent by the Telegram bot itself.
+        try:
+            self.telegram.send_startup_ready()
+        except Exception as e:
+            log.debug(f"startup-ready notify failed: {e}")
 
         if not Config.is_paper():
             self.pm.recover_positions_on_start()

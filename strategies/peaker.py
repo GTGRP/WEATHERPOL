@@ -1,36 +1,42 @@
 """
-PEAKER STRATEGY — unified, high-confidence daily-peak play.
+PEAKER STRATEGY (Req-28 redesign) -- market-anchored, cross-validated daily-peak play.
 
-This MERGES the old `safety_peak` + `peak_basket` "peak" logic into ONE strategy
-so the bot never buys the same peak bucket twice as a duplicate. It accurately
-estimates the daily highest-temperature bucket and then takes one of three
-FOCUSED shapes (the 4th — buying BOTH shoulders at once — is intentionally left
-to `peak_cluster`, the wide any-one-wins basket):
+WHAT CHANGED (and why it kept losing):
+The old peaker estimated the peak from the model forecast and shifted it DOWN by
+a hot-bias, then bought the bare peak. Buying the market's fairly-priced favorite
+at its fair price has ~zero edge (pay 60c for a 60%-likely bucket = break-even
+before fees -> a net loser). The user is right: the EDGE is the ANY-ONE-WINS
+BASKET, not the lone favorite.
 
-  sub-strategy            shape                         when
-  ----------------------  ----------------------------  ---------------------------
-  peaker                  1 leg  (peak only)            STABLE + very high confidence
-  peaker_basket_warmer    2 legs (peak + upper +1)      WARMING trend
-  peaker_basket_cooler    2 legs (peak + lower -1)      COOLING trend / default lean
-
-CALIBRATION (data-driven, Req-27):
-Live results showed the COOL neighbour (-1 bucket) is the big winner while the
-bare peak and the warm (+1) neighbour lose — i.e. real daily highs tend to land
-ABOUT ONE BUCKET BELOW the model's estimated peak. So this strategy:
-  * shifts the estimated peak DOWN by PEAKER_PEAK_BIAS_BUCKETS buckets,
-  * DEFAULTS the stable/ambiguous case to the COOLER basket (not a mean-lean),
-  * gives the cooler basket looser gates + a size multiplier (PEAKER_COOL_*),
-  * only does the bare 1-leg `peaker` when confidence is VERY high AND the lone
-    peak already clears the fee-aware profit floor by itself.
+NEW DESIGN (exactly as specified):
+  1. ANCHOR ON THE MARKET. Polymarket already prices the winning degree high
+     (~60%). We take the MARKET's highest-priced bucket as the estimated peak
+     -- "market always prices on the winning market".
+  2. CROSS-VALIDATE WITH OUR MODEL. We only act when our model AGREES: our
+     model's own peak bucket must sit within PEAKER_ALIGN_BUCKETS of the market
+     peak AND our probability for that bucket must not contradict the price
+     (our_prob >= price * PEAKER_CONFIRM_RATIO). If the model disagrees, we SKIP
+     -- this is the core fix for "always losing" (we stop fighting / rubber-
+     stamping the market with no edge).
+  3. DIRECTIONAL BASKET = THE EDGE.
+       * COOLING trend  -> PEAKER COOL BASKET: peak bucket + the -1C neighbour.
+       * WARMING trend   -> PEAKER WARM BASKET: peak bucket + the +1C neighbour.
+     Buy BOTH legs in EQUAL SHARES only when the combined per-share cost
+     (peak price + neighbour price) is < PEAKER_MAX_COST (default 0.95). The
+     buckets are mutually exclusive, so whichever one resolves to $1 covers the
+     basket + profit after fees. The basket is grouped + labelled "peaker cool
+     basket" / "peaker warm basket" in Telegram, status and /analysis.
+  4. SOLO ONLY ON A REAL EDGE. The bare 1-leg peaker fires only when our model
+     shows a GENUINE edge over the price (our_prob - price >= PEAKER_SOLO_MIN_EDGE)
+     at very high confidence -- otherwise we don't take a no-edge favorite.
 
 GUARANTEES:
-  * equal SHARES across legs → whichever single bucket resolves to $1 covers the
-    other leg + net profit after fees (buckets are mutually exclusive),
-  * combined per-share basket cost < PEAKER_MAX_COST (default 0.95),
+  * equal SHARES across legs -> any single winning bucket covers the basket + net,
+  * combined per-share basket cost < PEAKER_MAX_COST,
   * every leg clears the dust / sellability floor,
-  * HOLD to resolution (thin books make early exits losing).
+  * HOLD to resolution (the any-one-wins payoff is realised at settlement).
 
-Patient by design: returning [] (no trade) is the correct output most of the time.
+Returning [] (no trade) is the correct output most of the time.
 """
 
 import re
@@ -39,8 +45,7 @@ from typing import Dict, List, Optional, Tuple
 
 from config import Config
 from logger import log
-# These two are used ONLY as type hints below. Import defensively so a class
-# rename in those modules can never crash the bot on startup.
+# Type hints only; import defensively so a rename can never crash startup.
 try:
     from data.probability_engine import BucketProbability
 except Exception:  # pragma: no cover
@@ -51,15 +56,15 @@ except Exception:  # pragma: no cover
     StabilityReport = object  # type: ignore
 
 
-# ── dataclasses ──
+# -- dataclasses --
 
 @dataclass
 class PeakerLeg:
     bucket_label: str
     token_id: str
-    market_price: float        # best_ask (what we pay before maker re-price)
+    market_price: float        # best_ask we pay (before maker re-price)
     our_probability: float     # ensemble probability for this bucket
-    size_usd: float            # how much to allocate
+    size_usd: float            # allocation
     role: str                  # 'peak' | 'neighbor_warm' | 'neighbor_cool'
     offset: int                # 0 = peak, +1 = warmer, -1 = cooler
 
@@ -78,14 +83,16 @@ class PeakerSignal:
     combined_prob: float = 0.0
     n_models: int = 0
     expected_roi_pct: float = 0.0
-    sub_strategy: str = 'peaker'        # 'peaker' | 'peaker_basket_warmer' | 'peaker_basket_cooler'
+    sub_strategy: str = 'peaker'   # 'peaker' | 'peaker_cool_basket' | 'peaker_warm_basket'
+    display_label: str = 'peaker'  # human label used in grouped Telegram/status/analysis
+    is_basket: bool = False        # True for the grouped cool/warm baskets
     direction: str = 'stable'
     hold_hint: bool = True
     exit_hint: str = ''
     reason: str = ''
 
 
-# ── helpers ──
+# -- helpers --
 
 _NUM_RE = re.compile(r'(-?\d+(?:\.\d+)?)')
 
@@ -104,21 +111,19 @@ def _bucket_numeric_center(label: str, lo: float, hi: float) -> Optional[float]:
     return None
 
 
-# ── the strategy ──
+# -- the strategy --
 
 class PeakerStrategy:
-    """
-    Unified high-confidence peak estimator with three focused shapes
-    (peaker / warmer / cooler). The both-shoulders shape is delegated to
-    peak_cluster. Calibrated to the proven cool-neighbour edge.
-    """
+    """Market-anchored, cross-validated peak play. Prefers the directional
+    any-one-wins basket (cool/warm); takes the bare peak only on a real model
+    edge. Calibrated to the proven cool-neighbour win."""
 
     name = "peaker"
     description = (
-        "Unified high-confidence daily-peak play: accurately estimate the peak "
-        "bucket, then buy peak-only (stable) or peak + one directional neighbour "
-        "(warmer/cooler). Equal shares, any winner covers the basket + profit "
-        "after fees. Calibrated to the winning cool side. Hold to resolution."
+        "Anchor on the market's highest-priced (winning) bucket, cross-validate "
+        "with our model, then buy the directional any-one-wins basket (peak + "
+        "cool/warm neighbour, combined < 95c). Bare peak only on a genuine edge. "
+        "Equal shares, holds to resolution."
     )
 
     def __init__(self):
@@ -127,29 +132,33 @@ class PeakerStrategy:
     def _load_cfg(self):
         g = lambda n, d: getattr(Config, n, d)
         self.enabled = bool(g('PEAKER_ENABLED', 1))
-        self.min_grade = float(g('PEAKER_MIN_GRADE', 0.60))
+        self.min_grade = float(g('PEAKER_MIN_GRADE', 0.55))
         self.min_models = int(g('PEAKER_MIN_MODELS', 3))
-        self.max_std = float(g('PEAKER_MAX_STD', 1.4))
-        self.min_conf = float(g('PEAKER_MIN_CONFIDENCE', 0.62))
-        # confidence needed to take the bare 1-leg stable play
-        self.solo_min_conf = float(g('PEAKER_SOLO_MIN_CONFIDENCE', 0.80))
-        # how many buckets to shift the estimated peak DOWN (hot-bias correction)
-        self.peak_bias = int(g('PEAKER_PEAK_BIAS_BUCKETS', 1))
-        self.max_peak_price = float(g('PEAKER_MAX_PEAK_PRICE', 0.85))
-        self.max_nb_price = float(g('PEAKER_MAX_NEIGHBOR_PRICE', 0.60))
+        self.max_std = float(g('PEAKER_MAX_STD', 1.6))
+        self.min_conf = float(g('PEAKER_MIN_CONFIDENCE', 0.55))
+        # market anchor gates
+        self.market_min_price = float(g('PEAKER_MARKET_MIN_PRICE', 0.40))
+        self.max_peak_price = float(g('PEAKER_MAX_PEAK_PRICE', 0.90))
+        self.max_nb_price = float(g('PEAKER_MAX_NEIGHBOR_PRICE', 0.70))
+        # cross-validation gates
+        self.align_buckets = int(g('PEAKER_ALIGN_BUCKETS', 1))
+        self.confirm_ratio = float(g('PEAKER_CONFIRM_RATIO', 0.85))
+        # basket economics
         self.max_cost = float(g('PEAKER_MAX_COST', 0.95))
         self.fee_buffer = float(g('PEAKER_FEE_BUFFER', 0.02))
         self.min_net = float(g('PEAKER_MIN_NET_PROFIT', 0.03))
-        self.min_edge = float(g('PEAKER_MIN_EDGE', 0.04))
+        self.min_edge = float(g('PEAKER_MIN_EDGE', 0.03))
+        # solo gates (a bare favorite needs a GENUINE model edge)
+        self.solo_min_edge = float(g('PEAKER_SOLO_MIN_EDGE', 0.08))
+        self.solo_min_conf = float(g('PEAKER_SOLO_MIN_CONFIDENCE', 0.75))
+        # sizing
         self.base_fraction = float(g('PEAKER_BASE_FRACTION', 0.05))
         self.max_fraction = float(g('PEAKER_MAX_FRACTION', 0.20))
         self.max_usd = float(g('PEAKER_MAX_USD', 15.0))
-        # cool-side calibration: prefer cooler when ambiguous, size it up, and
-        # relax its edge gate a touch because it is the proven winner.
         self.prefer_cool = bool(g('PEAKER_PREFER_COOL', 1))
         self.cool_size_mult = float(g('PEAKER_COOL_SIZE_MULT', 1.35))
         self.cool_edge_relax = float(g('PEAKER_COOL_EDGE_RELAX', 0.02))
-        self.warm_size_mult = float(g('PEAKER_WARM_SIZE_MULT', 0.7))
+        self.warm_size_mult = float(g('PEAKER_WARM_SIZE_MULT', 0.80))
         self.min_entry = float(g('MIN_ENTRY_PRICE', 0.02))
         self.min_order = float(g('MIN_ORDER_SIZE', 1.0))
 
@@ -168,7 +177,7 @@ class PeakerStrategy:
         if not self.enabled or not bucket_probs or balance <= 0:
             return []
 
-        # ── gate 1: stability / grade ──
+        # -- gate 1: stability / grade --
         if stability is None:
             log.debug(f"Peaker {city}: no stability report -- patient skip")
             return []
@@ -180,151 +189,171 @@ class PeakerStrategy:
             log.debug(f"Peaker {city}: eff grade {eff_grade:.2f} < {self.min_grade} -- skip")
             return []
 
-        # ── gate 2: enough agreeing models ──
+        # -- gate 2: enough agreeing models --
         n_models = max(bp.n_models for bp in bucket_probs)
         if n_models < self.min_models:
             log.debug(f"Peaker {city}: {n_models} models < {self.min_models} -- skip")
             return []
 
-        # ── gate 3: tight ensemble spread ──
+        # -- gate 3: tight ensemble spread --
         ens_std = min((bp.std_forecast for bp in bucket_probs), default=999)
         if ens_std > self.max_std:
             log.debug(f"Peaker {city}: std {ens_std:.2f}C > {self.max_std} -- skip")
             return []
 
-        # ── index buckets by numeric center ──
-        indexed: List[Tuple[float, BucketProbability]] = []
+        # -- index buckets by numeric center; carry price + prob + token + conf --
+        indexed: List[Tuple[float, BucketProbability, float]] = []
         for bp in bucket_probs:
             c = _bucket_numeric_center(bp.bucket_label, bp.bucket_low, bp.bucket_high)
-            if c is not None:
-                indexed.append((c, bp))
-        if not indexed:
+            price = market_prices.get(bp.bucket_label)
+            if c is None or price is None:
+                continue
+            indexed.append((c, bp, float(price or 0.0)))
+        if len(indexed) < 1:
             return []
         indexed.sort(key=lambda x: x[0])
 
-        # ── estimate peak (closest to forecast max), then apply the DOWNWARD
-        #    hot-bias correction so the bare peak sits where highs actually land ──
-        target = stability.forecast_max_c
-        raw_i = min(range(len(indexed)), key=lambda i: abs(indexed[i][0] - target))
-        center_i = max(0, raw_i - self.peak_bias)
-        center_val, center_bp = indexed[center_i]
+        # -- ANCHOR ON THE MARKET: the highest-priced bucket is the market's
+        #    "winning degree" estimate ("market always prices on winning market") --
+        market_i = max(range(len(indexed)), key=lambda i: indexed[i][2])
+        market_center, market_bp, market_price = indexed[market_i]
 
-        # ── gate 4: peak-bucket confidence ──
-        peak_conf = float(getattr(center_bp, 'confidence', 0.0) or 0.0)
+        # -- CROSS-VALIDATE WITH OUR MODEL --
+        # (a) the market peak must actually be a high-probability bucket
+        if market_price < self.market_min_price:
+            log.debug(f"Peaker {city}: market peak price {market_price:.2f} < {self.market_min_price} -- not a confident market, skip")
+            return []
+        if market_price > self.max_peak_price:
+            log.debug(f"Peaker {city}: market peak price {market_price:.2f} > {self.max_peak_price} -- too rich, skip")
+            return []
+        # (b) our model's own peak bucket must be within align_buckets of it
+        model_i = max(range(len(indexed)), key=lambda i: indexed[i][1].probability)
+        if abs(model_i - market_i) > self.align_buckets:
+            log.debug(f"Peaker {city}: model peak {model_i} not aligned with market peak {market_i} -- disagree, skip")
+            return []
+        # (c) our probability for the market peak must not contradict the price
+        peak_our_prob = float(getattr(market_bp, 'probability', 0.0) or 0.0)
+        if peak_our_prob < market_price * self.confirm_ratio:
+            log.debug(f"Peaker {city}: our prob {peak_our_prob:.2f} < {self.confirm_ratio:.2f} x price {market_price:.2f} -- model not confirming, skip")
+            return []
+        # (d) peak-bucket confidence floor
+        peak_conf = float(getattr(market_bp, 'confidence', 0.0) or 0.0)
         if peak_conf < self.min_conf:
             log.debug(f"Peaker {city}: peak conf {peak_conf:.2f} < {self.min_conf} -- skip")
             return []
 
-        # ── decide the shape (sub-strategy) ──
-        trend = (stability.trend or 'unknown').lower()
+        center_i = market_i
+        center_bp = market_bp
+
+        # -- decide the shape from the trend --
+        trend = (getattr(stability, 'trend', None) or 'unknown').lower()
         has_warm = (center_i + 1) < len(indexed)
         has_cool = (center_i - 1) >= 0
 
-        if trend == 'warming' and has_warm:
-            direction, sub = +1, 'peaker_basket_warmer'
-        elif trend == 'cooling' and has_cool:
-            direction, sub = -1, 'peaker_basket_cooler'
-        else:
-            # stable / sideways / ambiguous: default to the proven cool side
-            if self.prefer_cool and has_cool:
-                direction, sub = -1, 'peaker_basket_cooler'
-            elif peak_conf >= self.solo_min_conf:
-                direction, sub = 0, 'peaker'              # bare 1-leg stable play
-            elif has_cool:
-                direction, sub = -1, 'peaker_basket_cooler'
-            elif has_warm:
-                direction, sub = +1, 'peaker_basket_warmer'
-            else:
-                direction, sub = 0, 'peaker'
-
-        # bare 1-leg only when confidence is VERY high; otherwise add the cooler
-        if direction == 0 and peak_conf < self.solo_min_conf:
-            if has_cool:
-                direction, sub = -1, 'peaker_basket_cooler'
-            elif has_warm:
-                direction, sub = +1, 'peaker_basket_warmer'
-
-        # ── assemble candidate legs ──
-        candidates: List[Tuple[int, BucketProbability, str]] = [(center_i, center_bp, 'peak')]
-        if direction != 0:
-            ni = center_i + direction
-            if 0 <= ni < len(indexed):
-                _, nb = indexed[ni]
-                role = 'neighbor_warm' if direction > 0 else 'neighbor_cool'
-                candidates.append((ni, nb, role))
-
-        # ── price & floor checks ──
-        kept: List[Tuple[int, BucketProbability, str, float, str]] = []
-        for idx, bp, role in candidates:
-            price = market_prices.get(bp.bucket_label)
-            tid = token_ids.get(bp.bucket_label)
-            if price is None or tid is None or price <= 0:
-                continue
-            if price < self.min_entry:
-                continue
-            if role == 'peak' and price > self.max_peak_price:
-                continue
-            if role != 'peak' and price > self.max_nb_price:
-                continue
-            kept.append((idx, bp, role, price, tid))
-
-        if not any(role == 'peak' for _, _, role, _, _ in kept):
-            log.debug(f"Peaker {city}: peak bucket failed price/floor checks -- skip")
+        peak_token = token_ids.get(center_bp.bucket_label)
+        if not peak_token or market_price < self.min_entry:
+            log.debug(f"Peaker {city}: peak bucket has no token / below entry floor -- skip")
             return []
-        # if the neighbour fell out, collapse to the bare peak (only if it can
-        # stand alone profitably; checked by the fee-aware floor below)
-        if len(kept) == 1:
-            sub = 'peaker'
-            direction = 0
 
-        # ── per-share basket cost & fee-aware profit floor (any-one-wins) ──
-        total_cost = sum(price for _, _, _, price, _ in kept)
+        def _neighbor(direction: int):
+            ni = center_i + direction
+            if ni < 0 or ni >= len(indexed):
+                return None
+            _, nbp, nprice = indexed[ni]
+            ntok = token_ids.get(nbp.bucket_label)
+            if not ntok or nprice <= 0 or nprice < self.min_entry:
+                return None
+            if nprice > self.max_nb_price:
+                return None
+            return (ni, nbp, nprice, ntok)
+
+        # Choose direction: cooling -> cool basket; warming -> warm basket;
+        # stable/ambiguous -> prefer cool (the proven winner) if it fits.
+        chosen_dir = 0
+        sub = 'peaker'
+        display = 'peaker'
+        neighbor = None
+        if trend == 'cooling' and has_cool:
+            nb = _neighbor(-1)
+            if nb and (market_price + nb[2]) < self.max_cost:
+                chosen_dir, sub, display, neighbor = -1, 'peaker_cool_basket', 'peaker cool basket', nb
+        elif trend == 'warming' and has_warm:
+            nb = _neighbor(+1)
+            if nb and (market_price + nb[2]) < self.max_cost:
+                chosen_dir, sub, display, neighbor = +1, 'peaker_warm_basket', 'peaker warm basket', nb
+
+        if chosen_dir == 0 and self.prefer_cool and has_cool:
+            nb = _neighbor(-1)
+            if nb and (market_price + nb[2]) < self.max_cost:
+                chosen_dir, sub, display, neighbor = -1, 'peaker_cool_basket', 'peaker cool basket', nb
+
+        # -- assemble legs --
+        legs_src: List[Tuple[BucketProbability, float, str, str, int]] = [
+            (center_bp, market_price, peak_token, 'peak', 0)
+        ]
+        if neighbor is not None:
+            _, nbp, nprice, ntok = neighbor
+            role = 'neighbor_cool' if chosen_dir < 0 else 'neighbor_warm'
+            legs_src.append((nbp, nprice, ntok, role, chosen_dir))
+
+        is_basket = len(legs_src) > 1
+
+        # -- SOLO requires a GENUINE model edge (no no-edge favorites) --
+        if not is_basket:
+            solo_edge = peak_our_prob - market_price
+            if solo_edge < self.solo_min_edge or peak_conf < self.solo_min_conf:
+                log.debug(f"Peaker {city}: solo edge {solo_edge:+.2f} / conf {peak_conf:.2f} "
+                          f"below solo gate ({self.solo_min_edge}, {self.solo_min_conf}) -- skip")
+                return []
+            sub, display = 'peaker', 'peaker'
+
+        # -- per-share basket cost + fee-aware floor --
+        total_cost = sum(p for _, p, _, _, _ in legs_src)
         if total_cost <= 0:
             return []
         max_basket_cost = min(self.max_cost, 1.0 - (self.fee_buffer + self.min_net))
-        if total_cost >= max_basket_cost:
-            log.debug(f"Peaker {city}: cost ${total_cost:.2f}/sh >= ${max_basket_cost:.2f} -- skip")
+        if is_basket and total_cost >= max_basket_cost:
+            log.debug(f"Peaker {city}: basket cost ${total_cost:.2f}/sh >= ${max_basket_cost:.2f} -- skip")
             return []
 
-        # ── combined probability / edge (cool side gets a relaxed gate) ──
-        combined_prob = min(0.99, sum(bp.probability for _, bp, _, _, _ in kept))
+        # -- combined probability / edge (cool side gets a small relaxed gate) --
+        combined_prob = min(0.99, sum(float(bp.probability) for bp, _, _, _, _ in legs_src))
         edge = combined_prob - total_cost
         eff_min_edge = self.min_edge
-        if sub == 'peaker_basket_cooler':
+        if sub == 'peaker_cool_basket':
             eff_min_edge = max(0.0, self.min_edge - self.cool_edge_relax)
-        if edge < eff_min_edge:
-            log.debug(f"Peaker {city}: edge {edge:.1%} < {eff_min_edge:.1%} -- skip")
+        if is_basket and edge < eff_min_edge:
+            log.debug(f"Peaker {city}: basket edge {edge:+.1%} < {eff_min_edge:.1%} -- skip")
             return []
 
-        # ── confidence-scaled sizing, with cool/warm multipliers ──
+        # -- confidence-scaled sizing with cool/warm multipliers --
         conf_span = max(0.0, min(1.0, (peak_conf - self.min_conf) / max(0.01, 1.0 - self.min_conf)))
         frac = self.base_fraction + (self.max_fraction - self.base_fraction) * conf_span
         frac = max(self.base_fraction, min(self.max_fraction, frac))
         size_mult = 1.0
-        if sub == 'peaker_basket_cooler':
+        if sub == 'peaker_cool_basket':
             size_mult = self.cool_size_mult
-        elif sub == 'peaker_basket_warmer':
+        elif sub == 'peaker_warm_basket':
             size_mult = self.warm_size_mult
         basket_usd = balance * frac * size_mult
         basket_usd = min(basket_usd, self.max_usd, balance * self.max_fraction)
-        basket_usd = max(self.min_order * len(kept), basket_usd)
+        basket_usd = max(self.min_order * len(legs_src), basket_usd)
 
-        # ── equal SHARES across legs ──
+        # -- equal SHARES across legs --
         cost_per_share = total_cost
         target_shares = basket_usd / cost_per_share if cost_per_share > 0 else 0.0
-        max_price = max(price for _, _, _, price, _ in kept)
+        max_price = max(p for _, p, _, _, _ in legs_src)
         min_shares_for_floor = self.min_order / max_price if max_price > 0 else 0.0
         shares = max(min_shares_for_floor, target_shares)
 
         legs: List[PeakerLeg] = []
-        for idx, bp, role, price, tid in kept:
+        for bp, price, tok, role, offset in legs_src:
             leg_usd = max(self.min_order, round(shares * price, 2))
-            offset = 0 if role == 'peak' else (+1 if role == 'neighbor_warm' else -1)
             legs.append(PeakerLeg(
                 bucket_label=bp.bucket_label,
-                token_id=tid,
+                token_id=tok,
                 market_price=price,
-                our_probability=bp.probability,
+                our_probability=float(bp.probability),
                 size_usd=leg_usd,
                 role=role,
                 offset=offset,
@@ -334,26 +363,27 @@ class PeakerStrategy:
         expected_roi_pct = ((1.0 - cost_per_share) / cost_per_share * 100.0) if cost_per_share > 0 else 0.0
 
         peak_label = next(l.bucket_label for l in legs if l.role == 'peak')
-        nb = [l for l in legs if l.role != 'peak']
-        if not nb:
-            shape = 'peaker (peak-only)'
-        elif nb[0].role == 'neighbor_cool':
-            shape = f'peaker basket cooler (peak {peak_label} + cooler {nb[0].bucket_label})'
+        nb_legs = [l for l in legs if l.role != 'peak']
+        if not nb_legs:
+            shape = f'peaker solo (peak {peak_label} @ {market_price:.2f}, edge {peak_our_prob - market_price:+.0%})'
+        elif nb_legs[0].role == 'neighbor_cool':
+            shape = f'peaker COOL basket (peak {peak_label} + cooler {nb_legs[0].bucket_label})'
         else:
-            shape = f'peaker basket warmer (peak {peak_label} + warmer {nb[0].bucket_label})'
+            shape = f'peaker WARM basket (peak {peak_label} + warmer {nb_legs[0].bucket_label})'
 
-        exit_hint = "HOLD -- high-confidence peaker, let it resolve"
+        exit_hint = "HOLD -- market-confirmed peaker, let it resolve"
         reason = (
             f"PEAKER {city} [{sub}] trend={trend} grade={eff_grade:.2f} conf={peak_conf:.0%} "
-            f"std={ens_std:.2f}C | {shape} | {len(legs)}legs ${total_deployed:.2f} "
-            f"Pwin={combined_prob:.0%} edge={edge:+.0%} roi~{expected_roi_pct:.0f}% after fees"
+            f"mkt_peak@{market_price:.2f} our_p={peak_our_prob:.0%} | {shape} | "
+            f"{len(legs)}legs ${total_deployed:.2f} cost${total_cost:.2f}/sh "
+            f"Pwin={combined_prob:.0%} edge={edge:+.0%} roi~{expected_roi_pct:.0f}%"
         )
         log.info(f"   > {reason}")
 
         return [PeakerSignal(
             market_title=market_title,
             city=city,
-            forecast_max_c=target,
+            forecast_max_c=getattr(stability, 'forecast_max_c', market_center),
             trend=trend,
             stability_score=eff_grade,
             confidence=peak_conf,
@@ -364,7 +394,9 @@ class PeakerStrategy:
             n_models=n_models,
             expected_roi_pct=expected_roi_pct,
             sub_strategy=sub,
-            direction=('warming' if direction > 0 else 'cooling' if direction < 0 else 'stable'),
+            display_label=display,
+            is_basket=is_basket,
+            direction=('warming' if chosen_dir > 0 else 'cooling' if chosen_dir < 0 else 'stable'),
             hold_hint=True,
             exit_hint=exit_hint,
             reason=reason,
