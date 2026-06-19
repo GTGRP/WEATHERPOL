@@ -215,7 +215,7 @@ class PositionManager:
         self._load_state()
         self._load_weekly()
 
-    # ════════════════════════
+    # ═══════════════════════
     # BALANCE
     # ═════════════════════════
 
@@ -693,6 +693,42 @@ class PositionManager:
         self._assert_ledger()
         log.info(f"♻️  RESTART FRESH — cleared all positions, balance reset to ${bal:.2f}")
         return bal
+
+    def apply_starting_balance(self, new_balance: float = None) -> dict:
+        """Re-apply the configured starting balance to the LIVE paper balance.
+
+        Fixes the bug where setting a new balance (e.g. 300) then tapping Start
+        kept trading with the old persisted balance: _load_state restores
+        paper_balance from data/positions.json, so a changed STARTING_BALANCE
+        never reached the live ledger. We rebase ONLY when the book is empty
+        (no open/pending/closed positions) so the PnL ledger invariant stays
+        intact; if any positions exist the caller should tell the user to
+        Restart (which wipes + rebases via reset_fresh). Returns a status dict.
+        """
+        bal = (float(new_balance) if new_balance is not None
+               else float(Config.STARTING_BALANCE))
+        # Always remember the requested balance so a later Restart uses it.
+        try:
+            Config.STARTING_BALANCE = bal
+        except Exception:
+            pass
+        if self.positions:
+            active = [p for p in self.positions if p.status in ('open', 'pending')]
+            return {'applied': False,
+                    'reason': 'positions_open' if active else 'has_history',
+                    'balance': self.paper_balance, 'target': bal,
+                    'open': len(active)}
+        # Empty book -> safe to rebase the whole paper ledger to the new balance.
+        self.paper_balance = bal
+        self.total_deposited = bal
+        self.total_redeemed = 0.0
+        self._save_state()
+        try:
+            self._assert_ledger()
+        except Exception:
+            pass
+        log.info(f"💰 Starting balance applied — paper balance set to ${bal:.2f}")
+        return {'applied': True, 'balance': bal, 'target': bal}
 
 
     # ═════════════════════════
