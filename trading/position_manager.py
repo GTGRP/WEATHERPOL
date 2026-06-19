@@ -215,9 +215,9 @@ class PositionManager:
         self._load_state()
         self._load_weekly()
 
-    # ════════════════════════
+    # ═══════════════════════
     # BALANCE
-    # ═════════════════════════
+    # ════════════════════════
 
     def get_balance(self) -> float:
         if Config.is_paper():
@@ -248,9 +248,9 @@ class PositionManager:
             return None
 
 
-    # ═════════════════════════
+    # ════════════════════════
     # POSITION LIFECYCLE
-    # ═════════════════════════
+    # ═══════════════════════
 
     def add_position(self, token_id: str, condition_id: str, entry_price: float,
                      shares: float, cost_usd: float, market_title: str,
@@ -694,10 +694,46 @@ class PositionManager:
         log.info(f"♻️  RESTART FRESH — cleared all positions, balance reset to ${bal:.2f}")
         return bal
 
+    def apply_starting_balance(self, new_balance: float = None) -> dict:
+        """Re-apply the configured starting balance to the LIVE paper balance.
 
-    # ═════════════════════════
+        Fixes the bug where setting a new balance (e.g. 300) then tapping Start
+        kept trading with the old persisted balance: _load_state restores
+        paper_balance from data/positions.json, so a changed STARTING_BALANCE
+        never reached the live ledger. We rebase ONLY when the book is empty
+        (no open/pending/closed positions) so the PnL ledger invariant stays
+        intact; if any positions exist the caller should tell the user to
+        Restart (which wipes + rebases via reset_fresh). Returns a status dict.
+        """
+        bal = (float(new_balance) if new_balance is not None
+               else float(Config.STARTING_BALANCE))
+        # Always remember the requested balance so a later Restart uses it.
+        try:
+            Config.STARTING_BALANCE = bal
+        except Exception:
+            pass
+        if self.positions:
+            active = [p for p in self.positions if p.status in ('open', 'pending')]
+            return {'applied': False,
+                    'reason': 'positions_open' if active else 'has_history',
+                    'balance': self.paper_balance, 'target': bal,
+                    'open': len(active)}
+        # Empty book -> safe to rebase the whole paper ledger to the new balance.
+        self.paper_balance = bal
+        self.total_deposited = bal
+        self.total_redeemed = 0.0
+        self._save_state()
+        try:
+            self._assert_ledger()
+        except Exception:
+            pass
+        log.info(f"💰 Starting balance applied — paper balance set to ${bal:.2f}")
+        return {'applied': True, 'balance': bal, 'target': bal}
+
+
+    # ════════════════════════
     # STOP-LOSS & TAKE-PROFIT
-    # ═════════════════════════
+    # ════════════════════════
 
     def check_risk_triggers(self) -> List[TrackedPosition]:
         """Check all open positions for stop-loss / take-profit triggers."""
@@ -833,9 +869,9 @@ class PositionManager:
                     log.debug(f"close notify failed: {e}")
 
 
-    # ═════════════════════════
+    # ════════════════════════
     # RESOLUTION & REDEMPTION
-    # ═════════════════════════
+    # ════════════════════════
 
     def _maybe_notify_cluster_close(self, box: str):
         """Once ALL legs of a basket ("Box N") have resolved, emit ONE grouped
@@ -1039,9 +1075,9 @@ class PositionManager:
                 count += 1
         return count
 
-    # ═════════════════════════
+    # ════════════════════════
     # PRICE UPDATES
-    # ═════════════════════════
+    # ════════════════════════
 
     def update_prices(self):
         """Batch update prices for open positions.
@@ -1086,9 +1122,9 @@ class PositionManager:
         self._save_state()
 
 
-    # ═════════════════════════
+    # ════════════════════════
     # CONTEXT MANAGEMENT (free memory for closed markets)
-    # ═════════════════════════
+    # ════════════════════════
 
     def _maybe_free_context(self, slug: str):
         """Free market context if no open positions remain for it."""
@@ -1112,9 +1148,9 @@ class PositionManager:
         """How many active market contexts we're tracking."""
         return sum(1 for v in self.market_contexts.values() if v.active)
 
-    # ═════════════════════════
+    # ════════════════════════
     # PAPER TRADE LOG + LEDGER INVARIANT
-    # ═════════════════════════
+    # ════════════════════════
 
     def _log_paper_trade(self, action: str, pos: TrackedPosition, extra: Optional[Dict] = None):
         """Append one structured record per BUY / SELL / SETTLE / REDEEM /
@@ -1184,9 +1220,9 @@ class PositionManager:
                         f"deposited=${self.total_deposited:.2f}")
         return ok
 
-    # ═════════════════════════
+    # ════════════════════════
     # WEEKLY MEMORY
-    # ═════════════════════════
+    # ════════════════════════
 
     def record_weekly_stats(self):
         """Snapshot current week's performance for ML memory."""
@@ -1246,9 +1282,9 @@ class PositionManager:
         return " | ".join(lines)
 
 
-    # ═════════════════════════
+    # ════════════════════════
     # STATISTICS (per-position + aggregate)
-    # ═════════════════════════
+    # ════════════════════════
 
     @staticmethod
     def _closed_outcome(p) -> Optional[str]:
@@ -1405,9 +1441,9 @@ class PositionManager:
         return summary
 
 
-    # ═════════════════════════
+    # ════════════════════════
     # PERSISTENCE
-    # ═════════════════════════
+    # ════════════════════════
 
     def _save_state(self):
         """Save positions to disk."""
