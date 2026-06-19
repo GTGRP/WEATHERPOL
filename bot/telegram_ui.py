@@ -43,6 +43,11 @@ class TelegramBot:
         self._poll_thread: Optional[threading.Thread] = None
         self._running = False
         self._last_update_id = 0
+        # Optional dashboard hook: restart_fresh(starting_balance=None) clears
+        # ALL positions and resets the paper balance for a fresh start. Set by
+        # the dashboard; the inline Restart button / /restart invoke it.
+        self._on_restart = None
+        self._restart_pending = False
         # Seed with already-redeemed ids so a restart doesn't re-announce the
         # whole backlog — only NEW redemptions after startup are sent.
         self._announced_redeemed = set(
@@ -121,6 +126,78 @@ class TelegramBot:
         except Exception:
             pass
 
+    # ==============================================================
+    # LIFECYCLE (startup ready / start / restart fresh)
+    # ==============================================================
+
+    def _main_keyboard(self) -> dict:
+        """Inline keyboard shown on startup: Start / Settings / Restart."""
+        return {'inline_keyboard': [[
+            {'text': '▶️ Start Trading', 'callback_data': 'act:start'},
+            {'text': '⚙️ Settings', 'callback_data': 'act:settings'},
+            {'text': '♻️ Restart', 'callback_data': 'act:restart'},
+        ]]}
+
+    def send_startup_ready(self):
+        """Announce a successful deploy/boot WITHOUT auto-trading and show the
+        Start / Settings / Restart inline keyboard. Trading begins only when the
+        user taps Start Trading (or sends /start, or types 'start')."""
+        try:
+            from bot import settings_store
+            bools, _nums = settings_store.snapshot()
+        except Exception:
+            bools = {}
+        try:
+            bal = self.pm.get_balance() if self.pm else 0.0
+        except Exception:
+            bal = 0.0
+        mode = '📋 PAPER' if Config.is_paper() else '🔴 LIVE'
+        trading = '🟢 ON' if bools.get('TRADING_ENABLED') else '🔴 OFF (tap Start Trading)'
+        msg = (
+            f"✅ <b>Bot initialized successfully</b>\n"
+            f"{mode} | starting balance ${bal:.2f}\n"
+            f"Trading: <b>{trading}</b>\n\n"
+            f"▶️ <b>Start Trading</b> — begin placing trades (or send /start)\n"
+            f"⚙️ <b>Settings</b> — strategies, gates & starting balance\n"
+            f"♻️ <b>Restart</b> — clear ALL positions & start fresh\n"
+        )
+        self.send(msg, reply_markup=self._main_keyboard())
+
+    def _prompt_restart(self):
+        """Ask for confirmation before the destructive restart-fresh action."""
+        self._restart_pending = True
+        kb = {'inline_keyboard': [[
+            {'text': '✅ Yes, clear all & restart', 'callback_data': 'act:restart_confirm'},
+            {'text': '✖️ Cancel', 'callback_data': 'act:restart_cancel'},
+        ]]}
+        self.send(
+            "♻️ <b>Restart fresh?</b>\n"
+            "This CLOSES/clears ALL positions and resets the paper balance to "
+            "the configured starting balance. This cannot be undone.",
+            reply_markup=kb,
+        )
+
+    def _do_restart(self):
+        """Invoke the dashboard restart hook (clear all positions + reset balance)."""
+        self._restart_pending = False
+        if not self._on_restart:
+            self.send("⚠️ Restart hook not wired — cannot restart from here.")
+            return
+        try:
+            self._on_restart()
+            try:
+                bal = self.pm.get_balance() if self.pm else 0.0
+            except Exception:
+                bal = 0.0
+            self.send(
+                f"♻️ <b>Restarted fresh</b> — all positions cleared, "
+                f"balance reset to ${bal:.2f}. Tap Start Trading to begin.",
+                reply_markup=self._main_keyboard(),
+            )
+        except Exception as e:
+            log.debug(f"restart failed: {e}")
+            self.send("⚠️ Restart failed — see logs.")
+
     def notify_trade(self, side: str, bucket_label: str, price: float,
                      size_usd: float, shares: float, strategy: str,
                      edge: float = 0, city: str = ''):
@@ -139,7 +216,7 @@ class TelegramBot:
 
     def notify_cluster(self, box_label: str, city: str, market_title: str,
                        legs: List, total_cost: float, combined_prob: float,
-                       roi_pct: float):
+                       roi_pct: float, group_label: str = None):
         """ONE grouped alert for a whole peak-cluster basket.
 
         Replaces the old behaviour of firing a separate notify_trade per leg
@@ -150,8 +227,9 @@ class TelegramBot:
         try:
             n = len(legs)
             total_cost_usd = sum(getattr(l, 'cost_usd', 0.0) or 0.0 for l in legs)
+            title = (group_label or 'PEAK CLUSTER').upper()
             head = (
-                f"🧺 <b>PEAK CLUSTER {self._esc(box_label)}</b> — {n} bucket{'s' if n != 1 else ''}\n"
+                f"🧺 <b>{self._esc(title)} {self._esc(box_label)}</b> — {n} bucket{'s' if n != 1 else ''}\n"
                 f"📍 {self._esc(city)} | {self._esc((market_title or '')[:60])}\n"
             )
             lines = []
@@ -354,9 +432,10 @@ class TelegramBot:
         open_pos = self.pm.get_open_positions() if self.pm else []
         clusters: Dict[str, list] = {}
         units: List[dict] = []
+        basket_strats = ('peak_cluster', 'peaker_cool_basket', 'peaker_warm_basket')
         for p in open_pos:
             box = getattr(p, 'cluster_box', '') or ''
-            if box and getattr(p, 'strategy', '') == 'peak_cluster':
+            if box and getattr(p, 'strategy', '') in basket_strats:
                 clusters.setdefault(box, []).append(p)
             else:
                 units.append({
@@ -369,9 +448,10 @@ class TelegramBot:
             cost = sum(l.cost_usd for l in legs)
             roi = (pnl / cost * 100.0) if cost > 0 else 0.0
             recent = max(l.entry_time for l in legs)
+            strat = getattr(legs[0], 'strategy', 'peak_cluster') if legs else 'peak_cluster'
             units.append({
                 'kind': 'cluster', 'box': box, 'positions': legs,
-                'pnl': pnl, 'roi': roi, 'recent': recent,
+                'pnl': pnl, 'roi': roi, 'recent': recent, 'strategy': strat,
             })
         if sort_key == 'pnl':
             units.sort(key=lambda u: u['pnl'], reverse=True)
@@ -403,8 +483,13 @@ class TelegramBot:
         pe = '🟢' if unit['pnl'] >= 0 else '🔴'
         city = self._esc(getattr(legs[0], 'city', '') if legs else '')
         cost = sum(l.cost_usd for l in legs)
+        label = {
+            'peak_cluster': 'Peak Cluster',
+            'peaker_cool_basket': 'Peaker Cool Basket',
+            'peaker_warm_basket': 'Peaker Warm Basket',
+        }.get(unit.get('strategy', 'peak_cluster'), 'Peak Cluster')
         out = (
-            f"{idx}. {pe} 🧺 <b>Peak Cluster {self._esc(unit['box'])}</b> — {city}  "
+            f"{idx}. {pe} 🧺 <b>{self._esc(label)} {self._esc(unit['box'])}</b> — {city}  "
             f"${unit['pnl']:+.2f} ({unit['roi']:+.0f}%)\n"
             f"   {len(legs)} buckets | cost ${cost:.2f} | hold → resolution\n"
         )
@@ -861,6 +946,33 @@ class TelegramBot:
             self.send_settings(group=group, edit_message_id=message_id)
             return
 
+        # Lifecycle action buttons: "act:start|settings|restart"
+        if data.startswith('act:'):
+            action = data.split(':', 1)[1]
+            if action == 'start':
+                from bot import settings_store
+                settings_store.set_value('TRADING_ENABLED', True)
+                self._restart_pending = False
+                self._answer_callback(callback_id, 'Trading enabled')
+                self.send("🟢 <b>Trading ENABLED</b> — the bot will place new trades.")
+            elif action == 'settings':
+                self._restart_pending = False
+                self._answer_callback(callback_id)
+                self.send_settings(edit_message_id=message_id)
+            elif action == 'restart':
+                self._answer_callback(callback_id)
+                self._prompt_restart()
+            elif action == 'restart_confirm':
+                self._answer_callback(callback_id, 'Restarting fresh')
+                self._do_restart()
+            elif action == 'restart_cancel':
+                self._restart_pending = False
+                self._answer_callback(callback_id, 'Cancelled')
+                self.send("✖️ Restart cancelled — positions untouched.")
+            else:
+                self._answer_callback(callback_id)
+            return
+
         # Toggle / bump: "<action>:<KEY>[:<group>]"
         parts = data.split(':')
         action = parts[0]
@@ -885,10 +997,12 @@ class TelegramBot:
         cmd = text.lower().split()[0] if text else ''
         parts = text.split()
 
-        if cmd == '/start' or cmd == '/resume':
+        if cmd in ('/start', '/resume', 'start'):
             from bot import settings_store
             settings_store.set_value('TRADING_ENABLED', True)
             self.send("🟢 <b>Trading ENABLED</b> — the bot will place new trades.")
+        elif cmd in ('/restart', 'restart'):
+            self._prompt_restart()
         elif cmd == '/stop' or cmd == '/pause':
             from bot import settings_store
             settings_store.set_value('TRADING_ENABLED', False)
@@ -934,7 +1048,8 @@ class TelegramBot:
         elif cmd == '/help':
             self.send(
                 "🌤️ <b>Weather Sniper Commands</b>\n"
-                "<b>/start</b> — enable trading\n"
+                "<b>/start</b> — enable trading (or just type 'start')\n"
+                "<b>/restart</b> — clear ALL positions & start fresh (or type 'restart')\n"
                 "<b>/stop</b> — disable trading (monitor only)\n"
                 "<b>/settings</b> — tabbed panel: toggle strategies & tune every gate\n"
                 "   (e.g. <code>/settings peaker</code> opens that tab)\n"
