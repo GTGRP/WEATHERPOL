@@ -93,6 +93,11 @@ class WeatherBot:
         self.station_resolver = StationResolver()
         self.resolution_verifier = ResolutionVerifier() if ResolutionVerifier else None
         self.telegram = TelegramBot(position_manager=self.pm, scanner=self.scanner)
+        # Req-30: give Telegram the ML engine so /mlanalysis writes a real report.
+        try:
+            self.telegram.attach_ml(self.ml)
+        except Exception as _e:
+            log.debug(f"attach_ml failed: {_e}")
         # Route close/resolution alerts (stop-loss, take-profit, trailing-stop,
         # won/lost) through Telegram. Flip/thesis exits are notified directly in
         # run_once (their reason is relabeled 'manual' after close, so the hook
@@ -158,11 +163,12 @@ class WeatherBot:
         if time.time() - self._last_resolution_check > 300:
             self._check_resolutions()
             self.pm.check_risk_triggers()  # stop-loss / take-profit
-            flip_exits = exit_policies.check_flip_exits(self.pm)    # quick_flip book-or-cut (time-boxed)
+            flip_exits = exit_policies.check_flip_exits(self.pm)    # quick_flip +10%/-5% + ML upside
+            cap_exits = exit_policies.check_profit_caps(self.pm)    # Req-30: global 300% ML-managed cap
             thesis_exits = exit_policies.check_thesis_exits(self.pm)  # strict thesis-invalidation (very bad only)
             # Flip/thesis closes use reason 'manual' (relabeled after close), so
             # the PM _notify_close hook deliberately skips them — notify here.
-            for _p in (flip_exits or []) + (thesis_exits or []):
+            for _p in (flip_exits or []) + (cap_exits or []) + (thesis_exits or []):
                 try:
                     self.telegram.notify_close(_p)
                 except Exception as e:
