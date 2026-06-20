@@ -60,6 +60,15 @@ def _cfg(name: str, default):
 # cool/warm baskets join peak_cluster here so they group + hold identically.
 BASKET_STRATEGIES = ('peak_cluster', 'peaker_cool_basket', 'peaker_warm_basket')
 
+# Exit reasons that the dashboard's exit-policy loop notifies directly (it sends
+# ONE close alert per returned position). They are still CLOSED here for correct
+# PnL / ledger / W-L accounting, but the _notify_close callback is suppressed for
+# them so we don't double-notify. 'manual' is user-initiated from Telegram.
+DASHBOARD_NOTIFIED_REASONS = (
+    'manual', 'flip_stop', 'flip_book', 'flip_book_mid', 'flip_timeout',
+    'profit_cap_book', 'thesis_invalidated', 'ml_review_sell',
+)
+
 
 @dataclass
 class PositionRules:
@@ -215,9 +224,9 @@ class PositionManager:
         self._load_state()
         self._load_weekly()
 
-    # ═══════════════════════
+    # ============================
     # BALANCE
-    # ═════════════════════════
+    # ============================
 
     def get_balance(self) -> float:
         if Config.is_paper():
@@ -248,9 +257,9 @@ class PositionManager:
             return None
 
 
-    # ═════════════════════════
+    # ============================
     # POSITION LIFECYCLE
-    # ═════════════════════════
+    # ============================
 
     def add_position(self, token_id: str, condition_id: str, entry_price: float,
                      shares: float, cost_usd: float, market_title: str,
@@ -261,11 +270,11 @@ class PositionManager:
                      hold_to_resolution: bool = False, cluster_box: str = '',
                      flip_max_hold_minutes: float = 0.0) -> Optional[TrackedPosition]:
         """Add new position — checks balance FIRST, only tracks if order succeeds."""
-        # ═══ VALIDATE SHARES (must be positive) ═══
+        # === VALIDATE SHARES (must be positive) ===
         if shares <= 0 or cost_usd <= 0 or entry_price <= 0:
             return None
 
-        # ═══ DUPLICATE GUARD ═══
+        # === DUPLICATE GUARD ===
         # Block re-buying the SAME outcome with the SAME strategy while an order
         # for it is still open or pending. A DIFFERENT strategy on the same market
         # (e.g. spread leg vs confident) is allowed.
@@ -275,8 +284,8 @@ class PositionManager:
                 log.debug(f"⏭️  SKIP dup: {city} {bucket_label[:25]} already {p.status} [{strategy}]")
                 return None
 
-        # ═══ MIN ORDER: GTC needs ≥5 shares AND ≥ $1 notional ═══
-        # Polymarket GTC floors to 5 shares; FOK/FAK need ≥ $1. We require both
+        # === MIN ORDER: GTC needs >=5 shares AND >= $1 notional ===
+        # Polymarket GTC floors to 5 shares; FOK/FAK need >= $1. We require both
         # (max of the two) so no order is dust. Applied in PAPER too so paper
         # simulates exactly what the venue would accept — otherwise grade/liquidity
         # size-trimming can produce sub-minimum "0-share" orders that can't fill.
@@ -286,7 +295,7 @@ class PositionManager:
             cost_usd = min_notional
             shares = cost_usd / entry_price
 
-        # ═══ BALANCE CHECK (after min-order bump so it reflects real spend) ═══
+        # === BALANCE CHECK (after min-order bump so it reflects real spend) ===
         # Skip (don't retry) when balance is insufficient — surfaced at INFO so
         # it's visible. Freed balance from sells/resolutions is picked up next scan.
         if not Config.is_paper():
@@ -307,7 +316,7 @@ class PositionManager:
         else:
             tp_price = min(0.85, entry_price * 2.5)
 
-        # ═══ PAPER REALISTIC FILL ═══
+        # === PAPER REALISTIC FILL ===
         # When enabled, walk the live ask ladder so the paper fill price/size and
         # partial fills mirror what the venue would actually give us. This is the
         # difference between paper "feeling random" and matching real trading.
@@ -326,7 +335,7 @@ class PositionManager:
                 if fr.partial:
                     log.info(f"⚖️  PARTIAL FILL {city} {bucket_label[:22]} — {shares:.0f}sh @ ${entry_price:.4f} ({fill_note})")
 
-        # ═══ LIVE: Place order FIRST. GTC sits in book until filled. ═══
+        # === LIVE: Place order FIRST. GTC sits in book until filled. ===
         # CRITICAL FIX: a GTC order != a filled position. Track as PENDING
         # until the fill is confirmed. This prevents phantom positions (wle.txt bug #1).
         if not Config.is_paper():
@@ -400,7 +409,7 @@ class PositionManager:
                      f"{shares:.0f}sh @ ${entry_price:.4f} | cost=${cost_usd:.2f}"
                      + (f" | {fill_note}" if fill_note else "") + "\033[0m")
 
-        # ═══ Observability metadata (common to both modes) ═══
+        # === Observability metadata (common to both modes) ===
         pos.edge_at_entry = edge
         pos.reason = reason
         pos.grade = grade
@@ -650,7 +659,7 @@ class PositionManager:
     def get_redeemable_positions(self) -> List[TrackedPosition]:
         return [p for p in self.positions if p.redeemable and p.status in ('open', 'won')]
 
-    # ═══ Peak-cluster basket numbering ("Box 1", "Box 2", ...) ═══
+    # === Peak-cluster basket numbering ("Box 1", "Box 2", ...) ===
     def peek_cluster_box(self) -> str:
         """Label for the NEXT basket WITHOUT consuming the number."""
         return f"Box {self.cluster_box_seq + 1}"
@@ -731,9 +740,9 @@ class PositionManager:
         return {'applied': True, 'balance': bal, 'target': bal}
 
 
-    # ═════════════════════════
+    # ============================
     # STOP-LOSS & TAKE-PROFIT
-    # ═════════════════════════
+    # ============================
 
     def check_risk_triggers(self) -> List[TrackedPosition]:
         """Check all open positions for stop-loss / take-profit triggers."""
@@ -808,14 +817,21 @@ class PositionManager:
         pos.exit_price = exit_price
         pos.exit_time = datetime.now(timezone.utc)
         pos.exit_reason = reason
-        pos.status = 'sold' if reason in ('take_profit', 'stop_loss', 'trailing_stop', 'manual') else reason
+        # A settlement (won/lost) books at $1/$0; ANY other reason is a market
+        # SELL -> status 'sold'. This MUST cover every exit-policy reason
+        # (flip_stop / flip_book / flip_book_mid / flip_timeout / profit_cap_book
+        # / thesis_invalidated): previously they matched NO branch below, so PnL
+        # stayed 0.0 even on a clear loss, the paper balance was never credited,
+        # and W/L was never recorded ("even in minus it shows 0").
+        is_resolution = reason in ('won', 'lost')
+        pos.status = reason if is_resolution else 'sold'
 
         # Calculate PnL
-        if reason in ('take_profit', 'trailing_stop', 'manual', 'stop_loss'):
+        if not is_resolution:
             # Sold at market — PnL = (exit_price - entry_price) * shares
             pos.pnl = (exit_price - pos.entry_price) * pos.shares
             pos.realized_pnl = pos.pnl
-            # ── WIN/LOSS ACCOUNTING FOR MARKET EXITS ──
+            # -- WIN/LOSS ACCOUNTING FOR MARKET EXITS --
             # BUGFIX: previously ONLY 'won'/'lost' resolutions touched
             # self.wins/self.losses. Every market SELL — thesis-exit,
             # flip book-or-cut, stop-loss, trailing-stop, manual — was booked
@@ -838,7 +854,7 @@ class PositionManager:
             self.losses += 1
 
         # Credit balance in paper mode
-        if Config.is_paper() and reason in ('take_profit', 'stop_loss', 'trailing_stop', 'manual'):
+        if Config.is_paper() and not is_resolution:
             self.paper_balance += pos.cost_usd + pos.pnl
 
         # Free market context if no more open positions for this slug
@@ -858,7 +874,7 @@ class PositionManager:
         # basket ("Box N") has resolved, then emit ONE grouped resolution summary
         # (which leg won + payout, the losing legs + their loss, net basket PnL).
         # Non-basket closes notify per-pos.
-        if reason != 'manual':
+        if reason not in DASHBOARD_NOTIFIED_REASONS:
             box = getattr(pos, 'cluster_box', '') or ''
             if box and getattr(pos, 'strategy', '') in BASKET_STRATEGIES:
                 self._maybe_notify_cluster_close(box)
@@ -869,9 +885,9 @@ class PositionManager:
                     log.debug(f"close notify failed: {e}")
 
 
-    # ═════════════════════════
+    # ============================
     # RESOLUTION & REDEMPTION
-    # ═════════════════════════
+    # ============================
 
     def _maybe_notify_cluster_close(self, box: str):
         """Once ALL legs of a basket ("Box N") have resolved, emit ONE grouped
@@ -1075,9 +1091,9 @@ class PositionManager:
                 count += 1
         return count
 
-    # ═════════════════════════
+    # ============================
     # PRICE UPDATES
-    # ═════════════════════════
+    # ============================
 
     def update_prices(self):
         """Batch update prices for open positions.
@@ -1122,9 +1138,9 @@ class PositionManager:
         self._save_state()
 
 
-    # ═════════════════════════
+    # ============================
     # CONTEXT MANAGEMENT (free memory for closed markets)
-    # ═════════════════════════
+    # ============================
 
     def _maybe_free_context(self, slug: str):
         """Free market context if no open positions remain for it."""
@@ -1148,9 +1164,9 @@ class PositionManager:
         """How many active market contexts we're tracking."""
         return sum(1 for v in self.market_contexts.values() if v.active)
 
-    # ═════════════════════════
+    # ============================
     # PAPER TRADE LOG + LEDGER INVARIANT
-    # ═════════════════════════
+    # ============================
 
     def _log_paper_trade(self, action: str, pos: TrackedPosition, extra: Optional[Dict] = None):
         """Append one structured record per BUY / SELL / SETTLE / REDEEM /
@@ -1220,9 +1236,9 @@ class PositionManager:
                         f"deposited=${self.total_deposited:.2f}")
         return ok
 
-    # ═════════════════════════
+    # ============================
     # WEEKLY MEMORY
-    # ═════════════════════════
+    # ============================
 
     def record_weekly_stats(self):
         """Snapshot current week's performance for ML memory."""
@@ -1282,9 +1298,9 @@ class PositionManager:
         return " | ".join(lines)
 
 
-    # ═════════════════════════
+    # ============================
     # STATISTICS (per-position + aggregate)
-    # ═════════════════════════
+    # ============================
 
     @staticmethod
     def _closed_outcome(p) -> Optional[str]:
@@ -1309,16 +1325,54 @@ class PositionManager:
                 return 'loss'
         return None
 
+    def get_outcome_breakdown(self) -> Dict[str, Dict]:
+        """Group CLOSED positions into reporting buckets so quick scalp exits
+        are shown SEPARATELY from settlements/redeems (user request: group the
+        small losses/gains and show them apart from the main settle/redeem).
+
+          settle_win  : resolved winners still locked (status 'won')
+          redeemed    : resolved winners cashed out (status 'redeemed')
+          settle_loss : resolved losers (status 'lost')
+          small_gain  : market exits (status 'sold') booked at a PROFIT
+          small_loss  : market exits (status 'sold') booked at a LOSS
+          breakeven   : market exits at ~$0
+
+        'small_*' are the flip / thesis / stop / cap scalps; a penny exit such as
+        0.20 -> 0.02 lands in small_loss. Each value is {count, pnl}.
+        """
+        cats = {k: {'count': 0, 'pnl': 0.0} for k in (
+            'settle_win', 'redeemed', 'settle_loss',
+            'small_gain', 'small_loss', 'breakeven')}
+        for p in self.positions:
+            st = getattr(p, 'status', '')
+            pnl = p.pnl or 0.0
+            if st == 'won':
+                key = 'settle_win'
+            elif st == 'redeemed':
+                key = 'redeemed'
+            elif st == 'lost':
+                key = 'settle_loss'
+            elif st == 'sold':
+                key = ('small_gain' if pnl > 1e-9
+                       else 'small_loss' if pnl < -1e-9 else 'breakeven')
+            else:
+                continue
+            cats[key]['count'] += 1
+            cats[key]['pnl'] += pnl
+        return cats
+
     def get_stats(self) -> Dict:
         """Comprehensive stats."""
         open_pos = self.get_open_positions()
         closed = [p for p in self.positions if p.status != 'open']
         total_closed = self.wins + self.losses
         win_rate = (self.wins / max(1, total_closed)) * 100
+        open_value = sum(p.current_value for p in open_pos)
 
         return {
             'mode': 'PAPER' if Config.is_paper() else 'LIVE',
             'balance': self.get_balance(),
+            'position_value': open_value,
             'portfolio_value': self.get_portfolio_value(),
             'total_pnl': self.get_total_pnl(),
             'roi_pct': (self.get_total_pnl() / max(0.01, self.total_deposited)) * 100,
@@ -1441,9 +1495,9 @@ class PositionManager:
         return summary
 
 
-    # ═════════════════════════
+    # ============================
     # PERSISTENCE
-    # ═════════════════════════
+    # ============================
 
     def _save_state(self):
         """Save positions to disk."""
