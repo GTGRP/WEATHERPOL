@@ -866,9 +866,7 @@ class PositionManager:
             self._log_paper_trade(action, pos)
 
         # Fire the close/resolution alert callback (Telegram), if wired. Skip
-        # 'manual': exit_policies relabels flip/thesis exits AFTER close and the
-        # dashboard notifies those directly, so this avoids a double-notify with
-        # the wrong label.
+        # reasons the dashboard already notifies directly to avoid double-notify.
         # Basket legs (peak_cluster + peaker cool/warm baskets) are GROUPED:
         # instead of one won/lost alert per leg, we wait until EVERY leg of the
         # basket ("Box N") has resolved, then emit ONE grouped resolution summary
