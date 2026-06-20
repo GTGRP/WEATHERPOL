@@ -36,6 +36,9 @@ BOOL_KEYS = [
     'PORTFOLIO_GUARD_ENABLED',
     # quick-flip exit behaviour
     'QUICK_FLIP_PROFIT_ONLY_EXIT', 'QUICK_FLIP_USE_ML_EXIT',
+    'QUICK_FLIP_BOOK_OR_CUT', 'QUICK_FLIP_USE_ML_PROFIT',
+    # global ML profit cap
+    'PROFIT_CAP_ENABLED',
     # peaker / cluster behaviour
     'PEAKER_PREFER_COOL', 'PEAKER_TRADE_DECIDED', 'PEAK_CLUSTER_TRADE_DECIDED',
     # exits / liquidity / gating
@@ -43,7 +46,7 @@ BOOL_KEYS = [
     'GRADE_SIZING_ENABLED', 'SKIP_DECIDED_MARKETS',
 ]
 
-# ── Numeric gates: key -> (min, max, step, is_int) ──────────────────────────
+# ── Numeric gates: key -> (min, max, step, is_int) ─────────────────────────
 NUM_KEYS: Dict[str, tuple] = {
     # account
     'STARTING_BALANCE':            (10, 1000000, 50, False),
@@ -111,6 +114,7 @@ NUM_KEYS: Dict[str, tuple] = {
     'PEAK_CLUSTER_MAX_CENTER_PRICE': (0.50, 0.99, 0.05, False),
     'PEAK_CLUSTER_MAX_USD':        (3, 50, 1, False),
     # exits & liquidity
+    'PROFIT_CAP_ROI_PCT':          (100, 1000, 25, False),
     'THESIS_EXIT_MAX_ROI_PCT':     (-99, -50, 5, False),
     'TRAILING_STOP_PCT':           (5, 90, 5, False),
     'TRAILING_MIN_PEAK_MULT':      (1.0, 10.0, 0.5, False),
@@ -158,6 +162,7 @@ GROUPS: List[dict] = [
     ]},
     {'id': 'quickflip', 'tab': 'Flip', 'title': 'Quick-Flip', 'keys': [
         'QUICK_FLIP_PROFIT_ONLY_EXIT', 'QUICK_FLIP_USE_ML_EXIT',
+        'QUICK_FLIP_BOOK_OR_CUT', 'QUICK_FLIP_USE_ML_PROFIT',
         'QUICK_FLIP_MIN_EDGE', 'QUICK_FLIP_MAX_PER_MARKET',
         'QUICK_FLIP_MAX_CONCURRENT', 'QUICK_FLIP_MAX_HOLD_MIN',
         'QUICK_FLIP_TARGET_ROI', 'QUICK_FLIP_STOP_LOSS_PCT', 'QUICK_FLIP_MAX_SIZE_USD',
@@ -181,8 +186,8 @@ GROUPS: List[dict] = [
     ]},
     {'id': 'exits', 'tab': 'Exits', 'title': 'Exits & Liquidity', 'keys': [
         'THESIS_EXIT_ENABLED', 'LIQUIDITY_GUARD_ENABLED', 'LIQUIDITY_STRICT_BLOCK',
-        'GRADE_SIZING_ENABLED', 'SKIP_DECIDED_MARKETS',
-        'THESIS_EXIT_MAX_ROI_PCT', 'TRAILING_STOP_PCT', 'TRAILING_MIN_PEAK_MULT',
+        'GRADE_SIZING_ENABLED', 'SKIP_DECIDED_MARKETS', 'PROFIT_CAP_ENABLED',
+        'THESIS_EXIT_MAX_ROI_PCT', 'PROFIT_CAP_ROI_PCT', 'TRAILING_STOP_PCT', 'TRAILING_MIN_PEAK_MULT',
         'EARLY_PROFIT_THRESHOLD', 'LIQUIDITY_THIN_SIZE_MULT', 'HIGH_TEMP_LOCK_HOUR',
     ]},
     {'id': 'sniper', 'tab': 'Sniper', 'title': 'Sniper / Basket', 'keys': [
