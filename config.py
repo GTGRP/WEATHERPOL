@@ -376,6 +376,16 @@ class Config:
     QUICK_FLIP_LADDER_RUN_ROI_PCT = float(os.getenv('QUICK_FLIP_LADDER_RUN_ROI_PCT', '30.0'))  # let strong flips run toward this
     QUICK_FLIP_FORCE_BOOK_ROI_PCT = float(os.getenv('QUICK_FLIP_FORCE_BOOK_ROI_PCT', '30.0'))  # always book at/above this (don't round-trip a winner)
     QUICK_FLIP_STOP_LOSS_PCT = float(os.getenv('QUICK_FLIP_STOP_LOSS_PCT', '-5.0'))      # Req-29: book a quick-flip LOSS at this ROI% (quick +10% up / -5% down)
+    QUICK_FLIP_BOOK_OR_CUT = os.getenv('QUICK_FLIP_BOOK_OR_CUT', '1') == '1'             # Req-30: cut a FLAT flip at the hold cap (OFF = let it ride to resolution, don't cut opportunities)
+    QUICK_FLIP_USE_ML_PROFIT = os.getenv('QUICK_FLIP_USE_ML_PROFIT', '1') == '1'         # Req-30: at the +profit target, let ML decide BOOK vs HOLD-for-more (no ML -> book at target)
+
+    # ===================================================================
+    # Req-30 GLOBAL PROFIT CAP (any strategy). A position once ran 500% -> 0.
+    # Above the cap, ML decides HOLD-to-settle vs BOOK now. If ML unavailable,
+    # let it settle (ride to resolution) per spec.
+    # ===================================================================
+    PROFIT_CAP_ENABLED = os.getenv('PROFIT_CAP_ENABLED', '1') == '1'
+    PROFIT_CAP_ROI_PCT = float(os.getenv('PROFIT_CAP_ROI_PCT', '300.0'))                 # ML-managed ceiling on unrealized ROI%
 
     # ===================================================================
     # PEAK_CLUSTER - parallel any-one-wins basket. Estimate the peak bucket
