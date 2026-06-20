@@ -121,6 +121,14 @@ class Config:
     # endpoints are cooling down (comma-sep; supplements OPEN_METEO_ENDPOINTS).
     OPEN_METEO_FAILOVER_ENDPOINTS = [e.strip() for e in os.getenv('OPEN_METEO_FAILOVER_ENDPOINTS', '').split(',') if e.strip()]
 
+    # WEATHER-DATA BUY GUARD (Req-30) - NEVER place a buy without enough live
+    # weather data. fetch_all() returns nothing when every provider failed / is
+    # cooling down (the "Open-Meteo cooling down" / "observed fetch returned no
+    # data" errors). Require at least this many forecast models before a market
+    # is evaluated for buys; this single choke point protects EVERY strategy.
+    WEATHER_BUY_GUARD_ENABLED = os.getenv('WEATHER_BUY_GUARD_ENABLED', '1') == '1'
+    WEATHER_MIN_FORECAST_MODELS = int(os.getenv('WEATHER_MIN_FORECAST_MODELS', '1'))
+
     # ===================================================================
     # TRADING PARAMETERS
     # ===================================================================
@@ -368,6 +376,9 @@ class Config:
     # --- Req-28 NO-side flips ---
     QUICK_FLIP_NO_SIDE = os.getenv('QUICK_FLIP_NO_SIDE', '1') == '1'                      # also hunt mispriced NO tokens for the 10% flip
     QUICK_FLIP_NO_MIN_EDGE = float(os.getenv('QUICK_FLIP_NO_MIN_EDGE', '0.10'))           # min edge for a NO-side flip candidate
+    # --- Req-30 NEW-MARKET hunting: catch freshly-appeared mispricings early ---
+    QUICK_FLIP_NEW_MARKET_BOOST = float(os.getenv('QUICK_FLIP_NEW_MARKET_BOOST', '0.10')) # confidence boost while a market is still "new"
+    QUICK_FLIP_NEW_MARKET_WINDOW_MIN = float(os.getenv('QUICK_FLIP_NEW_MARKET_WINDOW_MIN', '60'))  # minutes a market counts as new
     # --- Req-27 PROFIT-ONLY LADDERED EXIT (trading/exit_policies.check_flip_exits) ---
     QUICK_FLIP_PROFIT_ONLY_EXIT = os.getenv('QUICK_FLIP_PROFIT_ONLY_EXIT', '1') == '1'    # never book a flip at a loss/breakeven on the timer
     QUICK_FLIP_USE_ML_EXIT = os.getenv('QUICK_FLIP_USE_ML_EXIT', '1') == '1'              # let the ML decide sell-small vs run-more
@@ -376,6 +387,16 @@ class Config:
     QUICK_FLIP_LADDER_RUN_ROI_PCT = float(os.getenv('QUICK_FLIP_LADDER_RUN_ROI_PCT', '30.0'))  # let strong flips run toward this
     QUICK_FLIP_FORCE_BOOK_ROI_PCT = float(os.getenv('QUICK_FLIP_FORCE_BOOK_ROI_PCT', '30.0'))  # always book at/above this (don't round-trip a winner)
     QUICK_FLIP_STOP_LOSS_PCT = float(os.getenv('QUICK_FLIP_STOP_LOSS_PCT', '-5.0'))      # Req-29: book a quick-flip LOSS at this ROI% (quick +10% up / -5% down)
+    QUICK_FLIP_BOOK_OR_CUT = os.getenv('QUICK_FLIP_BOOK_OR_CUT', '1') == '1'             # Req-30: cut a FLAT flip at the hold cap (OFF = let it ride to resolution, don't cut opportunities)
+    QUICK_FLIP_USE_ML_PROFIT = os.getenv('QUICK_FLIP_USE_ML_PROFIT', '1') == '1'         # Req-30: at the +profit target, let ML decide BOOK vs HOLD-for-more (no ML -> book at target)
+
+    # ===================================================================
+    # Req-30 GLOBAL PROFIT CAP (any strategy). A position once ran 500% -> 0.
+    # Above the cap, ML decides HOLD-to-settle vs BOOK now. If ML unavailable,
+    # let it settle (ride to resolution) per spec.
+    # ===================================================================
+    PROFIT_CAP_ENABLED = os.getenv('PROFIT_CAP_ENABLED', '1') == '1'
+    PROFIT_CAP_ROI_PCT = float(os.getenv('PROFIT_CAP_ROI_PCT', '300.0'))                 # ML-managed ceiling on unrealized ROI%
 
     # ===================================================================
     # PEAK_CLUSTER - parallel any-one-wins basket. Estimate the peak bucket
@@ -520,6 +541,9 @@ class Config:
     # ===================================================================
     SCAN_INTERVAL_SECONDS = int(os.getenv('SCAN_INTERVAL_SECONDS', '60'))
     SCAN_DAYS_AHEAD = int(os.getenv('SCAN_DAYS_AHEAD', '3'))
+    # Req-30 SUMMARY TIMER - push a periodic Telegram status summary every N
+    # minutes (0 = off). Set live from /settings (e.g. 15 / 30 / 60).
+    SUMMARY_INTERVAL_MIN = int(os.getenv('SUMMARY_INTERVAL_MIN', '0'))
 
     # ===================================================================
     # PAPER-REALISM - make the dry run behave like real trading
@@ -549,9 +573,32 @@ class Config:
     # ===================================================================
     # ML DECISION ENGINE (GPT-5.5 via Freemodel)
     # ===================================================================
-    ML_API_URL = os.getenv('ML_API_URL', 'https://vip-sg.freemodel.dev/v1')
+    ML_API_URL = os.getenv('ML_API_URL', 'https://api.freemodel.dev/v1')
     ML_API_KEY = os.getenv('ML_API_KEY', '')
-    ML_MODEL = os.getenv('ML_MODEL', 'gpt-5.5')
+    # Decision model: used for the FREQUENT per-market / per-position calls. Default
+    # gpt-5.4-mini = fast + cheap. The heavy reasoning model (gpt-5.5) is reserved
+    # for the occasional /mlanalysis narrative (ML_ANALYSIS_MODEL) so the scan loop
+    # stays snappy and the bot isn't waiting ~7s on every market.
+    ML_MODEL = os.getenv('ML_MODEL', 'gpt-5.4-mini')
+    ML_ANALYSIS_MODEL = os.getenv('ML_ANALYSIS_MODEL', 'gpt-5.5')
+    # /mlanalysis on/off (the LLM narrative report). When OFF a local heuristic
+    # report is used instead (no API call).
+    ML_ANALYSIS_ENABLED = os.getenv('ML_ANALYSIS_ENABLED', '1') == '1'
+    # The Freemodel gpt-5.x models are REASONING models: they emit a <think>...</think>
+    # block (~7s) BEFORE the JSON answer. Give them enough tokens + time, otherwise
+    # the JSON truncates / the call times out and the bot silently falls back to the
+    # local rules even though the key is set.
+    ML_QUERY_TIMEOUT = float(os.getenv('ML_QUERY_TIMEOUT', '30'))
+    ML_DECISION_MAX_TOKENS = int(os.getenv('ML_DECISION_MAX_TOKENS', '700'))
+    ML_ANALYSIS_MAX_TOKENS = int(os.getenv('ML_ANALYSIS_MAX_TOKENS', '1200'))
+    # Extra ML wiring (Req-31): let ML review OPEN positions for an early HOLD/SELL,
+    # and prioritise which cities get evaluated first each scan (ordering only).
+    ML_REVIEW_POSITIONS = os.getenv('ML_REVIEW_POSITIONS', '1') == '1'
+    ML_REVIEW_SELL_CONF = float(os.getenv('ML_REVIEW_SELL_CONF', '0.72'))   # only a CONFIDENT SELL acts
+    ML_REVIEW_MIN_HOLD_MIN = float(os.getenv('ML_REVIEW_MIN_HOLD_MIN', '20'))
+    ML_REVIEW_MIN_MTC_MIN = float(os.getenv('ML_REVIEW_MIN_MTC_MIN', '45'))
+    ML_REVIEW_MAX_PER_SCAN = int(os.getenv('ML_REVIEW_MAX_PER_SCAN', '6'))
+    ML_SELECT_MARKETS = os.getenv('ML_SELECT_MARKETS', '1') == '1'
 
     # ===================================================================
     # LOGGING

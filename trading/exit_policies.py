@@ -1,30 +1,26 @@
 """
 Scoped exit policies that run in the main loop WITHOUT modifying PositionManager.
 
-Two exits the user asked for:
+Three exits, all reusing PositionManager._close_position(pos, price, reason) so
+the conserved ledger, paper-balance credit, paper-trade log and PnL accounting
+stay correct. The descriptive reason is passed STRAIGHT INTO _close_position so
+paper_trades.jsonl records the true exit reason.
 
-1. quick_flip PROFIT-ONLY LADDERED exit (Req-27): a flip is an information-
-   arbitrage trade and must SELL ONLY IN PROFIT. The ML (XGBoost / GPT) decides
-   whether to BOOK A SMALL profit now or let it RUN for more, laddered at
-   ~10% / 20% / 30% ROI. Big runners (>= force-book ROI) are ALWAYS booked so we
-   never round-trip a winner back to breakeven. A flip that is NOT in profit by
-   its hold cap is NEVER booked at a loss or breakeven (the user: "book / flip
-   exit closing in loss and breakeven is bad") -- instead it CONVERTS to
-   hold-to-resolution and rides to settlement. Set QUICK_FLIP_PROFIT_ONLY_EXIT=0
-   for the legacy book-or-cut-at-market behaviour.
+1. quick_flip exit (Req-30): a flip is a quick +10% / -5% trade.
+   - <= STOP (-5%): cut the loss immediately.
+   - >= TARGET (+10%): let the ML decide BOOK now vs HOLD for more (20/40/50/200%)
+     based on peak, edge, time-left and city win-rate. If the ML is unavailable
+     it BOOKS at the target (never round-trips a winner).
+   - flat (between stop and target) at the hold cap: BOOK-OR-CUT. When
+     QUICK_FLIP_BOOK_OR_CUT is ON we cut it at market (good for stale markets);
+     when OFF we let it ride to resolution instead of cutting an opportunity.
 
-2. STRICT thesis-invalidation: the observed / hold-to-resolution book is the
-   profit driver, so MOST positions keep holding to resolution. Only the VERY BAD
-   ones exit early -- a meaningful (non-tail) position whose price has COLLAPSED
-   (the market now says we're almost certainly wrong) AND that still has a real
-   bid to sell into, with time left before close. Cheap tails, stale prices,
-   near-close positions, and quick_flips all keep holding.
+2. GLOBAL PROFIT CAP (Req-30): any position above PROFIT_CAP_ROI_PCT (default
+   300%) is handed to the ML: HOLD-to-settle for even more, or BOOK now to lock
+   the gain (a position once ran 500% -> 0). With no ML it is left to settle.
 
-Both reuse PositionManager._close_position(pos, price, reason) so the conserved
-ledger, paper-balance credit, paper-trade log and PnL accounting stay correct.
-The descriptive reason is now passed STRAIGHT INTO _close_position (instead of
-being overwritten on pos.exit_reason AFTER the close logs), so paper_trades.jsonl
-records the true exit reason instead of a generic 'manual' (Req-27 logging fix).
+3. STRICT thesis-invalidation: only VERY BAD, non-tail, exitable positions sell
+   early; everything else holds to resolution.
 """
 
 from logger import log
@@ -39,10 +35,7 @@ def _cfg(name, default):
     return getattr(Config, name, default) if Config is not None else default
 
 
-# Lazy ML engine singleton so flips can ask "sell small vs run more" without the
-# dashboard having to thread its engine through. Safe no-op when no API key: the
-# engine falls back to its local model / a HOLD default, in which case the rules
-# ladder below still books at the force-book rung and when the window expires.
+# Lazy ML engine singleton.
 _ml_engine = None
 _ml_init_failed = False
 
@@ -58,61 +51,127 @@ def _get_ml():
         _ml_engine = MLDecisionEngine()
     except Exception as e:  # pragma: no cover
         _ml_init_failed = True
-        log.debug(f"flip-exit ML init failed: {e}")
+        log.debug(f"exit ML init failed: {e}")
         return None
     return _ml_engine
 
 
-def _ml_says_book(pos) -> bool:
-    """Ask the ML engine whether to SELL (book) this in-profit flip now or HOLD
-    for more. Returns True to book, False to keep running. Defaults to keep
-    running when the ML is unavailable -- the rules ladder still force-books big
-    runners and books everything once the hold window expires."""
+def _peak_roi(pos):
+    entry = pos.entry_price
+    peak = getattr(pos, 'peak_price', None)
+    if peak and entry and entry > 0:
+        return (peak - entry) / entry * 100.0
+    return pos.roi_pct
+
+
+def _ml_profit(pos, mode):
+    """Ask the ML whether to BOOK or HOLD an in-profit position. mode in
+    {'ladder','cap'}. Returns the decision dict; degrades to the engine's local
+    fallback (BOOK for ladder, HOLD/settle for cap) when the API is unavailable."""
     ml = _get_ml()
     if ml is None:
-        return False
+        return {'action': 'HOLD' if mode == 'cap' else 'BOOK', 'reason': 'no ML'}
     try:
         mtc = pos.minutes_to_close
         res_hours = (mtc / 60.0) if mtc is not None else 24.0
-        res = ml.review_position(
-            pos.city, pos.bucket_label, pos.entry_price, pos.current_price,
-            pos.hold_hours, res_hours,
+        return ml.decide_profit_hold(
+            city=pos.city, bucket_label=pos.bucket_label, strategy=pos.strategy,
+            entry_price=pos.entry_price, current_price=pos.current_price,
+            roi_pct=pos.roi_pct, peak_roi=_peak_roi(pos),
+            hold_hours=pos.hold_hours, resolution_hours=res_hours,
+            edge=getattr(pos, 'edge_at_entry', None), mode=mode,
         )
-        return str(res.get('action', 'HOLD')).upper() == 'SELL'
     except Exception as e:
-        log.debug(f"flip-exit ML review failed: {e}")
-        return False
+        log.debug(f"ml profit decision failed: {e}")
+        return {'action': 'HOLD' if mode == 'cap' else 'BOOK', 'reason': 'err'}
 
 
-def check_flip_exits(pm):
-    """Quick-flip exit: book at >= target ROI (+10%), cut at <= stop ROI (-5%).
-
-    Per the user's Req-29 instruction a flip is a quick +10% / -5% trade. The ML
-    gates whether to BOOK NOW or let a winner RUN toward a higher rung; big
-    runners (>= force-book) are always booked; if neither target nor stop is hit
-    by the hold window it books at market. This REPLACES the earlier
-    profit-only-hold behaviour (flips no longer convert to hold-to-resolution).
-    """
-    if not _cfg('QUICK_FLIP_TIME_EXIT', True):
+def check_ml_reviews(pm):
+    """Req-31: the ML reviews each eligible OPEN position and may trigger an
+    EARLY SELL when it is CONFIDENT the position should be cut. Conservative by
+    design so it never forces a bad exit:
+      - only when ML_REVIEW_POSITIONS is on and the API is live;
+      - skips quick_flip (its own ladder handles it), hold-to-resolution legs,
+        stale-price and zero-price positions;
+      - requires a minimum hold time and minimum time-to-close;
+      - only acts on a SELL with confidence >= ML_REVIEW_SELL_CONF;
+      - caps ML calls per scan (budget / latency guard).
+    HOLD or any low-confidence answer changes nothing."""
+    if not _cfg('ML_REVIEW_POSITIONS', False):
         return []
-    default_max = float(_cfg('QUICK_FLIP_MAX_HOLD_MIN', 120))
-    profit_only = bool(_cfg('QUICK_FLIP_PROFIT_ONLY_EXIT', True))
-    use_ml = bool(_cfg('QUICK_FLIP_USE_ML_EXIT', True))
-    target = float(_cfg('QUICK_FLIP_TARGET_ROI', 10.0))   # book at >= +10%
-    min_book = target
-    stop = float(_cfg('QUICK_FLIP_STOP_LOSS_PCT', -5.0))   # cut at <= -5%
-    mid_book = float(_cfg('QUICK_FLIP_LADDER_MID_ROI_PCT', 20.0))
-    force_book = float(_cfg('QUICK_FLIP_FORCE_BOOK_ROI_PCT', 30.0))
+    ml = _get_ml()
+    if ml is None or not getattr(ml, 'enabled', False):
+        return []
+    sell_conf = float(_cfg('ML_REVIEW_SELL_CONF', 0.72))
+    min_hold = float(_cfg('ML_REVIEW_MIN_HOLD_MIN', 20.0))
+    min_mtc = float(_cfg('ML_REVIEW_MIN_MTC_MIN', 45.0))
+    budget = int(_cfg('ML_REVIEW_MAX_PER_SCAN', 6))
     triggered = []
-    converted = False
+    used = 0
     for pos in pm.get_open_positions():
-        if pos.strategy != 'quick_flip':
+        if used >= budget:
+            break
+        if pos.strategy == 'quick_flip':
             continue
-        # Flips already converted to hold-to-resolution ride to settlement.
         if getattr(pos, 'hold_to_resolution', False):
             continue
         if getattr(pos, 'current_price_stale', False):
-            continue  # don't act on a frozen / garbage price
+            continue
+        if pos.current_price <= 0:
+            continue
+        if pos.hold_hours * 60.0 < min_hold:
+            continue
+        mtc = pos.minutes_to_close
+        if mtc is not None and mtc < min_mtc:
+            continue
+        used += 1
+        try:
+            res_hours = (mtc / 60.0) if mtc is not None else 24.0
+            d = ml.review_position(
+                pos.city, pos.bucket_label, pos.entry_price, pos.current_price,
+                pos.hold_hours, res_hours, strategy=pos.strategy,
+                roi_pct=pos.roi_pct, peak_roi=_peak_roi(pos),
+                edge=getattr(pos, 'edge_at_entry', None),
+            )
+        except Exception as e:
+            log.debug(f"ml review failed: {e}")
+            continue
+        action = str(d.get('action', 'HOLD')).upper()
+        try:
+            conf = float(d.get('confidence', d.get('conf', 0.0)) or 0.0)
+        except (ValueError, TypeError):
+            conf = 0.0
+        if action == 'SELL' and conf >= sell_conf:
+            pm._close_position(pos, pos.current_price, 'ml_review_sell')
+            triggered.append(pos)
+            log.info(f"ML REVIEW SELL ({conf:.0%}): {pos.city} {pos.bucket_label[:28]} "
+                     f"ROI={pos.roi_pct:+.0f}% @ ${pos.current_price:.4f} "
+                     f"PnL=${pos.pnl:+.2f} — {str(d.get('reason', ''))[:48]}")
+    if triggered:
+        pm._save_state()
+        pm._assert_ledger()
+    return triggered
+
+
+def check_flip_exits(pm):
+    """quick_flip +10% / -5% exit with ML-managed upside."""
+    if not _cfg('QUICK_FLIP_TIME_EXIT', True):
+        return []
+    default_max = float(_cfg('QUICK_FLIP_MAX_HOLD_MIN', 120))
+    use_ml = bool(_cfg('QUICK_FLIP_USE_ML_PROFIT', True))
+    book_or_cut = bool(_cfg('QUICK_FLIP_BOOK_OR_CUT', True))
+    target = float(_cfg('QUICK_FLIP_TARGET_ROI', 10.0))     # book / decide at >= +10%
+    stop = float(_cfg('QUICK_FLIP_STOP_LOSS_PCT', -5.0))    # cut at <= -5%
+    mid_book = float(_cfg('QUICK_FLIP_LADDER_MID_ROI_PCT', 20.0))
+    triggered = []
+    changed = False
+    for pos in pm.get_open_positions():
+        if pos.strategy != 'quick_flip':
+            continue
+        if getattr(pos, 'hold_to_resolution', False):
+            continue
+        if getattr(pos, 'current_price_stale', False):
+            continue
         price = pos.current_price
         if price <= 0:
             continue
@@ -121,52 +180,85 @@ def check_flip_exits(pm):
         held_min = pos.hold_hours * 60.0
         window_over = held_min >= max_hold
 
-        # 0) STOP-LOSS: cut a flip that has dropped to the stop (-5%). A flip is
-        # a quick +10% / -5% trade, so we no longer convert losers to hold.
+        # 0) STOP-LOSS: cut a flip that has dropped to the stop (-5%).
         if roi <= stop:
             pm._close_position(pos, price, 'flip_stop')
             triggered.append(pos)
-            log.info(f"🛑 FLIP STOP: {pos.city} {pos.bucket_label[:28]} "
+            log.info(f"FLIP STOP: {pos.city} {pos.bucket_label[:28]} "
                      f"ROI={roi:+.1f}% @ ${price:.4f} PnL=${pos.pnl:+.2f}")
             continue
 
-        # 1) Always book a big runner (don't round-trip a winner).
-        if roi >= force_book:
-            pm._close_position(pos, price, 'flip_book_run')
-            triggered.append(pos)
-            log.info(f"⏲️  FLIP BOOK-RUN: {pos.city} {pos.bucket_label[:28]} "
-                     f"ROI={roi:+.0f}% @ ${price:.4f} PnL=${pos.pnl:+.2f}")
-            continue
-
-        # 2) In profit on a lower rung: ML decides sell-small vs run-more.
-        if roi >= min_book:
-            sell = True
-            if use_ml and not window_over:
-                # Let it run toward the next rung unless the ML says book now.
-                sell = _ml_says_book(pos)
-            if sell:
-                reason = 'flip_book_mid' if roi >= mid_book else 'flip_book_small'
+        # 1) At/above the profit target: ML decides BOOK vs HOLD-for-more.
+        if roi >= target:
+            book = True
+            if use_ml:
+                d = _ml_profit(pos, 'ladder')
+                book = str(d.get('action', 'BOOK')).upper() == 'BOOK'
+                if not book:
+                    tgt = d.get('target_roi', roi)
+                    log.info(f"FLIP HOLD (ML run->{tgt:.0f}%): {pos.city} "
+                             f"{pos.bucket_label[:28]} ROI={roi:+.0f}%")
+            if book:
+                reason = 'flip_book_mid' if roi >= mid_book else 'flip_book'
                 pm._close_position(pos, price, reason)
                 triggered.append(pos)
-                log.info(f"⏲️  FLIP BOOK ({reason.split('_')[-1]}): {pos.city} "
-                         f"{pos.bucket_label[:28]} ROI={roi:+.0f}% @ ${price:.4f} "
-                         f"PnL=${pos.pnl:+.2f}")
+                log.info(f"FLIP BOOK: {pos.city} {pos.bucket_label[:28]} "
+                         f"ROI={roi:+.0f}% @ ${price:.4f} PnL=${pos.pnl:+.2f}")
             continue
 
-        # 3) Between stop and target: keep waiting until the hold window expires,
-        # then book at market (a small profit <+10%, or a small loss still above
-        # the -5% stop). Flips no longer convert to hold-to-resolution.
+        # 2) Flat (between stop and target): BOOK-OR-CUT at the hold cap.
         if not window_over:
             continue
-        pm._close_position(pos, price, 'flip_timeout')
-        triggered.append(pos)
-        log.info(f"⏲️  FLIP TIMEOUT: {pos.city} {pos.bucket_label[:28]} "
-                 f"held {held_min:.0f}m ROI={roi:+.1f}% @ ${price:.4f} "
-                 f"PnL=${pos.pnl:+.2f}")
+        if book_or_cut:
+            pm._close_position(pos, price, 'flip_timeout')
+            triggered.append(pos)
+            log.info(f"FLIP TIMEOUT (book-or-cut): {pos.city} "
+                     f"{pos.bucket_label[:28]} held {held_min:.0f}m ROI={roi:+.1f}% "
+                     f"@ ${price:.4f} PnL=${pos.pnl:+.2f}")
+        else:
+            pos.hold_to_resolution = True
+            changed = True
+            log.info(f"FLIP HOLD->resolution (book-or-cut OFF): {pos.city} "
+                     f"{pos.bucket_label[:28]} ROI={roi:+.1f}%")
     if triggered:
         pm._save_state()
         pm._assert_ledger()
-    elif converted:
+    elif changed:
+        pm._save_state()
+    return triggered
+
+
+def check_profit_caps(pm):
+    """GLOBAL cap (any strategy): above PROFIT_CAP_ROI_PCT, ML decides HOLD-to-
+    settle vs BOOK. With no ML, let it settle (ride to resolution)."""
+    if not _cfg('PROFIT_CAP_ENABLED', True):
+        return []
+    cap = float(_cfg('PROFIT_CAP_ROI_PCT', 300.0))
+    triggered = []
+    changed = False
+    for pos in pm.get_open_positions():
+        if getattr(pos, 'current_price_stale', False):
+            continue
+        if pos.current_price <= 0:
+            continue
+        roi = pos.roi_pct
+        if roi < cap:
+            continue
+        d = _ml_profit(pos, 'cap')
+        if str(d.get('action', 'HOLD')).upper() == 'BOOK':
+            pm._close_position(pos, pos.current_price, 'profit_cap_book')
+            triggered.append(pos)
+            log.info(f"CAP BOOK: {pos.city} {pos.bucket_label[:28]} "
+                     f"ROI={roi:+.0f}% @ ${pos.current_price:.4f} PnL=${pos.pnl:+.2f}")
+        elif not getattr(pos, 'hold_to_resolution', False):
+            pos.hold_to_resolution = True
+            changed = True
+            log.info(f"CAP HOLD->settle: {pos.city} {pos.bucket_label[:28]} "
+                     f"ROI={roi:+.0f}% (ride to resolution)")
+    if triggered:
+        pm._save_state()
+        pm._assert_ledger()
+    elif changed:
         pm._save_state()
     return triggered
 
@@ -183,23 +275,22 @@ def check_thesis_exits(pm):
     triggered = []
     for pos in pm.get_open_positions():
         if pos.strategy == 'quick_flip':
-            continue  # flips use their own profit-only exit
+            continue
         if getattr(pos, 'current_price_stale', False):
-            continue  # don't act on a stale price
+            continue
         if pos.entry_price < min_entry:
-            continue  # cheap tail = the edge -> hold to resolution
+            continue
         if pos.current_price < min_bid:
-            continue  # no real bid to exit into -> hold to resolution
+            continue
         mtc = pos.minutes_to_close
         if mtc is not None and mtc < min_mtc:
-            continue  # too close to close -> let it resolve
+            continue
         if pos.roi_pct > max_roi:
-            continue  # not "very bad" yet -> keep holding
+            continue
         pm._close_position(pos, pos.current_price, 'thesis_invalidated')
         triggered.append(pos)
-        log.info(f"🚫 THESIS EXIT: {pos.city} {pos.bucket_label[:28]} "
-                 f"ROI={pos.roi_pct:.0f}% @ ${pos.current_price:.4f} "
-                 f"(very bad — cut to recover residual)")
+        log.info(f"THESIS EXIT: {pos.city} {pos.bucket_label[:28]} "
+                 f"ROI={pos.roi_pct:.0f}% @ ${pos.current_price:.4f} (very bad - cut)")
     if triggered:
         pm._save_state()
         pm._assert_ledger()

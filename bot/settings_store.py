@@ -32,10 +32,14 @@ BOOL_KEYS = [
     'QUICK_FLIP_ENABLED', 'PEAK_CLUSTER_ENABLED', 'PEAKER_ENABLED',
     'CONFIDENT_ENABLED', 'SNIPER_ENABLED', 'SPREAD_ENABLED', 'STABILITY_ENABLED',
     # ml / ops
-    'ML_ENABLED', 'ML_DECISION_ENABLED', 'AUTO_REDEEM_ENABLED',
+    'ML_ENABLED', 'ML_DECISION_ENABLED', 'ML_ANALYSIS_ENABLED',
+    'ML_REVIEW_POSITIONS', 'ML_SELECT_MARKETS', 'AUTO_REDEEM_ENABLED',
     'PORTFOLIO_GUARD_ENABLED',
     # quick-flip exit behaviour
     'QUICK_FLIP_PROFIT_ONLY_EXIT', 'QUICK_FLIP_USE_ML_EXIT',
+    'QUICK_FLIP_BOOK_OR_CUT', 'QUICK_FLIP_USE_ML_PROFIT',
+    # global ML profit cap
+    'PROFIT_CAP_ENABLED',
     # peaker / cluster behaviour
     'PEAKER_PREFER_COOL', 'PEAKER_TRADE_DECIDED', 'PEAK_CLUSTER_TRADE_DECIDED',
     # exits / liquidity / gating
@@ -47,6 +51,8 @@ BOOL_KEYS = [
 NUM_KEYS: Dict[str, tuple] = {
     # account
     'STARTING_BALANCE':            (10, 1000000, 50, False),
+    # ops
+    'SUMMARY_INTERVAL_MIN':        (0, 240, 15, True),
     # risk & sizing
     'MAX_BET_PCT':                 (0.05, 1.00, 0.05, False),
     'MAX_POSITIONS':               (1, 50, 1, True),
@@ -85,6 +91,7 @@ NUM_KEYS: Dict[str, tuple] = {
     'QUICK_FLIP_FORCE_BOOK_ROI_PCT': (10, 100, 5, False),
     'QUICK_FLIP_STOP_LOSS_PCT':    (-30, -1, 1, False),
     'QUICK_FLIP_STALE_BOOST':      (0.00, 0.50, 0.05, False),
+    'QUICK_FLIP_NEW_MARKET_BOOST': (0.00, 0.50, 0.05, False),
     # peaker (merged peak + safety)
     'PEAKER_MIN_GRADE':            (0.00, 1.00, 0.05, False),
     'PEAKER_MIN_CONFIDENCE':       (0.00, 1.00, 0.02, False),
@@ -111,6 +118,7 @@ NUM_KEYS: Dict[str, tuple] = {
     'PEAK_CLUSTER_MAX_CENTER_PRICE': (0.50, 0.99, 0.05, False),
     'PEAK_CLUSTER_MAX_USD':        (3, 50, 1, False),
     # exits & liquidity
+    'PROFIT_CAP_ROI_PCT':          (100, 1000, 25, False),
     'THESIS_EXIT_MAX_ROI_PCT':     (-99, -50, 5, False),
     'TRAILING_STOP_PCT':           (5, 90, 5, False),
     'TRAILING_MIN_PEAK_MULT':      (1.0, 10.0, 0.5, False),
@@ -130,6 +138,12 @@ NUM_KEYS: Dict[str, tuple] = {
     'STABILITY_EARLY_EXIT_PRICE':  (0.50, 0.99, 0.05, False),
 }
 
+# ── String/choice settings: key -> list of allowed values (first = default) ──
+STR_KEYS: Dict[str, List[str]] = {
+    'ML_MODEL':          ['gpt-5.4-mini', 'gpt-5.4', 'gpt-5.5', 'gpt-5.3-codex'],
+    'ML_ANALYSIS_MODEL': ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex'],
+}
+
 # ── Tabs for the Telegram /settings panel. Each group lists the keys (toggles
 # and/or gates) shown when that tab is active, in display order. ────────────
 GROUPS: List[dict] = [
@@ -139,6 +153,12 @@ GROUPS: List[dict] = [
         'QUICK_FLIP_ENABLED', 'PEAK_CLUSTER_ENABLED', 'PEAKER_ENABLED',
         'CONFIDENT_ENABLED', 'SNIPER_ENABLED', 'SPREAD_ENABLED', 'STABILITY_ENABLED',
         'ML_ENABLED', 'ML_DECISION_ENABLED', 'AUTO_REDEEM_ENABLED',
+        'SUMMARY_INTERVAL_MIN',
+    ]},
+    {'id': 'ml', 'tab': 'ML', 'title': 'ML / AI Engine', 'keys': [
+        'ML_ENABLED', 'ML_DECISION_ENABLED', 'ML_ANALYSIS_ENABLED',
+        'ML_REVIEW_POSITIONS', 'ML_SELECT_MARKETS',
+        'ML_MODEL', 'ML_ANALYSIS_MODEL',
     ]},
     {'id': 'risk', 'tab': 'Risk', 'title': 'Risk & Sizing', 'keys': [
         'PORTFOLIO_GUARD_ENABLED',
@@ -158,12 +178,13 @@ GROUPS: List[dict] = [
     ]},
     {'id': 'quickflip', 'tab': 'Flip', 'title': 'Quick-Flip', 'keys': [
         'QUICK_FLIP_PROFIT_ONLY_EXIT', 'QUICK_FLIP_USE_ML_EXIT',
+        'QUICK_FLIP_BOOK_OR_CUT', 'QUICK_FLIP_USE_ML_PROFIT',
         'QUICK_FLIP_MIN_EDGE', 'QUICK_FLIP_MAX_PER_MARKET',
         'QUICK_FLIP_MAX_CONCURRENT', 'QUICK_FLIP_MAX_HOLD_MIN',
         'QUICK_FLIP_TARGET_ROI', 'QUICK_FLIP_STOP_LOSS_PCT', 'QUICK_FLIP_MAX_SIZE_USD',
         'QUICK_FLIP_MIN_BOOK_ROI_PCT', 'QUICK_FLIP_LADDER_MID_ROI_PCT',
         'QUICK_FLIP_LADDER_RUN_ROI_PCT', 'QUICK_FLIP_FORCE_BOOK_ROI_PCT',
-        'QUICK_FLIP_STALE_BOOST',
+        'QUICK_FLIP_STALE_BOOST', 'QUICK_FLIP_NEW_MARKET_BOOST',
     ]},
     {'id': 'peaker', 'tab': 'Peaker', 'title': 'Peaker (merged peak+safety)', 'keys': [
         'PEAKER_PREFER_COOL', 'PEAKER_TRADE_DECIDED',
@@ -181,8 +202,8 @@ GROUPS: List[dict] = [
     ]},
     {'id': 'exits', 'tab': 'Exits', 'title': 'Exits & Liquidity', 'keys': [
         'THESIS_EXIT_ENABLED', 'LIQUIDITY_GUARD_ENABLED', 'LIQUIDITY_STRICT_BLOCK',
-        'GRADE_SIZING_ENABLED', 'SKIP_DECIDED_MARKETS',
-        'THESIS_EXIT_MAX_ROI_PCT', 'TRAILING_STOP_PCT', 'TRAILING_MIN_PEAK_MULT',
+        'GRADE_SIZING_ENABLED', 'SKIP_DECIDED_MARKETS', 'PROFIT_CAP_ENABLED',
+        'THESIS_EXIT_MAX_ROI_PCT', 'PROFIT_CAP_ROI_PCT', 'TRAILING_STOP_PCT', 'TRAILING_MIN_PEAK_MULT',
         'EARLY_PROFIT_THRESHOLD', 'LIQUIDITY_THIN_SIZE_MULT', 'HIGH_TEMP_LOCK_HOUR',
     ]},
     {'id': 'sniper', 'tab': 'Sniper', 'title': 'Sniper / Basket', 'keys': [
@@ -205,6 +226,14 @@ def group_keys(group_id: str) -> Tuple[List[str], List[str]]:
     return bkeys, nkeys
 
 
+def group_str_keys(group_id: str) -> List[str]:
+    """Return the string/choice keys for a group (e.g. ML model selectors)."""
+    g = next((x for x in GROUPS if x['id'] == group_id), None)
+    if not g:
+        return []
+    return [k for k in g['keys'] if k in STR_KEYS]
+
+
 def _coerce(key: str, value):
     if key in BOOL_KEYS:
         if isinstance(value, bool):
@@ -215,13 +244,20 @@ def _coerce(key: str, value):
         lo, hi, _step, is_int = spec
         v = int(round(float(value))) if is_int else float(value)
         return max(lo, min(hi, v))
+    if key in STR_KEYS:
+        choices = STR_KEYS[key]
+        s = str(value).strip()
+        for c in choices:
+            if c.lower() == s.lower():
+                return c
+        return getattr(Config, key, choices[0])
     return value
 
 
 def set_value(key: str, value) -> Tuple[bool, str]:
     """Set a tunable to an explicit value (used by /set KEY VALUE)."""
     key = key.upper()
-    if key not in BOOL_KEYS and key not in NUM_KEYS:
+    if key not in BOOL_KEYS and key not in NUM_KEYS and key not in STR_KEYS:
         return False, f"unknown setting '{key}'"
     try:
         v = _coerce(key, value)
@@ -262,10 +298,32 @@ def bump(key: str, direction: int) -> Tuple[bool, str]:
     return True, f"{key} = {nxt}"
 
 
+def cycle(key: str) -> Tuple[bool, str]:
+    """Advance a string/choice setting to its next allowed value (tap button)."""
+    key = key.upper()
+    choices = STR_KEYS.get(key)
+    if not choices:
+        return False, f"'{key}' is not a choice setting"
+    cur = str(getattr(Config, key, choices[0]))
+    try:
+        idx = next(i for i, c in enumerate(choices) if c.lower() == cur.lower())
+    except StopIteration:
+        idx = -1
+    nxt = choices[(idx + 1) % len(choices)]
+    setattr(Config, key, nxt)
+    _persist()
+    return True, f"{key} = {nxt}"
+
+
 def snapshot() -> Tuple[Dict[str, bool], Dict[str, float]]:
     bools = {k: bool(getattr(Config, k, False)) for k in BOOL_KEYS}
     nums = {k: getattr(Config, k, None) for k in NUM_KEYS}
     return bools, nums
+
+
+def str_snapshot() -> Dict[str, str]:
+    """Current values of all string/choice settings."""
+    return {k: str(getattr(Config, k, v[0])) for k, v in STR_KEYS.items()}
 
 
 def _persist():
@@ -273,6 +331,7 @@ def _persist():
         os.makedirs('data', exist_ok=True)
         data = {k: bool(getattr(Config, k, False)) for k in BOOL_KEYS}
         data.update({k: getattr(Config, k, None) for k in NUM_KEYS})
+        data.update({k: str(getattr(Config, k, v[0])) for k, v in STR_KEYS.items()})
         with open(SETTINGS_PATH, 'w') as f:
             json.dump(data, f, indent=2)
     except Exception as e:
@@ -288,7 +347,7 @@ def load_into_config():
             data = json.load(f)
         n = 0
         for k, v in data.items():
-            if k in BOOL_KEYS or k in NUM_KEYS:
+            if k in BOOL_KEYS or k in NUM_KEYS or k in STR_KEYS:
                 setattr(Config, k, _coerce(k, v))
                 n += 1
         if n:

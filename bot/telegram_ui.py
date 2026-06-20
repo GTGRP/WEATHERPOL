@@ -573,6 +573,8 @@ class TelegramBot:
             text += (
                 f"📊 <b>Weather Sniper Status</b>\n"
                 f"Mode: {s['mode']} | Balance: ${s['balance']:.2f}\n"
+                f"Positions value: ${s.get('position_value', 0.0):.2f} | "
+                f"Portfolio: ${s['portfolio_value']:.2f}\n"
                 f"PnL: ${s['total_pnl']:+.2f} ({s['roi_pct']:+.1f}%) | "
                 f"WR: {s['win_rate']:.0f}% ({s['wins']}W/{s['losses']}L)\n"
                 f"Trades: {s['total_trades']} | Open: {s['open_positions']} | "
@@ -647,6 +649,47 @@ class TelegramBot:
             msg += f"  📍 {self._esc(city)}: {count} markets\n"
         self.send(msg)
 
+    def _outcome_breakdown_text(self) -> str:
+        """Grouped outcome breakdown (Req-30): settlements/redeems kept SEPARATE
+        from the small quick-flip/exit scalps (gains & losses)."""
+        if not self.pm or not hasattr(self.pm, 'get_outcome_breakdown'):
+            return ''
+        try:
+            b = self.pm.get_outcome_breakdown()
+        except Exception:
+            return ''
+        g = lambda k: b.get(k, {'count': 0, 'pnl': 0.0})
+        sw, rd, sl = g('settle_win'), g('redeemed'), g('settle_loss')
+        sg, slo = g('small_gain'), g('small_loss')
+        return (
+            f"🏦 <b>Settled/Redeemed</b>: ✅ {sw['count']} ${sw['pnl']:+.2f} | "
+            f"💰 {rd['count']} ${rd['pnl']:+.2f} | "
+            f"❌ {sl['count']} ${sl['pnl']:+.2f}\n"
+            f"⚡ <b>Flip/exit scalps</b>: 🟢 {sg['count']} ${sg['pnl']:+.2f} | "
+            f"🔴 {slo['count']} ${slo['pnl']:+.2f}\n"
+        )
+
+    def send_periodic_summary(self, interval_min: int = 0):
+        """Periodic status summary pushed every SUMMARY_INTERVAL_MIN minutes
+        (Req-30 summary timer): balance, position value, PnL, WR + the grouped
+        settle/redeem vs flip-scalp breakdown."""
+        if not self.pm:
+            return
+        s = self.pm.get_stats()
+        hdr = (f"⏲️ <b>Summary</b> (every {interval_min}m)\n"
+               if interval_min else "⏲️ <b>Summary</b>\n")
+        msg = (
+            hdr + f"{'-'*28}\n"
+            f"Mode: {s['mode']} | Balance: ${s['balance']:.2f}\n"
+            f"Positions value: ${s.get('position_value', 0.0):.2f} "
+            f"(open {s['open_positions']})\n"
+            f"Portfolio: ${s['portfolio_value']:.2f}\n"
+            f"PnL: ${s['total_pnl']:+.2f} ({s['roi_pct']:+.1f}%) | "
+            f"WR {s['win_rate']:.0f}% ({s['wins']}W/{s['losses']}L)\n"
+        )
+        msg += self._outcome_breakdown_text()
+        self.send(msg)
+
     def send_daily_summary(self):
         """Send end-of-day summary."""
         if not self.pm:
@@ -662,9 +705,11 @@ class TelegramBot:
             f"Today's PnL: ${today_pnl:+.2f}\n"
             f"Total PnL: ${stats['total_pnl']:+.2f}\n"
             f"Balance: ${stats['balance']:.2f}\n"
+            f"Positions value: ${stats.get('position_value', 0.0):.2f}\n"
             f"Portfolio: ${stats['portfolio_value']:.2f}\n"
             f"Win Rate: {stats['win_rate']:.0f}%\n"
         )
+        msg += self._outcome_breakdown_text()
         self.send(msg)
 
     # ==============================================================
@@ -787,9 +832,12 @@ class TelegramBot:
             f"WR {stats['win_rate']:.0f}% ({stats['wins']}W/{stats['losses']}L) | "
             f"Trades {stats['total_trades']} | Open {stats['open_positions']} | "
             f"Redeemed ${stats['total_redeemed']:.2f}\n"
+            f"Positions value ${stats.get('position_value', 0.0):.2f} | "
+            f"Portfolio ${stats['portfolio_value']:.2f}\n"
             f"{'-'*28}\n"
             f"<b>By strategy</b> (buys · W/L · WR · PnL)\n"
         )
+        text += self._outcome_breakdown_text()
         if not by_strat:
             text += "  (no trades yet)\n"
         else:
@@ -1073,6 +1121,9 @@ class TelegramBot:
         if not ml or not getattr(ml, 'enabled', False):
             return ("<i>ML narrative inactive — set ML_API_KEY to let the model "
                     "write the report. Heuristic analysis below.</i>")
+        if not getattr(Config, 'ML_ANALYSIS_ENABLED', True):
+            return ("<i>ML Analysis is turned OFF (toggle it on in ⚙️ Settings › ML). "
+                    "Heuristic analysis below.</i>")
         try:
             if hasattr(ml, 'write_trade_report'):
                 return self._esc(ml.write_trade_report(stats, by_strat, by_city))
@@ -1184,8 +1235,11 @@ class TelegramBot:
         'SNIPER_ENABLED': 'Sniper',
         'SPREAD_ENABLED': 'Spread',
         'STABILITY_ENABLED': 'Stability',
-        'ML_ENABLED': 'ML',
+        'ML_ENABLED': 'Use ML',
         'ML_DECISION_ENABLED': 'ML-Decide',
+        'ML_ANALYSIS_ENABLED': 'ML Analysis',
+        'ML_REVIEW_POSITIONS': 'ML Review-Pos',
+        'ML_SELECT_MARKETS': 'ML Market-Pick',
         'AUTO_REDEEM_ENABLED': 'Auto-Redeem',
         'PORTFOLIO_GUARD_ENABLED': 'Port-Guard',
         'QUICK_FLIP_PROFIT_ONLY_EXIT': 'Flip profit-only',
@@ -1225,6 +1279,8 @@ class TelegramBot:
         g = next((x for x in groups if x['id'] == gid), groups[0])
         gid = g['id']
         bkeys, nkeys = settings_store.group_keys(gid)
+        skeys = settings_store.group_str_keys(gid)
+        strs = settings_store.str_snapshot()
 
         mode = '📋 PAPER' if Config.is_paper() else '🔴 LIVE'
         master = '🟢 ON' if bools.get('TRADING_ENABLED') else '🔴 OFF'
@@ -1242,6 +1298,10 @@ class TelegramBot:
             text += "\n<b>Gates</b>\n"
             for k in nkeys:
                 text += f"  • {self._esc(k)} = <b>{self._fmt_num(nums.get(k))}</b>\n"
+        if skeys:
+            text += "\n<b>Models / Choices</b>\n"
+            for k in skeys:
+                text += f"  • {self._esc(k)} = <b>{self._esc(str(strs.get(k)))}</b>\n"
         text += "\n<i>Or type /set KEY VALUE · /toggle KEY</i>"
 
         rows = []
@@ -1271,6 +1331,11 @@ class TelegramBot:
                 {'text': f"➖{self._fmt_num(step)}", 'callback_data': f"dn:{k}:{gid}"},
                 {'text': f"{k} = {self._fmt_num(v)}", 'callback_data': 'noop'},
                 {'text': f"➕{self._fmt_num(step)}", 'callback_data': f"up:{k}:{gid}"},
+            ])
+        # String/choice settings (e.g. ML model): tap to cycle to the next value.
+        for k in skeys:
+            rows.append([
+                {'text': f"🔁 {self._label(k)}: {strs.get(k)}", 'callback_data': f"cy:{k}:{gid}"},
             ])
         # Req-29: type-to-change starting balance + an OK/Apply button that
         # summarises changes and offers Start. Shown on every tab.
@@ -1390,6 +1455,8 @@ class TelegramBot:
         ok, msg = False, 'no change'
         if action == 'tg':
             ok, msg = settings_store.toggle(key)
+        elif action == 'cy':
+            ok, msg = settings_store.cycle(key)
         elif action == 'up':
             ok, msg = settings_store.bump(key, +1)
         elif action == 'dn':
