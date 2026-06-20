@@ -1,32 +1,16 @@
 """
-Local ML Model — XGBoost-powered, no API, sub-millisecond inference.
+Local ML Model - XGBoost-powered (with rule fallback), no API, fast inference.
 
-WHY THIS EXISTS:
-  The GPT/LLM API can fail (rate limits, network, cost). When it does,
-  this local model takes over — zero latency, zero cost, always available.
-  It also runs ALONGSIDE the API model as a second opinion.
+Used as:
+  - A standalone decision-maker when ML_API_KEY is not set.
+  - A graceful fallback when the LLM API fails / times out.
+  - A second opinion alongside the LLM.
 
-WHAT IT DOES:
-  - Entry validation: BUY/SKIP with probability score
-  - Exit timing: HOLD/SELL with confidence
-  - Position sizing: Kelly fraction adjustment
-  - Confidence calibration: is the ensemble model overconfident?
-
-TRAINING:
-  Trained on historical Polymarket weather outcomes (from backtest).
-  Features: edge, edge_ratio, n_models, forecast_spread, lead_hours,
-            market_price, bucket_position, city_win_rate, spread_bps.
-  Target: did the trade win? (1/0)
-
-ARCHITECTURE:
-  XGBoost classifier (small, fast) with 50 trees, max_depth=4.
-  Inference time: <1ms. Model file: ~50KB.
-  Falls back to rule-based if model file not found.
-
-Usage:
-  from ml.local_model import LocalModel
-  model = LocalModel()
-  decision = model.predict_entry(features)  # {'action': 'BUY', 'prob': 0.72}
+Capabilities:
+  - predict_entry: BUY/SKIP with probability
+  - predict_exit:  HOLD/SELL with confidence
+  - decide_hold:   BOOK/HOLD ladder for in-profit positions (mid-trade)
+  - train_on_history: fit XGBoost on collected trade outcomes
 """
 
 import json
@@ -40,7 +24,6 @@ import numpy as np
 from logger import log
 
 
-# Feature names in order
 FEATURE_NAMES = [
     "edge",              # our_prob - market_price
     "edge_ratio",        # our_prob / market_price
@@ -78,7 +61,6 @@ class LocalModel:
         self._load_or_init()
 
     def _load_or_init(self):
-        """Load trained model or initialize rule-based fallback."""
         try:
             import xgboost as xgb
             if self.model_path.exists():
@@ -87,80 +69,98 @@ class LocalModel:
                 self._loaded = True
                 log.info(f"  XGBoost model loaded ({self.model_path.stat().st_size} bytes)")
             else:
-                log.info("  XGBoost model not found — using rule-based fallback")
-                log.info("  (Model will be trained after collecting trade history)")
+                log.info("  XGBoost model not found - using rule-based fallback")
         except ImportError:
-            log.info("  xgboost not installed — using rule-based fallback")
-            log.info("  (pip install xgboost for faster local ML)")
+            log.info("  xgboost not installed - using rule-based fallback")
         except Exception as e:
-            log.warning(f"  XGBoost load failed: {e} — using rule-based")
+            log.warning(f"  XGBoost load failed: {e} - using rule-based")
 
+    # ------------------------------------------------------------------ #
+    # Entry
+    # ------------------------------------------------------------------ #
     def predict_entry(self, features: dict) -> dict:
-        """
-        Predict whether to enter a trade.
-
-        Args:
-            features: dict with keys matching FEATURE_NAMES
-
-        Returns:
-            {'action': 'BUY'|'SKIP', 'probability': 0.0-1.0, 'source': 'xgb'|'rules'}
-        """
         if self.model is not None and self._loaded:
             return self._xgb_predict(features)
         return self._rules_predict(features)
 
+    # ------------------------------------------------------------------ #
+    # Exit (generic hold/sell)
+    # ------------------------------------------------------------------ #
     def predict_exit(self, features: dict) -> dict:
-        """
-        Predict whether to exit a position early.
-
-        Args:
-            features: dict with position state
-
-        Returns:
-            {'action': 'HOLD'|'SELL', 'probability': 0.0-1.0, 'source': 'xgb'|'rules'}
-        """
-        # For exit, we mostly want to HOLD (resolution is binary)
-        # Only exit if forecast reverses or profit target hit
         pnl_pct = features.get("pnl_pct", 0)
         forecast_changed = features.get("forecast_changed", False)
         hours_remaining = features.get("hours_remaining", 24)
 
-        if pnl_pct > 50:
-            return {"action": "SELL", "probability": 0.85, "source": "rules",
+        if pnl_pct >= 50:
+            return {"action": "SELL", "confidence": 0.85, "source": "rules",
                     "reason": f"Profit target hit (+{pnl_pct:.0f}%)"}
         if forecast_changed and pnl_pct < 0:
-            return {"action": "SELL", "probability": 0.75, "source": "rules",
+            return {"action": "SELL", "confidence": 0.75, "source": "rules",
                     "reason": "Forecast reversed against position"}
         if hours_remaining < 2 and pnl_pct < -50:
-            return {"action": "SELL", "probability": 0.60, "source": "rules",
+            return {"action": "SELL", "confidence": 0.60, "source": "rules",
                     "reason": "Near resolution, deep loss"}
-
-        return {"action": "HOLD", "probability": 0.80, "source": "rules",
+        return {"action": "HOLD", "confidence": 0.80, "source": "rules",
                 "reason": "Hold to binary resolution"}
 
+    # ------------------------------------------------------------------ #
+    # Mid-trade BOOK vs HOLD ladder (profit management)
+    # ------------------------------------------------------------------ #
+    def decide_hold(self, features: dict) -> dict:
+        """Rule-based profit manager used when the LLM is unavailable.
+        Returns {action:'BOOK'|'HOLD', target_roi, confidence, reason, source}."""
+        roi = float(features.get("roi_pct", 0.0))
+        peak = float(features.get("peak_roi", roi))
+        hrs = float(features.get("hours_remaining", 24) or 24)
+        mode = features.get("mode", "ladder")
+        give_back = peak - roi  # how far we've slipped from the high-water mark
+
+        if mode == "cap":
+            # Above the 300% cap: protect against the 500%->0 round-trip. If the
+            # price is clearly fading from peak, lock it; otherwise ride to settle.
+            if give_back >= 60:
+                return {"action": "BOOK", "target_roi": roi, "confidence": 0.7,
+                        "source": "rules", "reason": "cap: fading from peak, lock it"}
+            return {"action": "HOLD", "target_roi": max(peak, roi), "confidence": 0.6,
+                    "source": "rules", "reason": "cap: ride to settle"}
+
+        # ladder mode (position is at/above the +profit target)
+        if roi >= 50:
+            return {"action": "BOOK", "target_roi": roi, "confidence": 0.7,
+                    "source": "rules", "reason": "big gain - lock it"}
+        if give_back >= 8:
+            return {"action": "BOOK", "target_roi": roi, "confidence": 0.65,
+                    "source": "rules", "reason": "pulled back from peak"}
+        if roi >= 20 and hrs < 2:
+            return {"action": "BOOK", "target_roi": roi, "confidence": 0.6,
+                    "source": "rules", "reason": "near close - take it"}
+        nxt = 20 if roi < 20 else (40 if roi < 40 else 50)
+        return {"action": "HOLD", "target_roi": nxt, "confidence": 0.55,
+                "source": "rules", "reason": f"run toward {nxt}%"}
+
+    # ------------------------------------------------------------------ #
+    # Inference internals
+    # ------------------------------------------------------------------ #
     def _xgb_predict(self, features: dict) -> dict:
-        """XGBoost model inference."""
         try:
             x = np.array([[features.get(f, 0) for f in FEATURE_NAMES]], dtype=np.float32)
             prob = float(self.model.predict_proba(x)[0][1])
             action = "BUY" if prob > 0.55 else "SKIP"
-            return {"action": action, "probability": prob, "source": "xgb"}
+            return {"action": action, "probability": prob, "confidence": prob, "source": "xgb"}
         except Exception as e:
-            log.debug(f"XGBoost inference failed: {e} — falling back to rules")
+            log.debug(f"XGBoost inference failed: {e} - falling back to rules")
             return self._rules_predict(features)
 
     def _rules_predict(self, features: dict) -> dict:
-        """Rule-based fallback when XGBoost is unavailable."""
         edge = features.get("edge", 0)
         edge_ratio = features.get("edge_ratio", 0)
         n_models = features.get("n_models", 0)
         confidence = features.get("confidence", 0)
         spread_bps = features.get("market_spread_bps", 500)
         market_price = features.get("market_price", 0.5)
+        city_win_rate = features.get("city_win_rate", 0.07)
 
         score = 0.0
-
-        # Edge is the strongest signal
         if edge > 0.10:
             score += 0.35
         elif edge > 0.05:
@@ -168,7 +168,6 @@ class LocalModel:
         elif edge > 0.02:
             score += 0.10
 
-        # Edge ratio (relative edge)
         if edge_ratio > 5.0:
             score += 0.30
         elif edge_ratio > 3.0:
@@ -176,64 +175,59 @@ class LocalModel:
         elif edge_ratio > 2.0:
             score += 0.10
 
-        # Model agreement
         if n_models >= 5:
             score += 0.15
         elif n_models >= 3:
             score += 0.10
 
-        # Confidence
         if confidence > 0.80:
             score += 0.10
 
-        # Spread penalty
         if spread_bps > 1000:
             score -= 0.20
         elif spread_bps > 500:
             score -= 0.10
 
-        # Price zone (mid-range is better for flipping, tails for holding)
         if 0.10 <= market_price <= 0.50:
             score += 0.05
 
+        # Favor historically stronger cities a touch.
+        if city_win_rate >= 0.09:
+            score += 0.05
+        elif city_win_rate < 0.04:
+            score -= 0.05
+
         score = max(0.0, min(0.95, score))
         action = "BUY" if score >= 0.50 else "SKIP"
+        return {"action": action, "probability": score, "confidence": score, "source": "rules"}
 
-        return {"action": action, "probability": score, "source": "rules"}
-
-    def train_on_history(self, trades: list):
-        """Train XGBoost model on historical trade outcomes."""
+    def train_on_history(self, trades: list) -> bool:
         if len(trades) < 50:
             log.info(f"  Need 50+ trades to train (have {len(trades)})")
             return False
-
         try:
             import xgboost as xgb
-
             X, y = [], []
             for t in trades:
                 feats = t.get("features", {})
                 if not feats:
                     continue
-                row = [feats.get(f, 0) for f in FEATURE_NAMES]
-                X.append(row)
+                X.append([feats.get(f, 0) for f in FEATURE_NAMES])
                 y.append(1 if t.get("won", False) else 0)
-
             if len(X) < 50:
+                log.info(f"  Only {len(X)} trades carry features - need 50+ to train")
                 return False
-
             self.model = xgb.XGBClassifier(
                 n_estimators=50, max_depth=4, learning_rate=0.1,
-                objective="binary:logistic", eval_metric="logloss",
-                use_label_encoder=False, verbosity=0,
+                objective="binary:logistic", eval_metric="logloss", verbosity=0,
             )
             self.model.fit(np.array(X), np.array(y))
             self.model.save_model(str(self.model_path))
             self._loaded = True
-            log.info(f"  XGBoost trained on {len(X)} trades — saved to {self.model_path}")
+            log.info(f"  XGBoost trained on {len(X)} trades - saved to {self.model_path}")
             return True
         except ImportError:
-            log.warning("  xgboost not installed — cannot train")
+            log.warning("  xgboost not installed - cannot train")
         except Exception as e:
             log.warning(f"  XGBoost training failed: {e}")
         return False
@@ -246,7 +240,6 @@ class LocalModel:
         }
 
 
-# Singleton
 _instance: Optional[LocalModel] = None
 
 
