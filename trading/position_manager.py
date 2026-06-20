@@ -224,9 +224,9 @@ class PositionManager:
         self._load_state()
         self._load_weekly()
 
-    # ═══════════════════════
+    # ============================
     # BALANCE
-    # ════════════════════════
+    # ============================
 
     def get_balance(self) -> float:
         if Config.is_paper():
@@ -257,9 +257,9 @@ class PositionManager:
             return None
 
 
-    # ════════════════════════
+    # ============================
     # POSITION LIFECYCLE
-    # ═══════════════════════
+    # ============================
 
     def add_position(self, token_id: str, condition_id: str, entry_price: float,
                      shares: float, cost_usd: float, market_title: str,
@@ -270,11 +270,11 @@ class PositionManager:
                      hold_to_resolution: bool = False, cluster_box: str = '',
                      flip_max_hold_minutes: float = 0.0) -> Optional[TrackedPosition]:
         """Add new position — checks balance FIRST, only tracks if order succeeds."""
-        # ═══ VALIDATE SHARES (must be positive) ═══
+        # === VALIDATE SHARES (must be positive) ===
         if shares <= 0 or cost_usd <= 0 or entry_price <= 0:
             return None
 
-        # ═══ DUPLICATE GUARD ═══
+        # === DUPLICATE GUARD ===
         # Block re-buying the SAME outcome with the SAME strategy while an order
         # for it is still open or pending. A DIFFERENT strategy on the same market
         # (e.g. spread leg vs confident) is allowed.
@@ -284,8 +284,8 @@ class PositionManager:
                 log.debug(f"⏭️  SKIP dup: {city} {bucket_label[:25]} already {p.status} [{strategy}]")
                 return None
 
-        # ═══ MIN ORDER: GTC needs ≥5 shares AND ≥ $1 notional ═══
-        # Polymarket GTC floors to 5 shares; FOK/FAK need ≥ $1. We require both
+        # === MIN ORDER: GTC needs >=5 shares AND >= $1 notional ===
+        # Polymarket GTC floors to 5 shares; FOK/FAK need >= $1. We require both
         # (max of the two) so no order is dust. Applied in PAPER too so paper
         # simulates exactly what the venue would accept — otherwise grade/liquidity
         # size-trimming can produce sub-minimum "0-share" orders that can't fill.
@@ -295,7 +295,7 @@ class PositionManager:
             cost_usd = min_notional
             shares = cost_usd / entry_price
 
-        # ═══ BALANCE CHECK (after min-order bump so it reflects real spend) ═══
+        # === BALANCE CHECK (after min-order bump so it reflects real spend) ===
         # Skip (don't retry) when balance is insufficient — surfaced at INFO so
         # it's visible. Freed balance from sells/resolutions is picked up next scan.
         if not Config.is_paper():
@@ -316,7 +316,7 @@ class PositionManager:
         else:
             tp_price = min(0.85, entry_price * 2.5)
 
-        # ═══ PAPER REALISTIC FILL ═══
+        # === PAPER REALISTIC FILL ===
         # When enabled, walk the live ask ladder so the paper fill price/size and
         # partial fills mirror what the venue would actually give us. This is the
         # difference between paper "feeling random" and matching real trading.
@@ -335,7 +335,7 @@ class PositionManager:
                 if fr.partial:
                     log.info(f"⚖️  PARTIAL FILL {city} {bucket_label[:22]} — {shares:.0f}sh @ ${entry_price:.4f} ({fill_note})")
 
-        # ═══ LIVE: Place order FIRST. GTC sits in book until filled. ═══
+        # === LIVE: Place order FIRST. GTC sits in book until filled. ===
         # CRITICAL FIX: a GTC order != a filled position. Track as PENDING
         # until the fill is confirmed. This prevents phantom positions (wle.txt bug #1).
         if not Config.is_paper():
@@ -409,7 +409,7 @@ class PositionManager:
                      f"{shares:.0f}sh @ ${entry_price:.4f} | cost=${cost_usd:.2f}"
                      + (f" | {fill_note}" if fill_note else "") + "\033[0m")
 
-        # ═══ Observability metadata (common to both modes) ═══
+        # === Observability metadata (common to both modes) ===
         pos.edge_at_entry = edge
         pos.reason = reason
         pos.grade = grade
@@ -659,7 +659,7 @@ class PositionManager:
     def get_redeemable_positions(self) -> List[TrackedPosition]:
         return [p for p in self.positions if p.redeemable and p.status in ('open', 'won')]
 
-    # ═══ Peak-cluster basket numbering ("Box 1", "Box 2", ...) ═══
+    # === Peak-cluster basket numbering ("Box 1", "Box 2", ...) ===
     def peek_cluster_box(self) -> str:
         """Label for the NEXT basket WITHOUT consuming the number."""
         return f"Box {self.cluster_box_seq + 1}"
@@ -740,9 +740,9 @@ class PositionManager:
         return {'applied': True, 'balance': bal, 'target': bal}
 
 
-    # ════════════════════════
+    # ============================
     # STOP-LOSS & TAKE-PROFIT
-    # ════════════════════════
+    # ============================
 
     def check_risk_triggers(self) -> List[TrackedPosition]:
         """Check all open positions for stop-loss / take-profit triggers."""
@@ -831,7 +831,7 @@ class PositionManager:
             # Sold at market — PnL = (exit_price - entry_price) * shares
             pos.pnl = (exit_price - pos.entry_price) * pos.shares
             pos.realized_pnl = pos.pnl
-            # ── WIN/LOSS ACCOUNTING FOR MARKET EXITS ──
+            # -- WIN/LOSS ACCOUNTING FOR MARKET EXITS --
             # BUGFIX: previously ONLY 'won'/'lost' resolutions touched
             # self.wins/self.losses. Every market SELL — thesis-exit,
             # flip book-or-cut, stop-loss, trailing-stop, manual — was booked
@@ -866,9 +866,7 @@ class PositionManager:
             self._log_paper_trade(action, pos)
 
         # Fire the close/resolution alert callback (Telegram), if wired. Skip
-        # 'manual': exit_policies relabels flip/thesis exits AFTER close and the
-        # dashboard notifies those directly, so this avoids a double-notify with
-        # the wrong label.
+        # reasons the dashboard already notifies directly to avoid double-notify.
         # Basket legs (peak_cluster + peaker cool/warm baskets) are GROUPED:
         # instead of one won/lost alert per leg, we wait until EVERY leg of the
         # basket ("Box N") has resolved, then emit ONE grouped resolution summary
@@ -885,9 +883,9 @@ class PositionManager:
                     log.debug(f"close notify failed: {e}")
 
 
-    # ════════════════════════
+    # ============================
     # RESOLUTION & REDEMPTION
-    # ════════════════════════
+    # ============================
 
     def _maybe_notify_cluster_close(self, box: str):
         """Once ALL legs of a basket ("Box N") have resolved, emit ONE grouped
@@ -1091,9 +1089,9 @@ class PositionManager:
                 count += 1
         return count
 
-    # ════════════════════════
+    # ============================
     # PRICE UPDATES
-    # ════════════════════════
+    # ============================
 
     def update_prices(self):
         """Batch update prices for open positions.
@@ -1138,9 +1136,9 @@ class PositionManager:
         self._save_state()
 
 
-    # ════════════════════════
+    # ============================
     # CONTEXT MANAGEMENT (free memory for closed markets)
-    # ════════════════════════
+    # ============================
 
     def _maybe_free_context(self, slug: str):
         """Free market context if no open positions remain for it."""
@@ -1164,9 +1162,9 @@ class PositionManager:
         """How many active market contexts we're tracking."""
         return sum(1 for v in self.market_contexts.values() if v.active)
 
-    # ════════════════════════
+    # ============================
     # PAPER TRADE LOG + LEDGER INVARIANT
-    # ════════════════════════
+    # ============================
 
     def _log_paper_trade(self, action: str, pos: TrackedPosition, extra: Optional[Dict] = None):
         """Append one structured record per BUY / SELL / SETTLE / REDEEM /
@@ -1236,9 +1234,9 @@ class PositionManager:
                         f"deposited=${self.total_deposited:.2f}")
         return ok
 
-    # ════════════════════════
+    # ============================
     # WEEKLY MEMORY
-    # ════════════════════════
+    # ============================
 
     def record_weekly_stats(self):
         """Snapshot current week's performance for ML memory."""
@@ -1298,9 +1296,9 @@ class PositionManager:
         return " | ".join(lines)
 
 
-    # ════════════════════════
+    # ============================
     # STATISTICS (per-position + aggregate)
-    # ════════════════════════
+    # ============================
 
     @staticmethod
     def _closed_outcome(p) -> Optional[str]:
@@ -1495,9 +1493,9 @@ class PositionManager:
         return summary
 
 
-    # ═════════════════════════
+    # ============================
     # PERSISTENCE
-    # ═══��════════════════════
+    # ============================
 
     def _save_state(self):
         """Save positions to disk."""
