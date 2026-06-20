@@ -99,9 +99,9 @@ class WeatherBot:
         except Exception as _e:
             log.debug(f"attach_ml failed: {_e}")
         # Route close/resolution alerts (stop-loss, take-profit, trailing-stop,
-        # won/lost) through Telegram. Flip/thesis exits are notified directly in
-        # run_once (their reason is relabeled 'manual' after close, so the hook
-        # below skips them to avoid a double-notify).
+        # won/lost) through Telegram. Flip/cap/thesis exits are notified directly
+        # in run_once; the PM hook skips their reasons (DASHBOARD_NOTIFIED_REASONS)
+        # to avoid a double-notify.
         self.pm._notify_close = self.telegram.notify_close
         # Peak-cluster baskets resolve as ONE grouped summary (winner + payout,
         # losing buckets + loss, net) instead of one won/lost alert per leg.
@@ -121,6 +121,7 @@ class WeatherBot:
         self._last_resolution_check = 0
         self._last_daily_summary = ''
         self._last_weekly_record = ''
+        self._last_summary_ts = time.time()   # Req-30 periodic summary timer
 
     def restart_fresh(self, starting_balance=None):
         """Restart the bot like new: clear ALL positions and reset the ledger to
@@ -166,8 +167,9 @@ class WeatherBot:
             flip_exits = exit_policies.check_flip_exits(self.pm)    # quick_flip +10%/-5% + ML upside
             cap_exits = exit_policies.check_profit_caps(self.pm)    # Req-30: global 300% ML-managed cap
             thesis_exits = exit_policies.check_thesis_exits(self.pm)  # strict thesis-invalidation (very bad only)
-            # Flip/thesis closes use reason 'manual' (relabeled after close), so
-            # the PM _notify_close hook deliberately skips them — notify here.
+            # Flip/cap/thesis closes pass their real reason into _close_position;
+            # the PM _notify_close hook skips those reasons (DASHBOARD_NOTIFIED_
+            # REASONS) so they are notified ONCE here (no double-notify).
             for _p in (flip_exits or []) + (cap_exits or []) + (thesis_exits or []):
                 try:
                     self.telegram.notify_close(_p)
@@ -220,6 +222,19 @@ class WeatherBot:
         if today_str != self._last_daily_summary and now.hour >= 22:
             self.telegram.send_daily_summary()
             self._last_daily_summary = today_str
+
+        # Step 6: Periodic summary timer (Req-30). When SUMMARY_INTERVAL_MIN > 0,
+        # push a compact status summary to Telegram every N minutes.
+        try:
+            iv = int(getattr(Config, 'SUMMARY_INTERVAL_MIN', 0) or 0)
+        except Exception:
+            iv = 0
+        if iv > 0 and (time.time() - self._last_summary_ts) >= iv * 60:
+            try:
+                self.telegram.send_periodic_summary(iv)
+            except Exception as e:
+                log.debug(f"periodic summary failed: {e}")
+            self._last_summary_ts = time.time()
 
     # -----------------------------------------------------------------
     # STABILITY GRADE + LIQUIDITY — applied across every strategy
@@ -692,6 +707,18 @@ class WeatherBot:
         # Fetch forecasts
         target_time = market.resolution_time
         forecasts = self.fetcher.fetch_all(lat, lon, city, target_time)
+        # WEATHER-DATA BUY GUARD (Req-30): NEVER evaluate/buy a market without
+        # sufficient live weather data. fetch_all returns nothing when every
+        # provider failed / is cooling down (the "Open-Meteo cooling down" /
+        # "observed fetch returned no data" warnings). This single choke point
+        # protects EVERY strategy below — they all run after this return.
+        n_models = len(forecasts) if forecasts else 0
+        min_models = max(1, int(getattr(Config, 'WEATHER_MIN_FORECAST_MODELS', 1)))
+        if getattr(Config, 'WEATHER_BUY_GUARD_ENABLED', True) and n_models < min_models:
+            self._funnel['no_weather_data'] += 1
+            log.warning(f"   🚫 WEATHER GUARD {city} — {n_models} forecast model(s) "
+                        f"(< {min_models}); skip, no buys without sufficient weather data")
+            return
         if not forecasts:
             self._funnel['no_forecast'] += 1
             log.debug(f"No forecasts for {city}")

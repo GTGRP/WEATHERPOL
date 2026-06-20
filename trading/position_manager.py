@@ -60,6 +60,15 @@ def _cfg(name: str, default):
 # cool/warm baskets join peak_cluster here so they group + hold identically.
 BASKET_STRATEGIES = ('peak_cluster', 'peaker_cool_basket', 'peaker_warm_basket')
 
+# Exit reasons that the dashboard's exit-policy loop notifies directly (it sends
+# ONE close alert per returned position). They are still CLOSED here for correct
+# PnL / ledger / W-L accounting, but the _notify_close callback is suppressed for
+# them so we don't double-notify. 'manual' is user-initiated from Telegram.
+DASHBOARD_NOTIFIED_REASONS = (
+    'manual', 'flip_stop', 'flip_book', 'flip_book_mid', 'flip_timeout',
+    'profit_cap_book', 'thesis_invalidated',
+)
+
 
 @dataclass
 class PositionRules:
@@ -808,10 +817,17 @@ class PositionManager:
         pos.exit_price = exit_price
         pos.exit_time = datetime.now(timezone.utc)
         pos.exit_reason = reason
-        pos.status = 'sold' if reason in ('take_profit', 'stop_loss', 'trailing_stop', 'manual') else reason
+        # A settlement (won/lost) books at $1/$0; ANY other reason is a market
+        # SELL -> status 'sold'. This MUST cover every exit-policy reason
+        # (flip_stop / flip_book / flip_book_mid / flip_timeout / profit_cap_book
+        # / thesis_invalidated): previously they matched NO branch below, so PnL
+        # stayed 0.0 even on a clear loss, the paper balance was never credited,
+        # and W/L was never recorded ("even in minus it shows 0").
+        is_resolution = reason in ('won', 'lost')
+        pos.status = reason if is_resolution else 'sold'
 
         # Calculate PnL
-        if reason in ('take_profit', 'trailing_stop', 'manual', 'stop_loss'):
+        if not is_resolution:
             # Sold at market — PnL = (exit_price - entry_price) * shares
             pos.pnl = (exit_price - pos.entry_price) * pos.shares
             pos.realized_pnl = pos.pnl
@@ -838,7 +854,7 @@ class PositionManager:
             self.losses += 1
 
         # Credit balance in paper mode
-        if Config.is_paper() and reason in ('take_profit', 'stop_loss', 'trailing_stop', 'manual'):
+        if Config.is_paper() and not is_resolution:
             self.paper_balance += pos.cost_usd + pos.pnl
 
         # Free market context if no more open positions for this slug
@@ -858,7 +874,7 @@ class PositionManager:
         # basket ("Box N") has resolved, then emit ONE grouped resolution summary
         # (which leg won + payout, the losing legs + their loss, net basket PnL).
         # Non-basket closes notify per-pos.
-        if reason != 'manual':
+        if reason not in DASHBOARD_NOTIFIED_REASONS:
             box = getattr(pos, 'cluster_box', '') or ''
             if box and getattr(pos, 'strategy', '') in BASKET_STRATEGIES:
                 self._maybe_notify_cluster_close(box)
@@ -1309,16 +1325,54 @@ class PositionManager:
                 return 'loss'
         return None
 
+    def get_outcome_breakdown(self) -> Dict[str, Dict]:
+        """Group CLOSED positions into reporting buckets so quick scalp exits
+        are shown SEPARATELY from settlements/redeems (user request: group the
+        small losses/gains and show them apart from the main settle/redeem).
+
+          settle_win  : resolved winners still locked (status 'won')
+          redeemed    : resolved winners cashed out (status 'redeemed')
+          settle_loss : resolved losers (status 'lost')
+          small_gain  : market exits (status 'sold') booked at a PROFIT
+          small_loss  : market exits (status 'sold') booked at a LOSS
+          breakeven   : market exits at ~$0
+
+        'small_*' are the flip / thesis / stop / cap scalps; a penny exit such as
+        0.20 -> 0.02 lands in small_loss. Each value is {count, pnl}.
+        """
+        cats = {k: {'count': 0, 'pnl': 0.0} for k in (
+            'settle_win', 'redeemed', 'settle_loss',
+            'small_gain', 'small_loss', 'breakeven')}
+        for p in self.positions:
+            st = getattr(p, 'status', '')
+            pnl = p.pnl or 0.0
+            if st == 'won':
+                key = 'settle_win'
+            elif st == 'redeemed':
+                key = 'redeemed'
+            elif st == 'lost':
+                key = 'settle_loss'
+            elif st == 'sold':
+                key = ('small_gain' if pnl > 1e-9
+                       else 'small_loss' if pnl < -1e-9 else 'breakeven')
+            else:
+                continue
+            cats[key]['count'] += 1
+            cats[key]['pnl'] += pnl
+        return cats
+
     def get_stats(self) -> Dict:
         """Comprehensive stats."""
         open_pos = self.get_open_positions()
         closed = [p for p in self.positions if p.status != 'open']
         total_closed = self.wins + self.losses
         win_rate = (self.wins / max(1, total_closed)) * 100
+        open_value = sum(p.current_value for p in open_pos)
 
         return {
             'mode': 'PAPER' if Config.is_paper() else 'LIVE',
             'balance': self.get_balance(),
+            'position_value': open_value,
             'portfolio_value': self.get_portfolio_value(),
             'total_pnl': self.get_total_pnl(),
             'roi_pct': (self.get_total_pnl() / max(0.01, self.total_deposited)) * 100,
@@ -1441,9 +1495,9 @@ class PositionManager:
         return summary
 
 
-    # ════════════════════════
+    # ═════════════════════════
     # PERSISTENCE
-    # ════════════════════════
+    # ═══��════════════════════
 
     def _save_state(self):
         """Save positions to disk."""

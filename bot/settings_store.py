@@ -46,10 +46,12 @@ BOOL_KEYS = [
     'GRADE_SIZING_ENABLED', 'SKIP_DECIDED_MARKETS',
 ]
 
-# ── Numeric gates: key -> (min, max, step, is_int) ─────────────────────────
+# ── Numeric gates: key -> (min, max, step, is_int) ──────────────────────────
 NUM_KEYS: Dict[str, tuple] = {
     # account
     'STARTING_BALANCE':            (10, 1000000, 50, False),
+    # ops
+    'SUMMARY_INTERVAL_MIN':        (0, 240, 15, True),
     # risk & sizing
     'MAX_BET_PCT':                 (0.05, 1.00, 0.05, False),
     'MAX_POSITIONS':               (1, 50, 1, True),
@@ -88,6 +90,7 @@ NUM_KEYS: Dict[str, tuple] = {
     'QUICK_FLIP_FORCE_BOOK_ROI_PCT': (10, 100, 5, False),
     'QUICK_FLIP_STOP_LOSS_PCT':    (-30, -1, 1, False),
     'QUICK_FLIP_STALE_BOOST':      (0.00, 0.50, 0.05, False),
+    'QUICK_FLIP_NEW_MARKET_BOOST': (0.00, 0.50, 0.05, False),
     # peaker (merged peak + safety)
     'PEAKER_MIN_GRADE':            (0.00, 1.00, 0.05, False),
     'PEAKER_MIN_CONFIDENCE':       (0.00, 1.00, 0.02, False),
@@ -143,6 +146,7 @@ GROUPS: List[dict] = [
         'QUICK_FLIP_ENABLED', 'PEAK_CLUSTER_ENABLED', 'PEAKER_ENABLED',
         'CONFIDENT_ENABLED', 'SNIPER_ENABLED', 'SPREAD_ENABLED', 'STABILITY_ENABLED',
         'ML_ENABLED', 'ML_DECISION_ENABLED', 'AUTO_REDEEM_ENABLED',
+        'SUMMARY_INTERVAL_MIN',
     ]},
     {'id': 'risk', 'tab': 'Risk', 'title': 'Risk & Sizing', 'keys': [
         'PORTFOLIO_GUARD_ENABLED',
@@ -168,7 +172,7 @@ GROUPS: List[dict] = [
         'QUICK_FLIP_TARGET_ROI', 'QUICK_FLIP_STOP_LOSS_PCT', 'QUICK_FLIP_MAX_SIZE_USD',
         'QUICK_FLIP_MIN_BOOK_ROI_PCT', 'QUICK_FLIP_LADDER_MID_ROI_PCT',
         'QUICK_FLIP_LADDER_RUN_ROI_PCT', 'QUICK_FLIP_FORCE_BOOK_ROI_PCT',
-        'QUICK_FLIP_STALE_BOOST',
+        'QUICK_FLIP_STALE_BOOST', 'QUICK_FLIP_NEW_MARKET_BOOST',
     ]},
     {'id': 'peaker', 'tab': 'Peaker', 'title': 'Peaker (merged peak+safety)', 'keys': [
         'PEAKER_PREFER_COOL', 'PEAKER_TRADE_DECIDED',

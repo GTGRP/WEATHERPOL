@@ -573,6 +573,8 @@ class TelegramBot:
             text += (
                 f"📊 <b>Weather Sniper Status</b>\n"
                 f"Mode: {s['mode']} | Balance: ${s['balance']:.2f}\n"
+                f"Positions value: ${s.get('position_value', 0.0):.2f} | "
+                f"Portfolio: ${s['portfolio_value']:.2f}\n"
                 f"PnL: ${s['total_pnl']:+.2f} ({s['roi_pct']:+.1f}%) | "
                 f"WR: {s['win_rate']:.0f}% ({s['wins']}W/{s['losses']}L)\n"
                 f"Trades: {s['total_trades']} | Open: {s['open_positions']} | "
@@ -647,6 +649,47 @@ class TelegramBot:
             msg += f"  📍 {self._esc(city)}: {count} markets\n"
         self.send(msg)
 
+    def _outcome_breakdown_text(self) -> str:
+        """Grouped outcome breakdown (Req-30): settlements/redeems kept SEPARATE
+        from the small quick-flip/exit scalps (gains & losses)."""
+        if not self.pm or not hasattr(self.pm, 'get_outcome_breakdown'):
+            return ''
+        try:
+            b = self.pm.get_outcome_breakdown()
+        except Exception:
+            return ''
+        g = lambda k: b.get(k, {'count': 0, 'pnl': 0.0})
+        sw, rd, sl = g('settle_win'), g('redeemed'), g('settle_loss')
+        sg, slo = g('small_gain'), g('small_loss')
+        return (
+            f"🏦 <b>Settled/Redeemed</b>: ✅ {sw['count']} ${sw['pnl']:+.2f} | "
+            f"💰 {rd['count']} ${rd['pnl']:+.2f} | "
+            f"❌ {sl['count']} ${sl['pnl']:+.2f}\n"
+            f"⚡ <b>Flip/exit scalps</b>: 🟢 {sg['count']} ${sg['pnl']:+.2f} | "
+            f"🔴 {slo['count']} ${slo['pnl']:+.2f}\n"
+        )
+
+    def send_periodic_summary(self, interval_min: int = 0):
+        """Periodic status summary pushed every SUMMARY_INTERVAL_MIN minutes
+        (Req-30 summary timer): balance, position value, PnL, WR + the grouped
+        settle/redeem vs flip-scalp breakdown."""
+        if not self.pm:
+            return
+        s = self.pm.get_stats()
+        hdr = (f"⏲️ <b>Summary</b> (every {interval_min}m)\n"
+               if interval_min else "⏲️ <b>Summary</b>\n")
+        msg = (
+            hdr + f"{'-'*28}\n"
+            f"Mode: {s['mode']} | Balance: ${s['balance']:.2f}\n"
+            f"Positions value: ${s.get('position_value', 0.0):.2f} "
+            f"(open {s['open_positions']})\n"
+            f"Portfolio: ${s['portfolio_value']:.2f}\n"
+            f"PnL: ${s['total_pnl']:+.2f} ({s['roi_pct']:+.1f}%) | "
+            f"WR {s['win_rate']:.0f}% ({s['wins']}W/{s['losses']}L)\n"
+        )
+        msg += self._outcome_breakdown_text()
+        self.send(msg)
+
     def send_daily_summary(self):
         """Send end-of-day summary."""
         if not self.pm:
@@ -662,9 +705,11 @@ class TelegramBot:
             f"Today's PnL: ${today_pnl:+.2f}\n"
             f"Total PnL: ${stats['total_pnl']:+.2f}\n"
             f"Balance: ${stats['balance']:.2f}\n"
+            f"Positions value: ${stats.get('position_value', 0.0):.2f}\n"
             f"Portfolio: ${stats['portfolio_value']:.2f}\n"
             f"Win Rate: {stats['win_rate']:.0f}%\n"
         )
+        msg += self._outcome_breakdown_text()
         self.send(msg)
 
     # ==============================================================
@@ -787,9 +832,12 @@ class TelegramBot:
             f"WR {stats['win_rate']:.0f}% ({stats['wins']}W/{stats['losses']}L) | "
             f"Trades {stats['total_trades']} | Open {stats['open_positions']} | "
             f"Redeemed ${stats['total_redeemed']:.2f}\n"
+            f"Positions value ${stats.get('position_value', 0.0):.2f} | "
+            f"Portfolio ${stats['portfolio_value']:.2f}\n"
             f"{'-'*28}\n"
             f"<b>By strategy</b> (buys · W/L · WR · PnL)\n"
         )
+        text += self._outcome_breakdown_text()
         if not by_strat:
             text += "  (no trades yet)\n"
         else:

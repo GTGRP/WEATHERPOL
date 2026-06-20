@@ -141,6 +141,8 @@ class QuickFlipStrategy:
         self._last_prices: Dict[str, float] = {}
         # per token_id last signal time (dedup cooldown)
         self._recent_signals: Dict[str, datetime] = {}
+        # per market key first-seen time (Req-30 new-market hunting)
+        self._seen_markets: Dict[str, datetime] = {}
         self._load_cfg()
 
     def _load_cfg(self):
@@ -166,6 +168,9 @@ class QuickFlipStrategy:
         self.no_side_enabled = bool(g('QUICK_FLIP_NO_SIDE', 1))
         self.no_min_edge = float(g('QUICK_FLIP_NO_MIN_EDGE', g('QUICK_FLIP_MIN_EDGE', 0.10)))
         self.min_entry_price = float(g('QUICK_FLIP_MIN_ENTRY', 0.03))
+        # Req-30: boost a freshly-appeared market so we catch new mispricings early
+        self.new_market_boost = float(g('QUICK_FLIP_NEW_MARKET_BOOST', 0.10))
+        self.new_market_window_min = float(g('QUICK_FLIP_NEW_MARKET_WINDOW_MIN', 60.0))
 
     def should_poll_forecasts(self) -> bool:
         """True when we're inside the actionable window after a publish."""
@@ -235,7 +240,18 @@ class QuickFlipStrategy:
             except (TypeError, ValueError):
                 continue
 
-    def _boosted_confidence(self, base: float, run_changed: bool, in_window: bool, stale: bool) -> float:
+    def _is_new_market(self, key: str, now: datetime) -> bool:
+        """True while a market is still 'new' (first seen within the new-market
+        window). The first sighting records the timestamp. Req-30: lets the flip
+        consistently catch freshly-listed markets / mispricings early."""
+        first = self._seen_markets.get(key)
+        if first is None:
+            self._seen_markets[key] = now
+            return True
+        return (now - first).total_seconds() / 60.0 < self.new_market_window_min
+
+    def _boosted_confidence(self, base: float, run_changed: bool, in_window: bool,
+                            stale: bool, new_market: bool = False) -> float:
         conf = base
         if run_changed:
             conf += self.window_boost
@@ -243,6 +259,8 @@ class QuickFlipStrategy:
             conf += self.window_boost
         if stale:
             conf += self.stale_boost
+        if new_market:
+            conf += self.new_market_boost
         return min(1.0, conf)
 
     def evaluate(
@@ -267,6 +285,8 @@ class QuickFlipStrategy:
         now = datetime.now(timezone.utc)
         run_id, model, minutes = _current_run()
         in_window = minutes < self.window_min
+        # Req-30: is this a freshly-appeared market? (consistent new-market hunt)
+        is_new = self._is_new_market(f"{city}_{market_type}_{market_title}", now)
 
         change = self.detect_changes(city, market_type, bucket_probs, now, run_id)
         changed_labels = set(change.affected_buckets) if change else set()
@@ -343,7 +363,8 @@ class QuickFlipStrategy:
             stale = prev_price is not None and abs(float(market_prices.get(label, 0.0) or 0.0) - prev_price) < self.stale_eps
             edge_conf = max(0.0, min(1.0, edge / max(min_edge, 0.01) * 0.6))
             agree = float(getattr(bp, 'confidence', 0.0) or 0.0)
-            conf = self._boosted_confidence(max(edge_conf, agree), run_changed, in_window, stale)
+            conf = self._boosted_confidence(max(edge_conf, agree), run_changed,
+                                            in_window, stale, new_market=is_new)
             if conf < self.min_confidence:
                 continue
 
@@ -354,7 +375,8 @@ class QuickFlipStrategy:
             delta_c = abs(change.delta_c) if change else 0.0
             hold_minutes = min(self.max_hold_minutes, 30 + int(delta_c * 10))
             path = "+run" if run_changed else "+early"
-            tags = path + ("+window" if in_window else "") + ("+stale" if stale else "")
+            tags = (path + ("+window" if in_window else "")
+                    + ("+stale" if stale else "") + ("+new" if is_new else ""))
             disp = label if side == 'YES' else f"NO {label}"
 
             signals.append(QuickFlipSignal(

@@ -121,6 +121,14 @@ class Config:
     # endpoints are cooling down (comma-sep; supplements OPEN_METEO_ENDPOINTS).
     OPEN_METEO_FAILOVER_ENDPOINTS = [e.strip() for e in os.getenv('OPEN_METEO_FAILOVER_ENDPOINTS', '').split(',') if e.strip()]
 
+    # WEATHER-DATA BUY GUARD (Req-30) - NEVER place a buy without enough live
+    # weather data. fetch_all() returns nothing when every provider failed / is
+    # cooling down (the "Open-Meteo cooling down" / "observed fetch returned no
+    # data" errors). Require at least this many forecast models before a market
+    # is evaluated for buys; this single choke point protects EVERY strategy.
+    WEATHER_BUY_GUARD_ENABLED = os.getenv('WEATHER_BUY_GUARD_ENABLED', '1') == '1'
+    WEATHER_MIN_FORECAST_MODELS = int(os.getenv('WEATHER_MIN_FORECAST_MODELS', '1'))
+
     # ===================================================================
     # TRADING PARAMETERS
     # ===================================================================
@@ -368,6 +376,9 @@ class Config:
     # --- Req-28 NO-side flips ---
     QUICK_FLIP_NO_SIDE = os.getenv('QUICK_FLIP_NO_SIDE', '1') == '1'                      # also hunt mispriced NO tokens for the 10% flip
     QUICK_FLIP_NO_MIN_EDGE = float(os.getenv('QUICK_FLIP_NO_MIN_EDGE', '0.10'))           # min edge for a NO-side flip candidate
+    # --- Req-30 NEW-MARKET hunting: catch freshly-appeared mispricings early ---
+    QUICK_FLIP_NEW_MARKET_BOOST = float(os.getenv('QUICK_FLIP_NEW_MARKET_BOOST', '0.10')) # confidence boost while a market is still "new"
+    QUICK_FLIP_NEW_MARKET_WINDOW_MIN = float(os.getenv('QUICK_FLIP_NEW_MARKET_WINDOW_MIN', '60'))  # minutes a market counts as new
     # --- Req-27 PROFIT-ONLY LADDERED EXIT (trading/exit_policies.check_flip_exits) ---
     QUICK_FLIP_PROFIT_ONLY_EXIT = os.getenv('QUICK_FLIP_PROFIT_ONLY_EXIT', '1') == '1'    # never book a flip at a loss/breakeven on the timer
     QUICK_FLIP_USE_ML_EXIT = os.getenv('QUICK_FLIP_USE_ML_EXIT', '1') == '1'              # let the ML decide sell-small vs run-more
@@ -530,6 +541,9 @@ class Config:
     # ===================================================================
     SCAN_INTERVAL_SECONDS = int(os.getenv('SCAN_INTERVAL_SECONDS', '60'))
     SCAN_DAYS_AHEAD = int(os.getenv('SCAN_DAYS_AHEAD', '3'))
+    # Req-30 SUMMARY TIMER - push a periodic Telegram status summary every N
+    # minutes (0 = off). Set live from /settings (e.g. 15 / 30 / 60).
+    SUMMARY_INTERVAL_MIN = int(os.getenv('SUMMARY_INTERVAL_MIN', '0'))
 
     # ===================================================================
     # PAPER-REALISM - make the dry run behave like real trading
