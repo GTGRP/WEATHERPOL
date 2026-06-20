@@ -9,11 +9,19 @@ The ML is used for:
 5. Narrative trade reports for /mlanalysis
 
 Design:
-- MINIMAL TOKENS per call, MARKET-SCOPED CONTEXT, FAST single API call.
+- MARKET-SCOPED CONTEXT, FAST single API call.
 - ALWAYS degrades gracefully to the local model / rules when no API key or the
   API fails, so the bot never blocks on the network.
+
+Req-31: the Freemodel gpt-5.x models are REASONING models - they emit a
+<think>...</think> block (~7s) BEFORE the JSON answer. The old engine used an
+8s timeout, a 40-60 token cap and a fences-only parser, so every reasoning
+reply truncated / timed out and silently fell back to the local model even with
+a valid key. This version reads timeout + token budgets from config, strips the
+<think> preamble, and tolerantly extracts the JSON answer.
 """
 
+import re
 import time
 import json
 import requests
@@ -31,6 +39,13 @@ class MLDecisionEngine:
         self.base_url = (Config.ML_API_URL or '').rstrip('/')
         self.api_key = Config.ML_API_KEY
         self.model = Config.ML_MODEL
+        self.analysis_model = getattr(Config, 'ML_ANALYSIS_MODEL', self.model)
+        # Req-31: reasoning-model aware budgets, read from config (no more 8s/60tok
+        # hardcodes that silently truncated every reply).
+        self.timeout = float(getattr(Config, 'ML_QUERY_TIMEOUT', 30))
+        self.decision_max_tokens = int(getattr(Config, 'ML_DECISION_MAX_TOKENS', 700))
+        self.analysis_max_tokens = int(getattr(Config, 'ML_ANALYSIS_MAX_TOKENS', 1200))
+        self.analysis_enabled = bool(getattr(Config, 'ML_ANALYSIS_ENABLED', True))
         self.enabled = bool(self.api_key)
         self._session = requests.Session()
         self._session.headers.update({
@@ -50,7 +65,8 @@ class MLDecisionEngine:
         self._max_api_failures = 5
 
         if self.enabled:
-            log.info(f"  ML Engine: {self.model} via {self.base_url[:34]}...")
+            log.info(f"  ML Engine: {self.model} (analysis {self.analysis_model}) "
+                     f"via {self.base_url[:34]}...")
         else:
             log.info("  ML Engine: API key not set - using LOCAL model only")
 
@@ -118,7 +134,7 @@ class MLDecisionEngine:
             f"Forecast:{forecast_temp:.1f}C Models:{n_models}{cwr_txt}\n"
             f"History:{weekly_context[:80]}"
         )
-        result = self._query(prompt, max_tokens=60)
+        result = self._query(prompt)
         self._cache[cache_key] = (now, result)
         return result
 
@@ -160,7 +176,7 @@ class MLDecisionEngine:
             f"Now:${current_price:.3f} ROI:{roi_pct:+.0f}% "
             f"Held:{hold_hours:.0f}h Left:{resolution_hours:.0f}h " + ' '.join(ctx)
         )
-        return self._query(prompt, max_tokens=50)
+        return self._query(prompt)
 
     # ------------------------------------------------------------------ #
     # 3) Mid-trade PROFIT decision (book vs run; 300% cap)
@@ -220,7 +236,7 @@ class MLDecisionEngine:
             f"Now:${current_price:.3f} ROI:{roi_pct:+.0f}% Held:{hold_hours:.0f}h "
             f"Left:{resolution_hours:.0f}h " + ' '.join(ctx)
         )
-        res = self._query(prompt, max_tokens=60)
+        res = self._query(prompt)
         act = str(res.get('action', '')).upper()
         if act not in ('BOOK', 'HOLD'):
             act = 'HOLD' if fallback_hold else 'BOOK'
@@ -245,9 +261,9 @@ class MLDecisionEngine:
             f"Available: {','.join(available_cities[:15])}\n"
             f"Performance: {weekly_context[:100]}"
         )
-        result = self._query(prompt, max_tokens=40)
+        result = self._query(prompt)
         if isinstance(result.get('raw'), list):
-            return result['raw']
+            return [str(c) for c in result['raw'] if isinstance(c, (str, int, float))]
         return available_cities[:8]
 
     # ------------------------------------------------------------------ #
@@ -257,9 +273,10 @@ class MLDecisionEngine:
                            by_city: Optional[Dict] = None,
                            recent: Optional[List[Dict]] = None) -> str:
         """Produce a narrative report of how trading is going. Uses the LLM when
-        available, otherwise a heuristic summary. Always returns a string."""
+        available AND /mlanalysis is enabled, otherwise a heuristic summary.
+        Always returns a string."""
         heur = self._report_heuristic(stats, by_strat, by_city)
-        if not self.enabled:
+        if not self.enabled or not self.analysis_enabled:
             return heur
 
         s = stats or {}
@@ -295,20 +312,21 @@ class MLDecisionEngine:
             resp = self._session.post(
                 f"{self.base_url}/chat/completions",
                 json={
-                    'model': self.model,
+                    'model': self.analysis_model,
                     'messages': [
                         {'role': 'system', 'content': 'You are a concise quantitative trading analyst.'},
                         {'role': 'user', 'content': prompt},
                     ],
-                    'max_tokens': 340, 'temperature': 0.3,
+                    'max_tokens': self.analysis_max_tokens, 'temperature': 0.3,
                 },
-                timeout=15,
+                timeout=max(self.timeout, 30),
             )
             if resp.status_code == 200:
                 data = resp.json()
                 self._total_tokens_used += data.get('usage', {}).get('total_tokens', 0)
                 txt = (data.get('choices', [{}])[0].get('message', {})
                        .get('content', '') or '').strip()
+                txt = self._strip_reasoning(txt).strip()
                 self._last_ok_ts = time.time()
                 if txt:
                     return txt
@@ -343,13 +361,14 @@ class MLDecisionEngine:
             parts.append("Win rate is far below the 80-90% target wallets; entries "
                          "are likely too speculative - tighten edge/liquidity gates "
                          "and lean on the observed/hold-to-resolution book.")
-        parts.append("(Heuristic report - set ML_API_KEY for an LLM-written analysis.)")
+        parts.append("(Heuristic report - enable /mlanalysis + set ML_API_KEY for an LLM-written analysis.)")
         return ' '.join(parts)
 
     # ------------------------------------------------------------------ #
     # Core query + parsing
     # ------------------------------------------------------------------ #
-    def _query(self, prompt: str, max_tokens: int = 60) -> Dict:
+    def _query(self, prompt: str, max_tokens: Optional[int] = None) -> Dict:
+        mt = int(max_tokens or self.decision_max_tokens)
         try:
             self._total_calls += 1
             resp = self._session.post(
@@ -357,13 +376,13 @@ class MLDecisionEngine:
                 json={
                     'model': self.model,
                     'messages': [
-                        {'role': 'system', 'content': 'You are a weather trading assistant. Reply with JSON only. Be extremely concise.'},
+                        {'role': 'system', 'content': 'You are a weather trading assistant. Think briefly if needed, then reply with the JSON answer only.'},
                         {'role': 'user', 'content': prompt},
                     ],
-                    'max_tokens': max_tokens,
+                    'max_tokens': mt,
                     'temperature': 0.1,
                 },
-                timeout=8,
+                timeout=self.timeout,
             )
             if resp.status_code != 200:
                 self._api_failures += 1
@@ -397,16 +416,65 @@ class MLDecisionEngine:
         return {"action": default_action, "confidence": 0.5,
                 "reason": f"fallback: {reason}", "source": "fallback"}
 
+    # --- Req-31: reasoning-model aware parsing ------------------------- #
+    _THINK_BLOCK_RE = re.compile(r'(?is)<think>.*?</think>')
+    _THINK_OPEN_RE = re.compile(r'(?is)<think>.*$')
+
+    @staticmethod
+    def _strip_reasoning(text: str) -> str:
+        """Remove a reasoning model's <think>...</think> preamble (and any
+        dangling, unclosed <think> tail) so only the final answer remains."""
+        if not text:
+            return ''
+        text = MLDecisionEngine._THINK_BLOCK_RE.sub('', text)
+        text = MLDecisionEngine._THINK_OPEN_RE.sub('', text)
+        return text.strip()
+
+    @staticmethod
+    def _loads_json(s: str):
+        """Parse JSON, tolerating extra prose by extracting the first balanced
+        {...} object or [...] array. Returns the parsed value or None."""
+        s = (s or '').strip()
+        if not s:
+            return None
+        try:
+            return json.loads(s)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        for open_ch, close_ch in (('{', '}'), ('[', ']')):
+            start = s.find(open_ch)
+            if start < 0:
+                continue
+            depth = 0
+            for i in range(start, len(s)):
+                c = s[i]
+                if c == open_ch:
+                    depth += 1
+                elif c == close_ch:
+                    depth -= 1
+                    if depth == 0:
+                        frag = s[start:i + 1]
+                        try:
+                            return json.loads(frag)
+                        except (json.JSONDecodeError, ValueError):
+                            break
+        return None
+
     def _parse_response(self, content: str) -> Dict:
         content = (content or '').strip()
+        # Req-31: strip the reasoning model's <think>...</think> preamble first.
+        content = self._strip_reasoning(content)
         if content.startswith('```'):
             content = content.split('\n', 1)[-1].rsplit('```', 1)[0].strip()
-        try:
-            parsed = json.loads(content)
-            if isinstance(parsed, list):
-                return {'raw': parsed, 'action': 'SELECT', 'confidence': 0.8, 'reason': ''}
-            action = parsed.get('action', parsed.get('act', 'BUY')).upper()
-            confidence = float(parsed.get('conf', parsed.get('confidence', 0.5)))
+        parsed = self._loads_json(content)
+        if isinstance(parsed, list):
+            return {'raw': parsed, 'action': 'SELECT', 'confidence': 0.8, 'reason': ''}
+        if isinstance(parsed, dict):
+            action = str(parsed.get('action', parsed.get('act', 'BUY'))).upper()
+            try:
+                confidence = float(parsed.get('conf', parsed.get('confidence', 0.5)))
+            except (ValueError, TypeError):
+                confidence = 0.5
             reason = parsed.get('why', parsed.get('reason', ''))
             out = {
                 'action': action,
@@ -420,15 +488,15 @@ class MLDecisionEngine:
                 except (ValueError, TypeError):
                     pass
             return out
-        except (json.JSONDecodeError, ValueError, TypeError):
-            cu = content.upper()
-            if 'SKIP' in cu:
-                return {'action': 'SKIP', 'confidence': 0.5, 'reason': 'parsed from text'}
-            if 'SELL' in cu or 'BOOK' in cu:
-                return {'action': 'SELL', 'confidence': 0.5, 'reason': 'parsed from text'}
-            if 'HOLD' in cu:
-                return {'action': 'HOLD', 'confidence': 0.5, 'reason': 'parsed from text'}
-            return {'action': 'BUY', 'confidence': 0.5, 'reason': 'parse failed'}
+        # Fallback: keyword scan on the cleaned text.
+        cu = content.upper()
+        if 'SKIP' in cu:
+            return {'action': 'SKIP', 'confidence': 0.5, 'reason': 'parsed from text'}
+        if 'SELL' in cu or 'BOOK' in cu:
+            return {'action': 'SELL', 'confidence': 0.5, 'reason': 'parsed from text'}
+        if 'HOLD' in cu:
+            return {'action': 'HOLD', 'confidence': 0.5, 'reason': 'parsed from text'}
+        return {'action': 'BUY', 'confidence': 0.5, 'reason': 'parse failed'}
 
     # ------------------------------------------------------------------ #
     # Status / self-test
@@ -441,10 +509,13 @@ class MLDecisionEngine:
         return {
             'enabled': self.enabled,
             'model': self.model if self.enabled else 'local',
+            'analysis_model': self.analysis_model if self.enabled else 'local',
+            'analysis_enabled': self.analysis_enabled,
             'local_model': local_status.get("model", "none"),
             'tokens_used': self._total_tokens_used,
             'calls': self._total_calls,
             'api_failures': self._api_failures,
+            'timeout_s': self.timeout,
             'last_error': self._last_error,
             'cache_size': len(self._cache),
         }
@@ -460,8 +531,8 @@ class MLDecisionEngine:
                 f"{self.base_url}/chat/completions",
                 json={'model': self.model,
                       'messages': [{'role': 'user', 'content': 'Reply with the single word OK.'}],
-                      'max_tokens': 5, 'temperature': 0.0},
-                timeout=15,
+                      'max_tokens': self.decision_max_tokens, 'temperature': 0.0},
+                timeout=max(self.timeout, 15),
             )
             dt = time.time() - t0
             ok = resp.status_code == 200
@@ -469,6 +540,7 @@ class MLDecisionEngine:
             if ok:
                 body = (resp.json().get('choices', [{}])[0].get('message', {})
                         .get('content', '') or '').strip()
+                body = self._strip_reasoning(body)
             return {'ok': ok, 'status': resp.status_code, 'latency_s': round(dt, 2),
                     'reply': body[:60], 'url': self.base_url, 'model': self.model,
                     'error': '' if ok else resp.text[:120]}
