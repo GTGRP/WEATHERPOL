@@ -86,6 +86,73 @@ def _ml_profit(pos, mode):
         return {'action': 'HOLD' if mode == 'cap' else 'BOOK', 'reason': 'err'}
 
 
+def check_ml_reviews(pm):
+    """Req-31: the ML reviews each eligible OPEN position and may trigger an
+    EARLY SELL when it is CONFIDENT the position should be cut. Conservative by
+    design so it never forces a bad exit:
+      - only when ML_REVIEW_POSITIONS is on and the API is live;
+      - skips quick_flip (its own ladder handles it), hold-to-resolution legs,
+        stale-price and zero-price positions;
+      - requires a minimum hold time and minimum time-to-close;
+      - only acts on a SELL with confidence >= ML_REVIEW_SELL_CONF;
+      - caps ML calls per scan (budget / latency guard).
+    HOLD or any low-confidence answer changes nothing."""
+    if not _cfg('ML_REVIEW_POSITIONS', False):
+        return []
+    ml = _get_ml()
+    if ml is None or not getattr(ml, 'enabled', False):
+        return []
+    sell_conf = float(_cfg('ML_REVIEW_SELL_CONF', 0.72))
+    min_hold = float(_cfg('ML_REVIEW_MIN_HOLD_MIN', 20.0))
+    min_mtc = float(_cfg('ML_REVIEW_MIN_MTC_MIN', 45.0))
+    budget = int(_cfg('ML_REVIEW_MAX_PER_SCAN', 6))
+    triggered = []
+    used = 0
+    for pos in pm.get_open_positions():
+        if used >= budget:
+            break
+        if pos.strategy == 'quick_flip':
+            continue
+        if getattr(pos, 'hold_to_resolution', False):
+            continue
+        if getattr(pos, 'current_price_stale', False):
+            continue
+        if pos.current_price <= 0:
+            continue
+        if pos.hold_hours * 60.0 < min_hold:
+            continue
+        mtc = pos.minutes_to_close
+        if mtc is not None and mtc < min_mtc:
+            continue
+        used += 1
+        try:
+            res_hours = (mtc / 60.0) if mtc is not None else 24.0
+            d = ml.review_position(
+                pos.city, pos.bucket_label, pos.entry_price, pos.current_price,
+                pos.hold_hours, res_hours, strategy=pos.strategy,
+                roi_pct=pos.roi_pct, peak_roi=_peak_roi(pos),
+                edge=getattr(pos, 'edge_at_entry', None),
+            )
+        except Exception as e:
+            log.debug(f"ml review failed: {e}")
+            continue
+        action = str(d.get('action', 'HOLD')).upper()
+        try:
+            conf = float(d.get('confidence', d.get('conf', 0.0)) or 0.0)
+        except (ValueError, TypeError):
+            conf = 0.0
+        if action == 'SELL' and conf >= sell_conf:
+            pm._close_position(pos, pos.current_price, 'ml_review_sell')
+            triggered.append(pos)
+            log.info(f"ML REVIEW SELL ({conf:.0%}): {pos.city} {pos.bucket_label[:28]} "
+                     f"ROI={pos.roi_pct:+.0f}% @ ${pos.current_price:.4f} "
+                     f"PnL=${pos.pnl:+.2f} — {str(d.get('reason', ''))[:48]}")
+    if triggered:
+        pm._save_state()
+        pm._assert_ledger()
+    return triggered
+
+
 def check_flip_exits(pm):
     """quick_flip +10% / -5% exit with ML-managed upside."""
     if not _cfg('QUICK_FLIP_TIME_EXIT', True):

@@ -167,10 +167,11 @@ class WeatherBot:
             flip_exits = exit_policies.check_flip_exits(self.pm)    # quick_flip +10%/-5% + ML upside
             cap_exits = exit_policies.check_profit_caps(self.pm)    # Req-30: global 300% ML-managed cap
             thesis_exits = exit_policies.check_thesis_exits(self.pm)  # strict thesis-invalidation (very bad only)
-            # Flip/cap/thesis closes pass their real reason into _close_position;
-            # the PM _notify_close hook skips those reasons (DASHBOARD_NOTIFIED_
-            # REASONS) so they are notified ONCE here (no double-notify).
-            for _p in (flip_exits or []) + (cap_exits or []) + (thesis_exits or []):
+            ml_review_exits = exit_policies.check_ml_reviews(self.pm)  # Req-31: ML early HOLD/SELL position review
+            # Flip/cap/thesis/ml-review closes pass their real reason into
+            # _close_position; the PM _notify_close hook skips those reasons
+            # (DASHBOARD_NOTIFIED_REASONS) so they are notified ONCE here.
+            for _p in (flip_exits or []) + (cap_exits or []) + (thesis_exits or []) + (ml_review_exits or []):
                 try:
                     self.telegram.notify_close(_p)
                 except Exception as e:
@@ -192,6 +193,12 @@ class WeatherBot:
             return
 
         log.info(f"Found {len(markets)} active weather markets")
+
+        # Req-31: let the ML rank today's cities so the per-scan buy budget is
+        # spent on the highest-conviction markets first. Ordering ONLY — no
+        # market is dropped, so nothing profitable is skipped. No-op when the
+        # ML or ML_SELECT_MARKETS is off.
+        markets = self._ml_prioritize_markets(markets)
 
         # Balance early-out: if free balance can't cover even a minimum order,
         # don't bother scanning for buys this cycle — wait for open positions to
@@ -235,6 +242,40 @@ class WeatherBot:
             except Exception as e:
                 log.debug(f"periodic summary failed: {e}")
             self._last_summary_ts = time.time()
+
+    def _ml_prioritize_markets(self, markets):
+        """Reorder markets so the ML's top-ranked cities are evaluated first.
+        Ordering only — never drops a market. Safe no-op when ML / ML_SELECT_
+        MARKETS is off or the engine has no API key."""
+        try:
+            if not (getattr(Config, 'ML_ENABLED', True) and getattr(Config, 'ML_SELECT_MARKETS', False)):
+                return markets
+            ml = getattr(self, 'ml', None)
+            if ml is None or not getattr(ml, 'enabled', False):
+                return markets
+            cities = []
+            for m in markets:
+                c = getattr(m, 'city', None)
+                if c and c not in cities:
+                    cities.append(c)
+            if len(cities) <= 1:
+                return markets
+            wk = ''
+            try:
+                if hasattr(self.pm, 'get_weekly_context'):
+                    wk = self.pm.get_weekly_context() or ''
+            except Exception:
+                wk = ''
+            ranked = ml.select_markets(cities, weekly_context=wk) or []
+            if not ranked:
+                return markets
+            rank = {str(c).strip().lower(): i for i, c in enumerate(ranked)}
+            markets.sort(key=lambda m: rank.get(str(getattr(m, 'city', '')).strip().lower(), 999))
+            log.info(f"  🧠 ML market priority: {', '.join(str(c) for c in ranked[:5])}")
+            return markets
+        except Exception as e:
+            log.debug(f"ml prioritise failed: {e}")
+            return markets
 
     # -----------------------------------------------------------------
     # STABILITY GRADE + LIQUIDITY — applied across every strategy

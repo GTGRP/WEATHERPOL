@@ -573,9 +573,32 @@ class Config:
     # ===================================================================
     # ML DECISION ENGINE (GPT-5.5 via Freemodel)
     # ===================================================================
-    ML_API_URL = os.getenv('ML_API_URL', 'https://vip-sg.freemodel.dev/v1')
+    ML_API_URL = os.getenv('ML_API_URL', 'https://api.freemodel.dev/v1')
     ML_API_KEY = os.getenv('ML_API_KEY', '')
-    ML_MODEL = os.getenv('ML_MODEL', 'gpt-5.5')
+    # Decision model: used for the FREQUENT per-market / per-position calls. Default
+    # gpt-5.4-mini = fast + cheap. The heavy reasoning model (gpt-5.5) is reserved
+    # for the occasional /mlanalysis narrative (ML_ANALYSIS_MODEL) so the scan loop
+    # stays snappy and the bot isn't waiting ~7s on every market.
+    ML_MODEL = os.getenv('ML_MODEL', 'gpt-5.4-mini')
+    ML_ANALYSIS_MODEL = os.getenv('ML_ANALYSIS_MODEL', 'gpt-5.5')
+    # /mlanalysis on/off (the LLM narrative report). When OFF a local heuristic
+    # report is used instead (no API call).
+    ML_ANALYSIS_ENABLED = os.getenv('ML_ANALYSIS_ENABLED', '1') == '1'
+    # The Freemodel gpt-5.x models are REASONING models: they emit a <think>...</think>
+    # block (~7s) BEFORE the JSON answer. Give them enough tokens + time, otherwise
+    # the JSON truncates / the call times out and the bot silently falls back to the
+    # local rules even though the key is set.
+    ML_QUERY_TIMEOUT = float(os.getenv('ML_QUERY_TIMEOUT', '30'))
+    ML_DECISION_MAX_TOKENS = int(os.getenv('ML_DECISION_MAX_TOKENS', '700'))
+    ML_ANALYSIS_MAX_TOKENS = int(os.getenv('ML_ANALYSIS_MAX_TOKENS', '1200'))
+    # Extra ML wiring (Req-31): let ML review OPEN positions for an early HOLD/SELL,
+    # and prioritise which cities get evaluated first each scan (ordering only).
+    ML_REVIEW_POSITIONS = os.getenv('ML_REVIEW_POSITIONS', '1') == '1'
+    ML_REVIEW_SELL_CONF = float(os.getenv('ML_REVIEW_SELL_CONF', '0.72'))   # only a CONFIDENT SELL acts
+    ML_REVIEW_MIN_HOLD_MIN = float(os.getenv('ML_REVIEW_MIN_HOLD_MIN', '20'))
+    ML_REVIEW_MIN_MTC_MIN = float(os.getenv('ML_REVIEW_MIN_MTC_MIN', '45'))
+    ML_REVIEW_MAX_PER_SCAN = int(os.getenv('ML_REVIEW_MAX_PER_SCAN', '6'))
+    ML_SELECT_MARKETS = os.getenv('ML_SELECT_MARKETS', '1') == '1'
 
     # ===================================================================
     # LOGGING

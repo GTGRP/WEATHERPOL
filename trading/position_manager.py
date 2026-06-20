@@ -66,7 +66,7 @@ BASKET_STRATEGIES = ('peak_cluster', 'peaker_cool_basket', 'peaker_warm_basket')
 # them so we don't double-notify. 'manual' is user-initiated from Telegram.
 DASHBOARD_NOTIFIED_REASONS = (
     'manual', 'flip_stop', 'flip_book', 'flip_book_mid', 'flip_timeout',
-    'profit_cap_book', 'thesis_invalidated',
+    'profit_cap_book', 'thesis_invalidated', 'ml_review_sell',
 )
 
 

@@ -1121,6 +1121,9 @@ class TelegramBot:
         if not ml or not getattr(ml, 'enabled', False):
             return ("<i>ML narrative inactive — set ML_API_KEY to let the model "
                     "write the report. Heuristic analysis below.</i>")
+        if not getattr(Config, 'ML_ANALYSIS_ENABLED', True):
+            return ("<i>ML Analysis is turned OFF (toggle it on in ⚙️ Settings › ML). "
+                    "Heuristic analysis below.</i>")
         try:
             if hasattr(ml, 'write_trade_report'):
                 return self._esc(ml.write_trade_report(stats, by_strat, by_city))
@@ -1232,8 +1235,11 @@ class TelegramBot:
         'SNIPER_ENABLED': 'Sniper',
         'SPREAD_ENABLED': 'Spread',
         'STABILITY_ENABLED': 'Stability',
-        'ML_ENABLED': 'ML',
+        'ML_ENABLED': 'Use ML',
         'ML_DECISION_ENABLED': 'ML-Decide',
+        'ML_ANALYSIS_ENABLED': 'ML Analysis',
+        'ML_REVIEW_POSITIONS': 'ML Review-Pos',
+        'ML_SELECT_MARKETS': 'ML Market-Pick',
         'AUTO_REDEEM_ENABLED': 'Auto-Redeem',
         'PORTFOLIO_GUARD_ENABLED': 'Port-Guard',
         'QUICK_FLIP_PROFIT_ONLY_EXIT': 'Flip profit-only',
@@ -1273,6 +1279,8 @@ class TelegramBot:
         g = next((x for x in groups if x['id'] == gid), groups[0])
         gid = g['id']
         bkeys, nkeys = settings_store.group_keys(gid)
+        skeys = settings_store.group_str_keys(gid)
+        strs = settings_store.str_snapshot()
 
         mode = '📋 PAPER' if Config.is_paper() else '🔴 LIVE'
         master = '🟢 ON' if bools.get('TRADING_ENABLED') else '🔴 OFF'
@@ -1290,6 +1298,10 @@ class TelegramBot:
             text += "\n<b>Gates</b>\n"
             for k in nkeys:
                 text += f"  • {self._esc(k)} = <b>{self._fmt_num(nums.get(k))}</b>\n"
+        if skeys:
+            text += "\n<b>Models / Choices</b>\n"
+            for k in skeys:
+                text += f"  • {self._esc(k)} = <b>{self._esc(str(strs.get(k)))}</b>\n"
         text += "\n<i>Or type /set KEY VALUE · /toggle KEY</i>"
 
         rows = []
@@ -1319,6 +1331,11 @@ class TelegramBot:
                 {'text': f"➖{self._fmt_num(step)}", 'callback_data': f"dn:{k}:{gid}"},
                 {'text': f"{k} = {self._fmt_num(v)}", 'callback_data': 'noop'},
                 {'text': f"➕{self._fmt_num(step)}", 'callback_data': f"up:{k}:{gid}"},
+            ])
+        # String/choice settings (e.g. ML model): tap to cycle to the next value.
+        for k in skeys:
+            rows.append([
+                {'text': f"🔁 {self._label(k)}: {strs.get(k)}", 'callback_data': f"cy:{k}:{gid}"},
             ])
         # Req-29: type-to-change starting balance + an OK/Apply button that
         # summarises changes and offers Start. Shown on every tab.
@@ -1438,6 +1455,8 @@ class TelegramBot:
         ok, msg = False, 'no change'
         if action == 'tg':
             ok, msg = settings_store.toggle(key)
+        elif action == 'cy':
+            ok, msg = settings_store.cycle(key)
         elif action == 'up':
             ok, msg = settings_store.bump(key, +1)
         elif action == 'dn':
