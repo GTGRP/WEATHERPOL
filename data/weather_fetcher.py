@@ -5,9 +5,12 @@ Sources:
 1. Open-Meteo (free, no key, global coverage, multiple models)
 2. OpenWeatherMap (key required, good hourly forecasts)
 3. weather.gov (free, US only, NWS forecasts)
+4. WeatherAPI.com (key required, global, hourly + daily max/min)
+5. Visual Crossing (key required, global, hourly + daily max/min)
 
 Each source returns standardized forecast data that feeds into
-the probability engine.
+the probability engine. More independent members = a tighter, more accurate
+ensemble and automatic failover when any single provider is down/limited.
 
 Open-Meteo's free tier allows ~10k calls/day. To spread that budget and reduce
 single-IP rate-limit risk, the fetcher round-robins across the endpoints in
@@ -15,6 +18,7 @@ Config.OPEN_METEO_ENDPOINTS (default = the single public endpoint). Add a second
 mirror / self-hosted instance there and calls alternate automatically.
 """
 
+import os
 import time
 import requests
 from typing import Dict, List, Optional, Tuple
@@ -28,8 +32,8 @@ from logger import log
 @dataclass
 class ForecastPoint:
     """A single forecast data point."""
-    source: str           # 'open_meteo', 'openweather', 'weather_gov'
-    model: str            # 'ECMWF', 'GFS', 'ICON', etc.
+    source: str           # 'open_meteo', 'openweather', 'weather_gov', 'weatherapi', 'visualcrossing'
+    model: str            # 'ECMWF', 'GFS', 'ICON', 'WAPI', 'VC', etc.
     location: str         # city or lat,lon
     timestamp: datetime   # forecast valid time (UTC)
     temp_c: float         # temperature in Celsius
@@ -54,6 +58,15 @@ class WeatherFetcher:
         self._om_idx = 0  # round-robin index across Open-Meteo endpoints
         # endpoint URL -> epoch time when it may be retried after a rate/IP limit
         self._om_cooldowns: Dict[str, float] = {}
+
+    # ── API keys (Config attr first, then environment) ───────────────────
+    @staticmethod
+    def _weatherapi_key() -> Optional[str]:
+        return getattr(Config, 'WEATHERAPI_API_KEY', None) or os.getenv('WEATHERAPI_API_KEY')
+
+    @staticmethod
+    def _visualcrossing_key() -> Optional[str]:
+        return getattr(Config, 'VISUALCROSSING_API_KEY', None) or os.getenv('VISUALCROSSING_API_KEY')
 
     def _open_meteo_endpoints(self) -> List[str]:
         """Primary Open-Meteo endpoints + optional failover mirrors.
@@ -182,6 +195,22 @@ class WeatherFetcher:
             except Exception as e:
                 log.warning(f"weather.gov fetch failed: {e}")
 
+        # 4. WeatherAPI.com (global, key required)
+        if self._weatherapi_key():
+            try:
+                wa_results = self._fetch_weatherapi(lat, lon, city, target_time)
+                results.extend(wa_results)
+            except Exception as e:
+                log.warning(f"WeatherAPI fetch failed: {e}")
+
+        # 5. Visual Crossing (global, key required)
+        if self._visualcrossing_key():
+            try:
+                vc_results = self._fetch_visualcrossing(lat, lon, city, target_time)
+                results.extend(vc_results)
+            except Exception as e:
+                log.warning(f"Visual Crossing fetch failed: {e}")
+
         self._cache[cache_key] = (now, results)
         log.info(f"Fetched {len(results)} forecast points for {city or f'{lat},{lon}'}")
         return results
@@ -190,7 +219,8 @@ class WeatherFetcher:
                           target_time: datetime = None) -> List[ForecastPoint]:
         """
         Open-Meteo: SINGLE batch request with all models for speed.
-        Previously made 5 sequential requests — now 1 batch call.
+        Pulls hourly temp + humidity/wind/precip/cloud AND the daily max/min for
+        each model, so high/low-temperature markets can key off the day extreme.
         Endpoint is chosen round-robin across Config.OPEN_METEO_ENDPOINTS, with
         automatic failover to the next mirror when one is rate/IP limited.
         """
@@ -206,6 +236,7 @@ class WeatherFetcher:
             'latitude': lat,
             'longitude': lon,
             'hourly': 'temperature_2m,relative_humidity_2m,wind_speed_10m,precipitation,cloud_cover',
+            'daily': 'temperature_2m_max,temperature_2m_min',
             'models': ','.join(models),
             'timezone': 'UTC',
             'forecast_days': 3,
@@ -221,14 +252,33 @@ class WeatherFetcher:
             if not times:
                 return results
 
+            daily = data.get('daily', {})
+            daily_times = daily.get('time', [])
+
             for model in models:
-                # Open-Meteo returns model-suffixed keys or plain keys
-                temp_key = f'temperature_2m_{model}'
-                temps = hourly.get(temp_key, [])
+                def _harr(base):
+                    """Hourly array for this model (model-suffixed key → plain key)."""
+                    arr = hourly.get(f'{base}_{model}')
+                    if not arr:
+                        arr = hourly.get(base, [])
+                    return arr or []
+
+                temps = _harr('temperature_2m')
                 if not temps:
-                    temps = hourly.get('temperature_2m', [])
-                    if not temps:
-                        continue
+                    continue
+                hums = _harr('relative_humidity_2m')
+                winds = _harr('wind_speed_10m')
+                precs = _harr('precipitation')
+                clouds = _harr('cloud_cover')
+
+                # Per-day max/min for THIS model (date 'YYYY-MM-DD' → (max, min)).
+                dmax = daily.get(f'temperature_2m_max_{model}') or daily.get('temperature_2m_max', [])
+                dmin = daily.get(f'temperature_2m_min_{model}') or daily.get('temperature_2m_min', [])
+                day_map = {}
+                for di, dstr in enumerate(daily_times):
+                    mx = dmax[di] if di < len(dmax) else None
+                    mn = dmin[di] if di < len(dmin) else None
+                    day_map[str(dstr)[:10]] = (mx, mn)
 
                 for i, t_str in enumerate(times):
                     if i >= len(temps) or temps[i] is None:
@@ -240,12 +290,23 @@ class WeatherFetcher:
                     if target_time and abs((t - target_time).total_seconds()) > 7200:
                         continue
 
+                    tmax, tmin = day_map.get(str(t_str)[:10], (None, None))
+
+                    def _at(arr):
+                        return arr[i] if i < len(arr) and arr[i] is not None else None
+
                     fp = ForecastPoint(
                         source='open_meteo',
                         model=model.replace('_seamless', '').replace('_ifs04', '').upper(),
                         location=city or f"{lat},{lon}",
                         timestamp=t,
                         temp_c=temps[i],
+                        temp_max_c=tmax,
+                        temp_min_c=tmin,
+                        humidity_pct=_at(hums),
+                        wind_speed_kmh=_at(winds),
+                        precip_mm=_at(precs),
+                        cloud_cover_pct=_at(clouds),
                         confidence=model_confidence.get(model, 0.7),
                     )
                     results.append(fp)
@@ -312,7 +373,7 @@ class WeatherFetcher:
         results = []
 
         # Step 1: Get gridpoint
-        points_url = f"{{https://api.weather.gov/points/{lat:.4f}}},{lon:.4f}"
+        points_url = f"https://api.weather.gov/points/{lat:.4f},{lon:.4f}"
         resp = self.session.get(points_url, timeout=10)
         if resp.status_code != 200:
             return results
@@ -366,10 +427,115 @@ class WeatherFetcher:
 
         return results
 
+    def _fetch_weatherapi(self, lat: float, lon: float, city: str,
+                          target_time: datetime = None) -> List[ForecastPoint]:
+        """WeatherAPI.com forecast.json — global, 3-day hourly with the day's
+        max/min (day.maxtemp_c / day.mintemp_c) attached to every hour so high/
+        low-temperature markets resolve against the true daily extreme."""
+        results = []
+        key = self._weatherapi_key()
+        if not key:
+            return results
+        url = "https://api.weatherapi.com/v1/forecast.json"
+        params = {'key': key, 'q': f"{lat},{lon}", 'days': 3,
+                  'aqi': 'no', 'alerts': 'no'}
+        try:
+            resp = self.session.get(url, params=params, timeout=10)
+            if resp.status_code != 200:
+                log.debug(f"WeatherAPI HTTP {resp.status_code}")
+                return results
+            data = resp.json()
+        except Exception as e:
+            log.debug(f"WeatherAPI request failed: {e}")
+            return results
 
-# ═════════════════════════════════════════════════════════════════════
+        for day in data.get('forecast', {}).get('forecastday', []):
+            d = day.get('day', {})
+            tmax = d.get('maxtemp_c')
+            tmin = d.get('mintemp_c')
+            for hour in day.get('hour', []):
+                epoch = hour.get('time_epoch')
+                if epoch is None:
+                    continue
+                try:
+                    t = datetime.fromtimestamp(epoch, tz=timezone.utc)
+                except Exception:
+                    continue
+                if target_time and abs((t - target_time).total_seconds()) > 7200:
+                    continue
+                fp = ForecastPoint(
+                    source='weatherapi',
+                    model='WAPI',
+                    location=city or f"{lat},{lon}",
+                    timestamp=t,
+                    temp_c=hour.get('temp_c', 0),
+                    temp_max_c=tmax,
+                    temp_min_c=tmin,
+                    humidity_pct=hour.get('humidity'),
+                    wind_speed_kmh=hour.get('wind_kph'),
+                    precip_mm=hour.get('precip_mm'),
+                    cloud_cover_pct=hour.get('cloud'),
+                    confidence=0.80,
+                )
+                results.append(fp)
+        return results
+
+    def _fetch_visualcrossing(self, lat: float, lon: float, city: str,
+                              target_time: datetime = None) -> List[ForecastPoint]:
+        """Visual Crossing Timeline API — global, hourly readings plus each day's
+        tempmax/tempmin, giving another strong independent ensemble member."""
+        results = []
+        key = self._visualcrossing_key()
+        if not key:
+            return results
+        url = ("https://weather.visualcrossing.com/VisualCrossingWebServices"
+               f"/rest/services/timeline/{lat},{lon}")
+        params = {'unitGroup': 'metric', 'include': 'hours',
+                  'key': key, 'contentType': 'json'}
+        try:
+            resp = self.session.get(url, params=params, timeout=15)
+            if resp.status_code != 200:
+                log.debug(f"VisualCrossing HTTP {resp.status_code}")
+                return results
+            data = resp.json()
+        except Exception as e:
+            log.debug(f"VisualCrossing request failed: {e}")
+            return results
+
+        for day in data.get('days', []):
+            tmax = day.get('tempmax')
+            tmin = day.get('tempmin')
+            for hour in day.get('hours', []):
+                epoch = hour.get('datetimeEpoch')
+                if epoch is None:
+                    continue
+                try:
+                    t = datetime.fromtimestamp(epoch, tz=timezone.utc)
+                except Exception:
+                    continue
+                if target_time and abs((t - target_time).total_seconds()) > 7200:
+                    continue
+                fp = ForecastPoint(
+                    source='visualcrossing',
+                    model='VC',
+                    location=city or f"{lat},{lon}",
+                    timestamp=t,
+                    temp_c=hour.get('temp', 0),
+                    temp_max_c=tmax,
+                    temp_min_c=tmin,
+                    humidity_pct=hour.get('humidity'),
+                    wind_speed_kmh=hour.get('windspeed'),
+                    precip_mm=hour.get('precip'),
+                    cloud_cover_pct=hour.get('cloudcover'),
+                    confidence=0.80,
+                )
+                results.append(fp)
+        return results
+
+
+# ═════════════════════════════════════════════════════════════
 # KNOWN CITY COORDINATES (for Polymarket weather markets)
-# ═════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 CITY_COORDS = {
     # Asia (popular on Polymarket weather markets)
     'tokyo': (35.6762, 139.6503),

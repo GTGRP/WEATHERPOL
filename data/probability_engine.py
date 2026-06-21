@@ -55,6 +55,10 @@ class ProbabilityEngine:
             'NWS': 0.80,
             'HRRR': 0.88,
             'UKMO': 0.83,
+            # Commercial multi-model blends (WeatherAPI.com / Visual Crossing).
+            # Treated as strong, independent ensemble members.
+            'WAPI': 0.80,
+            'VC': 0.80,
         }
 
 
@@ -63,6 +67,7 @@ class ProbabilityEngine:
         forecasts: List[ForecastPoint],
         buckets: List[Tuple[str, float, float]],
         target_time: datetime = None,
+        market_type: str = None,
     ) -> List[BucketProbability]:
         """
         Estimate probability for each temperature bucket.
@@ -72,6 +77,10 @@ class ProbabilityEngine:
             buckets: List of (label, low_bound, high_bound) for each outcome
                      e.g. [("24°C", 23.5, 24.5), ("25°C", 24.5, 25.5), ...]
             target_time: Target resolution time (filter forecasts)
+            market_type: e.g. 'highest_temperature' / 'lowest_temperature'.
+                When provided, the ensemble keys off each model's daily MAX
+                (high markets) or daily MIN (low markets) instead of a single
+                hourly reading — a much closer match to how Polymarket resolves.
         
         Returns:
             List of BucketProbability for each bucket
@@ -94,8 +103,20 @@ class ProbabilityEngine:
             if not relevant:
                 relevant = forecasts  # fallback to all
 
+        # Choose which temperature field drives the ensemble. "Highest temp"
+        # markets resolve on the day's MAX, "lowest temp" on the day's MIN; use
+        # those when the forecaster supplied them, else fall back to the hourly
+        # temp_c (handled per-point in _weighted_ensemble).
+        mt = (market_type or '').lower()
+        if 'low' in mt or 'min' in mt:
+            temp_field = 'temp_min_c'
+        elif 'high' in mt or 'max' in mt:
+            temp_field = 'temp_max_c'
+        else:
+            temp_field = None
+
         # Compute weighted mean and std
-        mean_temp, std_temp, n_models = self._weighted_ensemble(relevant)
+        mean_temp, std_temp, n_models = self._weighted_ensemble(relevant, temp_field)
 
         # Calculate probability for each bucket using normal CDF
         results = []
@@ -128,13 +149,24 @@ class ProbabilityEngine:
         return results
 
 
-    def _weighted_ensemble(self, forecasts: List[ForecastPoint]) -> Tuple[float, float, int]:
+    def _weighted_ensemble(self, forecasts: List[ForecastPoint],
+                           temp_field: str = None) -> Tuple[float, float, int]:
         """
         Compute weighted mean and std from multiple model forecasts.
         Returns (mean_temp, std_temp, n_unique_models).
+
+        When temp_field is set (e.g. 'temp_max_c'/'temp_min_c') each point
+        contributes that field if present, otherwise it falls back to temp_c.
         """
         if not forecasts:
             return 20.0, 5.0, 0
+
+        def _val(f: ForecastPoint) -> float:
+            if temp_field:
+                v = getattr(f, temp_field, None)
+                if v is not None:
+                    return v
+            return f.temp_c
 
         # Group by model, take most recent from each
         model_temps: Dict[str, List[float]] = {}
@@ -142,7 +174,7 @@ class ProbabilityEngine:
             model_key = f"{f.source}_{f.model}"
             if model_key not in model_temps:
                 model_temps[model_key] = []
-            model_temps[model_key].append(f.temp_c)
+            model_temps[model_key].append(_val(f))
 
         # Weighted mean across models
         total_weight = 0
