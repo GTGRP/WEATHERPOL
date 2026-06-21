@@ -20,26 +20,28 @@ you do, the engine still works — it just defaults to the hourly temperature
 (`temp_c`), which is harmless but slightly less accurate for
 `highest_temperature` / `lowest_temperature` markets.
 
-**WHERE / WHICH LINE:** Find the single call site inside `_evaluate_market`:
+**WHERE / EXACT LINE:** In `dashboard.py`, inside `_evaluate_market`, find this
+exact call (the variable is `bucket_probs`, and the call spans 3 lines):
 
 ```python
-# BEFORE (current line):
-probs = self.engine.estimate_bucket_probabilities(forecasts, buckets, target_time)
+# BEFORE (current code — find this):
+bucket_probs = self.engine.estimate_bucket_probabilities(
+    forecasts, buckets, target_time
+)
 
-# AFTER (add the 4th argument):
-probs = self.engine.estimate_bucket_probabilities(
+# AFTER (add market_type=market.market_type as the last argument):
+bucket_probs = self.engine.estimate_bucket_probabilities(
     forecasts, buckets, target_time, market_type=market.market_type
 )
 ```
 
 **Notes:**
-- The variable holding the call result may be named differently in your copy
-  (e.g. `bucket_probs`); only the **arguments** matter — append
-  `market_type=market.market_type` as the last argument.
+- The ONLY change is appending `, market_type=market.market_type` after
+  `target_time` on the middle line. Nothing else changes.
 - `market` is the `WeatherMarket` already in scope in `_evaluate_market`; it has
   `.market_type` ∈ {`highest_temperature`, `lowest_temperature`}.
-- No other line needs to change. The engine signature already accepts
-  `market_type: str = None`.
+- The engine signature already accepts `market_type: str = None`, so no other
+  file needs editing.
 - **WHY it couldn't be auto-pushed:** `dashboard.py` (~74 KB) is too large for
   the GitHub file tool to reproduce in full without risking a truncated/
   corrupted write, so this one line is left for a manual edit rather than
