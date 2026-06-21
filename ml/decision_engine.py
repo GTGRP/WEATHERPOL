@@ -13,6 +13,13 @@ Design:
 - ALWAYS degrades gracefully to the local model / rules when no API key or the
   API fails, so the bot never blocks on the network.
 
+Req-32: validate_signal no longer fabricates a 0.0C forecast. The trade path
+did not pass a forecast value, so the old forecast_temp=0.0 default made the
+reasoning model 'see' a freezing forecast that contradicted every warm market
+and veto essentially everything. forecast_temp now defaults to None ('unknown'),
+the prompt says so explicitly, and a SKIP rationalised on the (absent) forecast
+is neutralised so a missing forecast can never silently kill every signal again.
+
 Req-31: the Freemodel gpt-5.x models are REASONING models - they emit a
 <think>...</think> block (~7s) BEFORE the JSON answer. The old engine used an
 8s timeout, a 40-60 token cap and a fences-only parser, so every reasoning
@@ -95,20 +102,32 @@ class MLDecisionEngine:
     # 1) Entry validation
     # ------------------------------------------------------------------ #
     def validate_signal(self, city: str, bucket_label: str, entry_price: float,
-                        our_prob: float, edge: float, forecast_temp=0.0,
-                        n_models: int = 3, weekly_context: str = '') -> Dict:
-        """Validate a trading signal. Returns {action:'BUY'|'SKIP', confidence, reason}."""
-        try:
-            forecast_temp = float(forecast_temp)
-        except (ValueError, TypeError):
-            forecast_temp = 0.0
+                        our_prob: float, edge: float, forecast_temp=None,
+                        n_models: int = 0, weekly_context: str = '') -> Dict:
+        """Validate a trading signal. Returns {action:'BUY'|'SKIP', confidence, reason}.
+
+        forecast_temp may be None when the caller has no live forecast value
+        handy (observation- or price-driven strategies). Req-32: in that case we
+        MUST NOT present a fabricated 0.0C to the model - that made the reasoning
+        model veto essentially every warm/cold market. When the forecast is
+        unknown we say so and tell the model to judge on price / edge / observed
+        lock only, and we neutralise any SKIP it rationalises on the absent
+        forecast.
+        """
+        has_forecast = forecast_temp is not None
+        if has_forecast:
+            try:
+                forecast_temp = float(forecast_temp)
+            except (ValueError, TypeError):
+                forecast_temp = None
+                has_forecast = False
 
         cwr = self._city_wr(city)
         if not self.enabled:
             if self.local_model is not None:
                 return self.local_model.predict_entry({
                     "edge": edge, "edge_ratio": our_prob / max(entry_price, 0.01),
-                    "n_models": n_models, "confidence": 0.6,
+                    "n_models": n_models or 3, "confidence": 0.6,
                     "market_spread_bps": 500, "market_price": entry_price,
                     "forecast_std": 1.5, "lead_hours": 24,
                     "city_win_rate": cwr if cwr is not None else 0.07,
@@ -126,15 +145,36 @@ class MLDecisionEngine:
                 return result
 
         cwr_txt = f" CityWR:{cwr:.0%}" if cwr is not None else ""
+        if has_forecast:
+            fc_txt = f"Forecast:{forecast_temp:.1f}C Models:{n_models}"
+            guide = ''
+        else:
+            # Req-32: NEVER imply 0C. The bucket label already carries the
+            # temperature range; judge on price/edge/lock instead.
+            fc_txt = f"Forecast:n/a Models:{n_models}"
+            guide = ("No live forecast value is provided; the bucket label carries the "
+                     "temperature range. Judge ONLY on price, edge, our probability and "
+                     "city history. Do NOT skip merely because the forecast is missing.\n")
         prompt = (
             'Weather trade entry. Reply JSON only: '
             '{"action":"BUY"|"SKIP","conf":0-1,"why":"short"}\n'
+            + guide +
             f"City:{city} Bucket:{bucket_label} Price:${entry_price:.3f} "
             f"OurProb:{our_prob:.0%} Edge:{edge:+.0%} "
-            f"Forecast:{forecast_temp:.1f}C Models:{n_models}{cwr_txt}\n"
+            f"{fc_txt}{cwr_txt}\n"
             f"History:{weekly_context[:80]}"
         )
         result = self._query(prompt)
+        # Req-32 safety net: when no forecast was available, a SKIP that is
+        # clearly rationalised on the (absent) forecast is NOT a valid veto -
+        # neutralise it so a missing forecast can never silently kill every
+        # signal again. Price-based SKIPs (reason not citing the forecast) pass.
+        if not has_forecast and str(result.get('action', '')).upper() == 'SKIP':
+            why = str(result.get('reason', '')).lower()
+            if ('forecast' in why or '0.0' in why or '0c' in why
+                    or 'no data' in why or 'contradict' in why):
+                result = {'action': 'BUY', 'confidence': 0.55,
+                          'reason': 'forecast n/a -> defer to price/edge'}
         self._cache[cache_key] = (now, result)
         return result
 
