@@ -1634,4 +1634,19 @@ class TelegramBot:
                 "<b>/settings</b> — tabbed panel: toggle strategies & tune every gate\n"
                 "   (e.g. <code>/settings peaker</code> opens that tab)\n"
                 "/set KEY VALUE — set a gate, e.g. /set BASKET_MAX_COST 0.80\n"
-                "/toggle KEY —
+                "/toggle KEY — flip a toggle, e.g. /toggle SNIPER_ENABLED\n"
+                "/status — summary + positions (paged, sortable)\n"
+                "/balance — current balance\n"
+                "/pnl — total profit/loss\n"
+                "/positions — open positions (10/page; sort by PnL/Losses/ROI/Recent)\n"
+                "/markets — active weather markets\n"
+                "/analysis — per-strategy performance + downloadable CSV\n"
+                "/close — manually sell an open position (tap Sell)\n"
+                "/done — closed history + open positions (🟢/🔴)\n"
+                "/aisummary — recent runtime warnings/errors to share\n"
+                "/mlanalysis — ML report: how it's going, what's failing\n"
+                "/redeem — redeem winning positions\n"
+                "/help — this message"
+            )
+        elif cmd.startswith('/'):
+            self.send(f"❓ Unknown command. Try /help")
