@@ -1,14 +1,14 @@
 """
-Runtime settings store — change the bot's behavior live (from Telegram) without
+Runtime settings store -- change the bot's behavior live (from Telegram) without
 editing .env or restarting. Overrides are applied as attributes on `Config`
 (read at call-time across the code) and persisted to data/runtime_settings.json
 so they survive restarts (load_into_config() re-applies them at startup, so they
 also reach strategy objects that cache their gates in __init__).
 
 Three things are exposed:
-  BOOL_KEYS — on/off toggles (every strategy enable + operational switches)
-  NUM_KEYS  — numeric gates with (min, max, step, is_int)
-  GROUPS    — ordered categories the Telegram /settings panel renders as tabs
+  BOOL_KEYS -- on/off toggles (every strategy enable + operational switches)
+  NUM_KEYS  -- numeric gates with (min, max, step, is_int)
+  GROUPS    -- ordered categories the Telegram /settings panel renders as tabs
 
 Req-27: expanded from the original ~10 toggles / ~12 gates to cover EVERY tunable
 knob (all strategies incl. PEAKER + the profit-only flip ladder + YES gates),
@@ -22,9 +22,16 @@ from typing import Tuple, Dict, List
 from config import Config
 from logger import log
 
+# Req-33: ensure newer toggles default sensibly on Config even before any
+# persisted override is loaded, so the Telegram panel shows the correct state
+# AND the code's getattr() default matches it. Done here to avoid a full
+# config.py rewrite -- mirror into config.py when convenient.
+if not hasattr(Config, 'QUICK_FLIP_HARD_STOP_ENABLED'):
+    Config.QUICK_FLIP_HARD_STOP_ENABLED = os.getenv('QUICK_FLIP_HARD_STOP_ENABLED', '1') == '1'
+
 SETTINGS_PATH = 'data/runtime_settings.json'
 
-# ── On/off toggles exposed to Telegram (tick boxes) ──────────────────────
+# -- On/off toggles exposed to Telegram (tick boxes) ----------------------
 BOOL_KEYS = [
     # master + per-strategy enables
     'TRADING_ENABLED',
@@ -38,6 +45,7 @@ BOOL_KEYS = [
     # quick-flip exit behaviour
     'QUICK_FLIP_PROFIT_ONLY_EXIT', 'QUICK_FLIP_USE_ML_EXIT',
     'QUICK_FLIP_BOOK_OR_CUT', 'QUICK_FLIP_USE_ML_PROFIT',
+    'QUICK_FLIP_HARD_STOP_ENABLED',
     # global ML profit cap
     'PROFIT_CAP_ENABLED',
     # peaker / cluster behaviour
@@ -47,7 +55,7 @@ BOOL_KEYS = [
     'GRADE_SIZING_ENABLED', 'SKIP_DECIDED_MARKETS',
 ]
 
-# ── Numeric gates: key -> (min, max, step, is_int) ─────────────────────
+# -- Numeric gates: key -> (min, max, step, is_int) ---------------------
 NUM_KEYS: Dict[str, tuple] = {
     # account
     'STARTING_BALANCE':            (10, 1000000, 50, False),
@@ -141,14 +149,14 @@ NUM_KEYS: Dict[str, tuple] = {
     'STABILITY_EARLY_EXIT_PRICE':  (0.50, 0.99, 0.05, False),
 }
 
-# ── String/choice settings: key -> list of allowed values (first = default) ──
+# -- String/choice settings: key -> list of allowed values (first = default) --
 STR_KEYS: Dict[str, List[str]] = {
     'ML_MODEL':          ['gpt-5.4-mini', 'gpt-5.4', 'gpt-5.5', 'gpt-5.3-codex'],
     'ML_ANALYSIS_MODEL': ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex'],
 }
 
-# ── Tabs for the Telegram /settings panel. Each group lists the keys (toggles
-# and/or gates) shown when that tab is active, in display order. ────────────
+# -- Tabs for the Telegram /settings panel. Each group lists the keys (toggles
+# and/or gates) shown when that tab is active, in display order. ------------
 GROUPS: List[dict] = [
     {'id': 'main', 'tab': 'Strat', 'title': 'Master & Strategies', 'keys': [
         'TRADING_ENABLED', 'STARTING_BALANCE',
@@ -183,6 +191,7 @@ GROUPS: List[dict] = [
     {'id': 'quickflip', 'tab': 'Flip', 'title': 'Quick-Flip', 'keys': [
         'QUICK_FLIP_PROFIT_ONLY_EXIT', 'QUICK_FLIP_USE_ML_EXIT',
         'QUICK_FLIP_BOOK_OR_CUT', 'QUICK_FLIP_USE_ML_PROFIT',
+        'QUICK_FLIP_HARD_STOP_ENABLED',
         'QUICK_FLIP_MIN_EDGE', 'QUICK_FLIP_MAX_PER_MARKET',
         'QUICK_FLIP_MAX_CONCURRENT', 'QUICK_FLIP_MAX_HOLD_MIN',
         'QUICK_FLIP_TARGET_ROI', 'QUICK_FLIP_STOP_LOSS_PCT', 'QUICK_FLIP_MAX_SIZE_USD',
