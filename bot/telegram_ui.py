@@ -1242,8 +1242,10 @@ class TelegramBot:
         'ML_SELECT_MARKETS': 'ML Market-Pick',
         'AUTO_REDEEM_ENABLED': 'Auto-Redeem',
         'PORTFOLIO_GUARD_ENABLED': 'Port-Guard',
+        'DRAWDOWN_GATE_ENABLED': 'Drawdown-Gate',
         'QUICK_FLIP_PROFIT_ONLY_EXIT': 'Flip profit-only',
         'QUICK_FLIP_USE_ML_EXIT': 'Flip ML-exit',
+        'QUICK_FLIP_BOOK_OR_CUT': 'Flip book-or-cut',
         'PEAKER_PREFER_COOL': 'Prefer cool',
         'PEAKER_TRADE_DECIDED': 'Peaker decided',
         'PEAK_CLUSTER_TRADE_DECIDED': 'Cluster decided',
@@ -1335,7 +1337,7 @@ class TelegramBot:
         # String/choice settings (e.g. ML model): tap to cycle to the next value.
         for k in skeys:
             rows.append([
-                {'text': f"🔁 {self._label(k)}: {strs.get(k)}", 'callback_data': f"cy:{k}:{gid}"},
+                {'text': f"🔁 {self._LABELS.get(k, k)}: {strs.get(k)}", 'callback_data': f"cy:{k}:{gid}"},
             ])
         # Req-29: type-to-change starting balance + an OK/Apply button that
         # summarises changes and offers Start. Shown on every tab.

@@ -24,7 +24,7 @@ from logger import log
 
 SETTINGS_PATH = 'data/runtime_settings.json'
 
-# ── On/off toggles exposed to Telegram (tick boxes) ─────────────────────────
+# ── On/off toggles exposed to Telegram (tick boxes) ──────────────────────
 BOOL_KEYS = [
     # master + per-strategy enables
     'TRADING_ENABLED',
@@ -34,7 +34,7 @@ BOOL_KEYS = [
     # ml / ops
     'ML_ENABLED', 'ML_DECISION_ENABLED', 'ML_ANALYSIS_ENABLED',
     'ML_REVIEW_POSITIONS', 'ML_SELECT_MARKETS', 'AUTO_REDEEM_ENABLED',
-    'PORTFOLIO_GUARD_ENABLED',
+    'PORTFOLIO_GUARD_ENABLED', 'DRAWDOWN_GATE_ENABLED',
     # quick-flip exit behaviour
     'QUICK_FLIP_PROFIT_ONLY_EXIT', 'QUICK_FLIP_USE_ML_EXIT',
     'QUICK_FLIP_BOOK_OR_CUT', 'QUICK_FLIP_USE_ML_PROFIT',
@@ -47,7 +47,7 @@ BOOL_KEYS = [
     'GRADE_SIZING_ENABLED', 'SKIP_DECIDED_MARKETS',
 ]
 
-# ── Numeric gates: key -> (min, max, step, is_int) ──────────────────────────
+# ── Numeric gates: key -> (min, max, step, is_int) ─────────────────────
 NUM_KEYS: Dict[str, tuple] = {
     # account
     'STARTING_BALANCE':            (10, 1000000, 50, False),
@@ -65,6 +65,9 @@ NUM_KEYS: Dict[str, tuple] = {
     'PORTFOLIO_RESERVE_PCT':       (0.00, 0.50, 0.05, False),
     'MAX_DEPLOY_PER_SCAN_PCT':     (0.05, 1.00, 0.05, False),
     'MAX_BUYS_PER_SCAN':           (1, 20, 1, True),
+    'MAX_DAILY_DRAWDOWN_PCT':      (5, 90, 5, False),
+    'MAX_WEEKLY_DRAWDOWN_PCT':     (5, 95, 5, False),
+    'DRAWDOWN_COOLDOWN_MINUTES':   (0, 480, 15, True),
     'MIN_EDGE_TO_ENTER':           (0.00, 0.50, 0.02, False),
     'GRADE_MIN_TO_TRADE':          (0.00, 1.00, 0.05, False),
     # late-observed (primary)
@@ -160,12 +163,13 @@ GROUPS: List[dict] = [
         'ML_REVIEW_POSITIONS', 'ML_SELECT_MARKETS',
         'ML_MODEL', 'ML_ANALYSIS_MODEL',
     ]},
-    {'id': 'risk', 'tab': 'Risk', 'title': 'Risk & Sizing', 'keys': [
-        'PORTFOLIO_GUARD_ENABLED',
+    {'id': 'risk', 'tab': 'Risk', 'title': 'Risk, Drawdown & Sizing', 'keys': [
+        'PORTFOLIO_GUARD_ENABLED', 'DRAWDOWN_GATE_ENABLED', 'QUICK_FLIP_BOOK_OR_CUT',
         'MAX_BET_PCT', 'MAX_POSITIONS', 'MAX_SINGLE_MARKET_PCT',
         'KELLY_MAX_FRACTION', 'KELLY_TIER_BASE_USD', 'KELLY_TIER_GOOD_USD',
         'KELLY_TIER_VGOOD_USD', 'KELLY_TIER_PERFECT_USD',
         'PORTFOLIO_RESERVE_PCT', 'MAX_DEPLOY_PER_SCAN_PCT', 'MAX_BUYS_PER_SCAN',
+        'MAX_DAILY_DRAWDOWN_PCT', 'MAX_WEEKLY_DRAWDOWN_PCT', 'DRAWDOWN_COOLDOWN_MINUTES',
         'MIN_EDGE_TO_ENTER', 'GRADE_MIN_TO_TRADE',
     ]},
     {'id': 'lateobs', 'tab': 'LateObs', 'title': 'Late-Observed (primary)', 'keys': [
