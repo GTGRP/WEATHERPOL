@@ -786,7 +786,7 @@ class WeatherBot:
 
         # Run probability engine
         bucket_probs = self.engine.estimate_bucket_probabilities(
-            forecasts, buckets, target_time
+            forecasts, buckets, target_time, market_type=market.market_type
         )
 
         # Get market prices (from scan data, already fetched)
