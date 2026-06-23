@@ -6,14 +6,20 @@ the conserved ledger, paper-balance credit, paper-trade log and PnL accounting
 stay correct. The descriptive reason is passed STRAIGHT INTO _close_position so
 paper_trades.jsonl records the true exit reason.
 
-1. quick_flip exit (Req-30): a flip is a quick +10% / -5% trade.
-   - <= STOP (-5%): cut the loss immediately.
-   - >= TARGET (+10%): let the ML decide BOOK now vs HOLD for more (20/40/50/200%)
+1. quick_flip exit (Req-30/33): a flip is a quick +10% / -5% trade.
+   - <= STOP (-5%): cut the loss IMMEDIATELY. Req-33: this hard stop now fires
+     for EVERY quick_flip position, INCLUDING ones that were parked to
+     resolution (book-or-cut OFF) or otherwise marked hold_to_resolution, so a
+     flip can never silently ride a loss down to -70% again. It is checked
+     BEFORE the hold-to-resolution guard. Toggle via QUICK_FLIP_HARD_STOP_ENABLED
+     ("Flip" tab in Telegram /settings).
+   - >= TARGET (+10%): let the ML decide BOOK now vs HOLD for more (15/20/40/..%)
      based on peak, edge, time-left and city win-rate. If the ML is unavailable
      it BOOKS at the target (never round-trips a winner).
    - flat (between stop and target) at the hold cap: BOOK-OR-CUT. When
      QUICK_FLIP_BOOK_OR_CUT is ON we cut it at market (good for stale markets);
-     when OFF we let it ride to resolution instead of cutting an opportunity.
+     when OFF we let it ride to resolution for UPSIDE only -- the -5% hard stop
+     above still protects the downside every cycle.
 
 2. GLOBAL PROFIT CAP (Req-30): any position above PROFIT_CAP_ROI_PCT (default
    300%) is handed to the ML: HOLD-to-settle for even more, or BOOK now to lock
@@ -146,7 +152,7 @@ def check_ml_reviews(pm):
             triggered.append(pos)
             log.info(f"ML REVIEW SELL ({conf:.0%}): {pos.city} {pos.bucket_label[:28]} "
                      f"ROI={pos.roi_pct:+.0f}% @ ${pos.current_price:.4f} "
-                     f"PnL=${pos.pnl:+.2f} — {str(d.get('reason', ''))[:48]}")
+                     f"PnL=${pos.pnl:+.2f} -- {str(d.get('reason', ''))[:48]}")
     if triggered:
         pm._save_state()
         pm._assert_ledger()
@@ -154,12 +160,23 @@ def check_ml_reviews(pm):
 
 
 def check_flip_exits(pm):
-    """quick_flip +10% / -5% exit with ML-managed upside."""
+    """quick_flip exit: ALWAYS -5% hard stop + +10% book / ML-managed upside.
+
+    Req-33 fix: the user reported a flip sitting at a ~70% loss without exiting.
+    Root cause: the -5% stop used to be checked AFTER the hold_to_resolution
+    guard, and a FLAT flip at the hold cap with QUICK_FLIP_BOOK_OR_CUT OFF was
+    marked hold_to_resolution=True -- which then exempted it from the stop on
+    every later cycle, so it rode the loss all the way down. The hard stop is
+    now the FIRST thing checked for every quick_flip position (even ones parked
+    to resolution), gated by QUICK_FLIP_HARD_STOP_ENABLED so it can be turned
+    off from Telegram.
+    """
     if not _cfg('QUICK_FLIP_TIME_EXIT', True):
         return []
     default_max = float(_cfg('QUICK_FLIP_MAX_HOLD_MIN', 120))
     use_ml = bool(_cfg('QUICK_FLIP_USE_ML_PROFIT', True))
     book_or_cut = bool(_cfg('QUICK_FLIP_BOOK_OR_CUT', True))
+    hard_stop = bool(_cfg('QUICK_FLIP_HARD_STOP_ENABLED', True))
     target = float(_cfg('QUICK_FLIP_TARGET_ROI', 10.0))     # book / decide at >= +10%
     stop = float(_cfg('QUICK_FLIP_STOP_LOSS_PCT', -5.0))    # cut at <= -5%
     mid_book = float(_cfg('QUICK_FLIP_LADDER_MID_ROI_PCT', 20.0))
@@ -168,25 +185,31 @@ def check_flip_exits(pm):
     for pos in pm.get_open_positions():
         if pos.strategy != 'quick_flip':
             continue
-        if getattr(pos, 'hold_to_resolution', False):
-            continue
         if getattr(pos, 'current_price_stale', False):
             continue
         price = pos.current_price
         if price <= 0:
             continue
         roi = pos.roi_pct
+
+        # 0) HARD STOP-LOSS (Req-33): cut the flip's loss at the stop (-5%)
+        # IMMEDIATELY. Checked BEFORE the hold_to_resolution guard so a flip that
+        # was parked to resolution (book-or-cut OFF) can NEVER ride a loss down.
+        if hard_stop and roi <= stop:
+            pm._close_position(pos, price, 'flip_stop')
+            triggered.append(pos)
+            log.info(f"FLIP STOP ({stop:.0f}%): {pos.city} {pos.bucket_label[:28]} "
+                     f"ROI={roi:+.1f}% @ ${price:.4f} PnL=${pos.pnl:+.2f}")
+            continue
+
+        # Parked-to-resolution flips ride ONLY for upside now; the stop above
+        # already protected the downside this cycle.
+        if getattr(pos, 'hold_to_resolution', False):
+            continue
+
         max_hold = float(getattr(pos, 'flip_max_hold_minutes', 0) or default_max)
         held_min = pos.hold_hours * 60.0
         window_over = held_min >= max_hold
-
-        # 0) STOP-LOSS: cut a flip that has dropped to the stop (-5%).
-        if roi <= stop:
-            pm._close_position(pos, price, 'flip_stop')
-            triggered.append(pos)
-            log.info(f"FLIP STOP: {pos.city} {pos.bucket_label[:28]} "
-                     f"ROI={roi:+.1f}% @ ${price:.4f} PnL=${pos.pnl:+.2f}")
-            continue
 
         # 1) At/above the profit target: ML decides BOOK vs HOLD-for-more.
         if roi >= target:
@@ -216,10 +239,11 @@ def check_flip_exits(pm):
                      f"{pos.bucket_label[:28]} held {held_min:.0f}m ROI={roi:+.1f}% "
                      f"@ ${price:.4f} PnL=${pos.pnl:+.2f}")
         else:
-            pos.hold_to_resolution = True
-            changed = True
-            log.info(f"FLIP HOLD->resolution (book-or-cut OFF): {pos.city} "
-                     f"{pos.bucket_label[:28]} ROI={roi:+.1f}%")
+            if not getattr(pos, 'hold_to_resolution', False):
+                pos.hold_to_resolution = True
+                changed = True
+                log.info(f"FLIP HOLD->resolution (book-or-cut OFF, -5% stop still "
+                         f"armed): {pos.city} {pos.bucket_label[:28]} ROI={roi:+.1f}%")
     if triggered:
         pm._save_state()
         pm._assert_ledger()
